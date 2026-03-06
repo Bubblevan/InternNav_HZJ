@@ -125,9 +125,10 @@ def traj_to_actions(dp_actions, use_discrate_action=True):
 
         return actions
 
-    # unnormalize
+    # unnormalize（推理时无需梯度，先 detach 再转 numpy 避免 requires_grad 报错）
+    dp_actions = dp_actions.float().detach()
     dp_actions[:, :, :2] /= 4.0
-    all_trajectory = reconstruct_xy_from_delta(dp_actions.float().cpu().numpy())
+    all_trajectory = reconstruct_xy_from_delta(dp_actions.cpu().numpy())
     trajectory = np.mean(all_trajectory, axis=0)
     if use_discrate_action:
         actions = trajectory_to_discrete_actions_close_to_goal(trajectory)

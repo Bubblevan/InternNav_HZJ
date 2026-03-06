@@ -144,6 +144,11 @@ class InternVLAN1MetaModel:
             else:
                 raise NotImplementedError
 
+        # 从 checkpoint 加载时 config 可能无 system1，但 forward 仍需要 latent_queries，故在此兜底创建
+        if getattr(self, "latent_queries", None) is None:
+            n_query = getattr(config, "n_query", 4)
+            self.latent_queries = nn.Parameter(torch.randn(1, n_query, config.hidden_size))
+
     def initialize_vision_modules(self, model_args):
         if 'nextdit' in model_args.system1:
             self.traj_dit, self.noise_scheduler = build_traj_dit(model_args)
