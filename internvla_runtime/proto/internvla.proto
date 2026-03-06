@@ -1,0 +1,42 @@
+syntax = "proto3";
+
+package internvla;
+
+service InternVLAService {
+  rpc InitEpisode(InitRequest) returns (InitResponse);
+  rpc Step(StepRequest) returns (StepResponse);
+}
+
+message InitRequest {
+  string session_id = 1;
+  string instruction = 2;
+}
+
+message InitResponse {
+  bool ok = 1;
+}
+
+message StepRequest {
+  string session_id = 1;
+  int32 width = 2;
+  int32 height = 3;
+
+  bytes rgb = 4;      // uint8 HWC
+  bytes depth = 5;    // float32 HW
+
+  repeated float camera_pose = 6; // 4x4
+}
+
+message StepResponse {
+
+  bool has_trajectory = 1;
+
+  repeated float trajectory = 2;
+
+  bool has_action = 3;
+
+  repeated int32 action = 4;
+
+  int32 pixel_x = 5;
+  int32 pixel_y = 6;
+}
