@@ -1,0 +1,6 @@
+# 在 Unitree Go2 上运行 grpc_internvla_client.py 所需的 Python 依赖
+# Python 3.8 上无 protobuf 6.x，使用 5.x；internvla_pb2 已做兼容
+protobuf>=5.27.0
+grpcio>=1.60.0
+numpy
+Pillow
