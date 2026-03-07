@@ -1,12 +1,13 @@
 import argparse
+import io
 import json
 import os
 import time
 from datetime import datetime
 
 import numpy as np
-from flask import Flask, jsonify, request
-from PIL import Image
+from flask import Flask, Response, jsonify, request
+from PIL import Image, ImageDraw
 
 from internnav.agent.internvla_n1_agent_realworld import InternVLAN1AsyncAgent
 
@@ -14,11 +15,15 @@ app = Flask(__name__)
 idx = 0
 start_time = time.time()
 output_dir = ''
+# 第一人称视角：保存最近一帧 RGB（JPEG bytes），供 GET /fpv 使用
+_last_fpv_jpeg = None
+# stream 保存路径：/stream/<timestamp>/frame_xxx.jpg
+_stream_run_dir = None
 
 
 @app.route("/eval_dual", methods=['POST'])
 def eval_dual():
-    global idx, output_dir, start_time
+    global idx, output_dir, start_time, _last_fpv_jpeg, _stream_run_dir
     start_time = time.time()
 
     image_file = request.files['image']
@@ -37,13 +42,16 @@ def eval_dual():
     print(f"read http data cost {time.time() - start_time}")
 
     camera_pose = np.array([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]])
-    instruction = "Turn left and walk to the nearest man in front of you and stop there"
+    instruction = "walk out of the room and stop at the elevator. If a person is coming, closing, wait and let the person pass first, then move through the door."
     policy_init = data['reset']
     if policy_init:
         start_time = time.time()
         idx = 0
         output_dir = 'output/runs' + datetime.now().strftime('%m-%d-%H%M')
         os.makedirs(output_dir, exist_ok=True)
+        _stream_run_dir = os.path.join('/home/ubuntu1/backup/InternNav/stream',
+                                       datetime.now().strftime('%Y-%m-%d-%H%M%S'))
+        os.makedirs(_stream_run_dir, exist_ok=True)
         print("init reset model!!!")
         agent.reset()
 
@@ -70,11 +78,75 @@ def eval_dual():
         if dual_sys_output.output_pixel is not None:
             json_output['pixel_goal'] = dual_sys_output.output_pixel
 
+    # 更新 FPV：在画面上绘制 grounded waypoint 红点后保存
+    fpv_img = Image.fromarray(image).convert('RGB')
+    draw = ImageDraw.Draw(fpv_img)
+    h_img, w_img = image.shape[:2]
+    goal_px = None
+    if dual_sys_output.output_pixel is not None:
+        # pixel_goal 在 agent 的 384x384 空间，需缩放到原图
+        px = int(dual_sys_output.output_pixel[1] * w_img / args.resize_w)
+        py = int(dual_sys_output.output_pixel[0] * h_img / args.resize_h)
+        goal_px = (px, py)
+    elif dual_sys_output.output_trajectory is not None and len(dual_sys_output.output_trajectory) > 0:
+        # 仅 trajectory：将最后一个点从 body 系 (x,y) 米 投影到像素
+        traj = dual_sys_output.output_trajectory
+        x_end, y_end = float(traj[-1][0]), float(traj[-1][1])
+        x_end = max(x_end, 0.15)  # 避免除零
+        K = args.camera_intrinsic
+        fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
+        cam_h = getattr(args, 'camera_height', 0.4)
+        px = int(fx * y_end / x_end + cx)
+        py = int(fy * cam_h / x_end + cy)
+        if 0 <= px < w_img and 0 <= py < h_img:
+            goal_px = (px, py)
+    if goal_px is not None:
+        r = 10
+        draw.ellipse([goal_px[0] - r, goal_px[1] - r, goal_px[0] + r, goal_px[1] + r], outline='red', fill='red', width=3)
+    buf = io.BytesIO()
+    fpv_img.save(buf, format='JPEG', quality=85)
+    _last_fpv_jpeg = buf.getvalue()
+
+    # 保存帧到 stream/<timestamp>/ 目录
+    if _stream_run_dir is None:
+        _stream_run_dir = os.path.join('/home/ubuntu1/backup/InternNav/stream',
+                                        datetime.now().strftime('%Y-%m-%d-%H%M%S'))
+        os.makedirs(_stream_run_dir, exist_ok=True)
+    fpv_img.save(os.path.join(_stream_run_dir, f'frame_{idx:06d}.jpg'), format='JPEG', quality=85)
+
     t1 = time.time()
     generate_time = t1 - t0
     print(f"dual sys step {generate_time}")
     print(f"json_output {json_output}")
     return jsonify(json_output)
+
+
+@app.route("/fpv", methods=['GET'])
+def fpv():
+    """第一人称视角：返回最近一帧 RGB（JPEG）。"""
+    global _last_fpv_jpeg
+    if _last_fpv_jpeg is None:
+        return "No frame yet. Run client to send images.", 404
+    return Response(_last_fpv_jpeg, mimetype='image/jpeg')
+
+
+@app.route("/fpv_live", methods=['GET'])
+def fpv_live():
+    """第一人称视角页面：自动刷新画面。浏览器打开 http://<server_ip>:5801/fpv_live 即可看 FPV。"""
+    html = """
+    <!DOCTYPE html>
+    <html><head><meta charset="utf-8"><title>FPV</title></head>
+    <body style="margin:0;background:#000;">
+    <img id="img" src="/fpv" style="width:100%;height:100%;object-fit:contain;" />
+    <script>
+    setInterval(function(){
+        var i = document.getElementById('img');
+        i.src = '/fpv?t=' + Date.now();
+    }, 300);
+    </script>
+    </body></html>
+    """
+    return Response(html, mimetype='text/html; charset=utf-8')
 
 
 if __name__ == '__main__':
@@ -86,6 +158,8 @@ if __name__ == '__main__':
     parser.add_argument("--resize_h", type=int, default=384)
     parser.add_argument("--num_history", type=int, default=8)
     parser.add_argument("--plan_step_gap", type=int, default=4)
+    parser.add_argument("--camera_height", type=float, default=0.4,
+                       help="相机离地高度(m)，用于 trajectory->pixel 投影（无 pixel_goal 时）")
     args = parser.parse_args()
 
     args.camera_intrinsic = np.array(
