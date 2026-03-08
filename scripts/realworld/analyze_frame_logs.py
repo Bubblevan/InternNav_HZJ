@@ -277,6 +277,42 @@ def main():
     else:
         print("  (无 STOP 样本)")
 
+    # ----- 8. 连续 S1 执行长度（S2 产出 trajectory 后，连续多少帧走 MPC/S1，直到被 discrete_action 拉回）-----
+    print("\n【7. 连续 S1 执行长度】")
+    print("  (S2 产出 latent/trajectory 后，连续多少帧走 step_s1/MPC，直到 discrete_action 拉回 S2)")
+    ordered = [(e['frame_id'], e.get('action_type', '')) for e in server_events if e.get('event') == 'server_model_end']
+    ordered.sort(key=lambda x: x[0])
+    s1_run_lengths = []
+    i = 0
+    while i < len(ordered):
+        fid, at = ordered[i]
+        if at != 'trajectory':
+            i += 1
+            continue
+        run_start = fid
+        run_len = 0
+        while i < len(ordered) and ordered[i][1] == 'trajectory':
+            run_len += 1
+            i += 1
+        s1_run_lengths.append(run_len)
+    if s1_run_lengths:
+        avg_len = sum(s1_run_lengths) / len(s1_run_lengths)
+        print(f"  S1 连续执行段数:     {len(s1_run_lengths)}")
+        print(f"  平均连续长度:       {avg_len:.2f} 帧")
+        print(f"  最小/最大:          {min(s1_run_lengths)} / {max(s1_run_lengths)} 帧")
+        len_1 = sum(1 for L in s1_run_lengths if L == 1)
+        len_2 = sum(1 for L in s1_run_lengths if L == 2)
+        len_le2 = sum(1 for L in s1_run_lengths if L <= 2)
+        print(f"  仅 1 帧即被拉回:    {len_1} 次 ({len_1/len(s1_run_lengths)*100:.1f}%)")
+        print(f"  仅 2 帧即被拉回:    {len_2} 次 ({len_2/len(s1_run_lengths)*100:.1f}%)")
+        print(f"  ≤2 帧即被拉回:      {len_le2} 次 ({len_le2/len(s1_run_lengths)*100:.1f}%)")
+        if avg_len <= 2.0:
+            print("  -> 平均≤2 帧，S1 接管窗口极短，实机行为接近 S2 主导")
+        else:
+            print("  -> S1 有较稳定执行窗口")
+    else:
+        print("  (无 trajectory 段，无法统计)")
+
     print("\n" + "-" * 70)
     print("解读: callback 不稳->传感器; RTT/T_model 大->推理或网络; rgb-odom 差大->位姿不同步")
     print("=" * 70)

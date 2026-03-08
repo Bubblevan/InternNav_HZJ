@@ -79,6 +79,10 @@ mpc_rw_lock = ReadWriteLock()
 _DEFAULT_SERVER_URL = os.environ.get('INTERNVLA_SERVER_URL', 'http://192.168.1.105:5801')
 _EVAL_DUAL_URL = f'{_DEFAULT_SERVER_URL.rstrip("/")}/eval_dual'
 
+# 固定轨迹测试模式：INTERNVLA_FIXED_TRAJ_TEST=1 时，不连 server，用一条固定直线轨迹测试 MPC 跟踪能力
+_FIXED_TRAJ_TEST = os.environ.get('INTERNVLA_FIXED_TRAJ_TEST', '').strip() in ('1', 'true', 'yes')
+_FIXED_TRAJ_INJECTED = False  # 是否已注入过固定轨迹（只注入一次）
+
 
 def dual_sys_eval(image_bytes, depth_bytes, front_image_bytes, frame_id, rgb_ts_header, depth_ts_header,
                   odom_ts_used, t_http_send, url=None):
@@ -141,7 +145,7 @@ def control_thread():
 
 
 def planning_thread():
-    global trajs_in_world
+    global trajs_in_world, frame_data, frame_id_counter, publish_count, _FIXED_TRAJ_INJECTED, mpc, current_control_mode
 
     while True:
         start_time = time.time()
@@ -172,11 +176,52 @@ def planning_thread():
                 odom_ts_used = odom[0]
         odom_rw_lock.release_read()
 
-        if odom_infer is not None and rgb_bytes is not None and depth_bytes is not None:
-            global frame_data, frame_id_counter, publish_count
+        # 固定轨迹测试：只需 odom；正常模式：需 odom + rgb + depth
+        can_plan = (odom_infer is not None) and (
+            (_FIXED_TRAJ_TEST and not _FIXED_TRAJ_INJECTED) or (rgb_bytes is not None and depth_bytes is not None)
+        )
+        if can_plan:
             frame_id_counter += 1
             frame_id = frame_id_counter
             t_http_send = time.monotonic()
+
+            # ----- 固定轨迹测试模式：不连 server，注入轨迹验证 MPC 能否跟上 -----
+            if _FIXED_TRAJ_TEST and not _FIXED_TRAJ_INJECTED:
+                _FIXED_TRAJ_INJECTED = True
+                # body 系：x 前向，y 左。L 形：直走 4m → 左转 90° → 往左走 2m
+                pts = []
+                # 1. 直走 4m: (0.1,0) -> (4.0,0)
+                pts.extend([[x, 0.0] for x in np.linspace(0.1, 4.0, 40)])
+                # 2. 左转 90° 弧，圆心 (4.0, 0.5)，半径 0.5
+                for t in np.linspace(-np.pi/2, 0, 12):
+                    pts.append([4.0 + 0.5 * np.cos(t), 0.5 + 0.5 * np.sin(t)])
+                # 3. 往左走 2m: (4.5, 0.5) -> (4.5, 2.5)
+                pts.extend([[4.5, y] for y in np.linspace(0.5, 2.5, 20)])
+                body_traj = np.array(pts)
+                odom = odom_infer
+                x_, y_, yaw_ = odom[0], odom[1], odom[2]
+                w_T_b = np.array([
+                    [np.cos(yaw_), -np.sin(yaw_), 0, x_],
+                    [np.sin(yaw_), np.cos(yaw_), 0, y_],
+                    [0.0, 0.0, 1.0, 0],
+                    [0.0, 0.0, 0.0, 1.0],
+                ])
+                trajs_in_world = np.array([
+                    (w_T_b @ np.array([p[0], p[1], 0.0, 1.0]))[:2] for p in body_traj
+                ])
+                manager.last_trajs_in_world = trajs_in_world
+                mpc_rw_lock.acquire_write()
+                mpc = Mpc_controller(np.array(trajs_in_world), desired_v=1.2, v_max=1.5)
+                mpc_rw_lock.release_write()
+                current_control_mode = ControlMode.MPC_Mode
+                print("[固定轨迹测试] 已注入 L 形：直走 4m → 左转 90° → 往左走 2m。Ctrl+C 结束。")
+                time.sleep(max(0, DESIRED_TIME - (time.time() - start_time)))
+                continue
+
+            # 固定轨迹测试且已注入：不再调用 server，control_thread 会持续用 MPC 跟踪
+            if _FIXED_TRAJ_TEST:
+                time.sleep(max(0, DESIRED_TIME - (time.time() - start_time)))
+                continue
 
             _client_log('planning_before_send',
                        frame_id=frame_id,
@@ -218,7 +263,6 @@ def planning_thread():
             if len(frame_data) > 100:
                 del frame_data[min(frame_data.keys())]
 
-            global current_control_mode
             if 'trajectory' in response:
                 trajectory = response['trajectory']
                 trajs_in_world = []
@@ -243,9 +287,8 @@ def planning_thread():
 
                 manager.last_trajs_in_world = trajs_in_world
                 mpc_rw_lock.acquire_write()
-                global mpc
                 if mpc is None:
-                    mpc = Mpc_controller(np.array(trajs_in_world))
+                    mpc = Mpc_controller(np.array(trajs_in_world), desired_v=1.2, v_max=1.5)
                 else:
                     mpc.update_ref_traj(np.array(trajs_in_world))
                 manager.request_cnt += 1
@@ -436,7 +479,10 @@ class Go2Manager(Node):
 
 if __name__ == '__main__':
     print(f"[InternVLA Client] 诊断日志将写入: {_client_log_path}")
-    print(f"[InternVLA Client] Server URL: {_EVAL_DUAL_URL} (可通过 INTERNVLA_SERVER_URL 环境变量覆盖)")
+    if _FIXED_TRAJ_TEST:
+        print("[InternVLA Client] 固定轨迹测试模式 (INTERNVLA_FIXED_TRAJ_TEST=1)：不连 server，注入 2m 直线验证 MPC")
+    else:
+        print(f"[InternVLA Client] Server URL: {_EVAL_DUAL_URL} (可通过 INTERNVLA_SERVER_URL 环境变量覆盖)")
     control_thread_instance = threading.Thread(target=control_thread)
     planning_thread_instance = threading.Thread(target=planning_thread)
     control_thread_instance.daemon = True

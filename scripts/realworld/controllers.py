@@ -48,9 +48,9 @@ class Mpc_controller:
             x_next = opt_states[i, :] + f(opt_states[i, :], opt_controls[i, :]).T * self.T
             opti.subject_to(opt_states[i + 1, :] == x_next)
 
-        # define the cost function
+        # define the cost function（R[0,0] 越小，MPC 越愿意用高 v；原 0.05 导致实际速度偏慢）
         Q = np.diag([10.0, 10.0, 0.0])
-        R = np.diag([0.05, 0.2])
+        R = np.diag([0.01, 0.2])
         obj = 0
         for i in range(N):
             obj = obj + ca.mtimes([opt_controls[i, :], R, opt_controls[i, :].T])
@@ -136,10 +136,13 @@ class Mpc_controller:
         nearest_idx = np.argmin(np.linalg.norm(global_planed_traj - x0[:2].reshape((1, 2)), axis=1))
         desire_arc_length = self.desired_v * self.ref_gap * self.T
         cum_dist = np.cumsum(np.linalg.norm(np.diff(global_planed_traj, axis=0), axis=1))
+        # cum_dist[i] = 从 pt0 到 pt(i+1) 的弧长；从 pt(nearest_idx) 到 pt(i+1) 的弧长 = cum_dist[i] - cum_dist[nearest_idx-1]
+        cum_dist_from_nearest = cum_dist[nearest_idx - 1] if nearest_idx > 0 else 0.0
 
         # select the reference points from the nearest point to the end of global_planed_traj
         for i in range(nearest_idx, len(global_planed_traj) - 1):
-            if cum_dist[i] - cum_dist[nearest_idx] >= desire_arc_length * len(ref_traj_pts):
+            dist_from_nearest = cum_dist[i] - cum_dist_from_nearest
+            if dist_from_nearest >= desire_arc_length * len(ref_traj_pts):
                 ref_traj_pts.append(global_planed_traj[i, :])
                 if len(ref_traj_pts) == self.ref_traj_len:
                     break
