@@ -2,10 +2,29 @@ import argparse
 import io
 import json
 import os
+import threading
 import time
 from datetime import datetime
 
 import numpy as np
+
+# ========== 诊断日志：写入文件 ==========
+_log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
+os.makedirs(_log_dir, exist_ok=True)
+_server_log_path = os.path.join(_log_dir, f'internvla_server_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')
+_server_log_file = None
+_server_log_lock = threading.Lock()
+server_recv_count = 0
+
+
+def _server_log(event: str, **kwargs):
+    global _server_log_file
+    with _server_log_lock:
+        if _server_log_file is None:
+            _server_log_file = open(_server_log_path, 'a', encoding='utf-8')
+        rec = {'event': event, 't_mono': time.monotonic(), **kwargs}
+        _server_log_file.write(json.dumps(rec, ensure_ascii=False) + '\n')
+        _server_log_file.flush()
 from flask import Flask, Response, jsonify, request
 from PIL import Image, ImageDraw
 
@@ -23,13 +42,19 @@ _stream_run_dir = None
 
 @app.route("/eval_dual", methods=['POST'])
 def eval_dual():
-    global idx, output_dir, start_time, _last_fpv_jpeg, _stream_run_dir
-    start_time = time.time()
+    global idx, output_dir, start_time, _last_fpv_jpeg, _stream_run_dir, server_recv_count
+    t_server_recv = time.monotonic()
+    server_recv_count += 1
 
     image_file = request.files['image']
     depth_file = request.files['depth']
     json_data = request.form['json']
     data = json.loads(json_data)
+    frame_id = data.get('frame_id', -1)
+
+    _server_log('server_recv', frame_id=frame_id, t_server_recv=t_server_recv, server_recv_count=server_recv_count)
+
+    start_time = time.time()
 
     image = Image.open(image_file.stream)
     image = image.convert('RGB')
@@ -42,7 +67,7 @@ def eval_dual():
     print(f"read http data cost {time.time() - start_time}")
 
     camera_pose = np.array([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]])
-    instruction = "walk out of the room and stop at the elevator. If a person is coming, closing, wait and let the person pass first, then move through the door."
+    instruction = "Task Objective: 1. Move straight ahead. 2. When a chair is detected, turn right 90 degrees and exit. 3. Walk straight. 4. Turn around at the end of the corridor. 5. Return. 6. When a chair is detected, stop"
     policy_init = data['reset']
     if policy_init:
         start_time = time.time()
@@ -58,7 +83,7 @@ def eval_dual():
     idx += 1
 
     look_down = False
-    t0 = time.time()
+    t_model_start = time.monotonic()
     dual_sys_output = {}
 
     dual_sys_output = agent.step(
@@ -70,13 +95,29 @@ def eval_dual():
             image, depth, camera_pose, instruction, intrinsic=args.camera_intrinsic, look_down=look_down
         )
 
+    t_model_end = time.monotonic()
+
     json_output = {}
     if dual_sys_output.output_action is not None:
         json_output['discrete_action'] = dual_sys_output.output_action
+        action_type = 'discrete_action'
+        action_value = dual_sys_output.output_action
+        pixel_goal = None
+        traj_len = 0.0
     else:
         json_output['trajectory'] = dual_sys_output.output_trajectory.tolist()
         if dual_sys_output.output_pixel is not None:
             json_output['pixel_goal'] = dual_sys_output.output_pixel
+        action_type = 'trajectory'
+        action_value = dual_sys_output.output_trajectory.tolist()
+        pixel_goal = dual_sys_output.output_pixel
+        traj_len = float(np.linalg.norm(dual_sys_output.output_trajectory[-1][:2])) if dual_sys_output.output_trajectory is not None and len(dual_sys_output.output_trajectory) > 0 else 0.0
+
+    _server_log('server_model_end', frame_id=frame_id, t_server_recv=t_server_recv,
+                t_model_start=t_model_start, t_model_end=t_model_end,
+                action_type=action_type, action_value=str(action_value),
+                pixel_goal=str(pixel_goal) if pixel_goal is not None else None,
+                traj_len=traj_len, server_recv_count=server_recv_count)
 
     # 更新 FPV：在画面上绘制 grounded waypoint 红点后保存
     fpv_img = Image.fromarray(image).convert('RGB')
@@ -114,8 +155,8 @@ def eval_dual():
         os.makedirs(_stream_run_dir, exist_ok=True)
     fpv_img.save(os.path.join(_stream_run_dir, f'frame_{idx:06d}.jpg'), format='JPEG', quality=85)
 
-    t1 = time.time()
-    generate_time = t1 - t0
+    t1 = time.monotonic()
+    generate_time = t1 - t_model_start
     print(f"dual sys step {generate_time}")
     print(f"json_output {json_output}")
     return jsonify(json_output)
@@ -138,12 +179,15 @@ def fpv_live():
     <html><head><meta charset="utf-8"><title>FPV</title></head>
     <body style="margin:0;background:#000;">
     <img id="img" src="/fpv" style="width:100%;height:100%;object-fit:contain;" />
+    <!-- 注释掉自动刷新，避免在无帧时刷屏 404；改用 RViz2 做可视化验证 -->
+    <!--
     <script>
     setInterval(function(){
         var i = document.getElementById('img');
         i.src = '/fpv?t=' + Date.now();
     }, 300);
     </script>
+    -->
     </body></html>
     """
     return Response(html, mimetype='text/html; charset=utf-8')
@@ -176,4 +220,5 @@ if __name__ == '__main__':
     )
     agent.reset()
 
+    print(f"[InternVLA Server] 诊断日志将写入: {_server_log_path}")
     app.run(host='0.0.0.0', port=5801)
