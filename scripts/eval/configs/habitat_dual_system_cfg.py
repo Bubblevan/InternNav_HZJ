@@ -29,6 +29,20 @@ eval_cfg = EvalCfg(
         "save_video": False,  # whether to save videos
         "epoch": 0,  # epoch number for logging
         "max_steps_per_episode": 500,  # maximum steps per episode
+        # mini-subset / local data overrides
+        "dataset_path_override": None,  # e.g. data/vln_ce/raw_data/r2r/val_unseen_mini/val_unseen_mini.json.gz
+        "scenes_dir_override": "data/scene_data",
+        "dataset_split_override": None,
+        "allowed_scene_ids": [],  # e.g. ["zsNo4HB9uLZ"]
+        "allowed_episode_ids": [],  # e.g. [1, 2, 3]
+        "max_eval_episodes": None,  # e.g. 8
+        # runtime profiling
+        "profile_runtime": True,
+        "profile_modules": True,
+        # replay subset export
+        "export_replay_subset": True,
+        "replay_num_episodes": 20,
+        "replay_seed": 0,
         # distributed settings
         "port": "2333",  # communication port
         "dist_url": "env://",  # url for distributed setup

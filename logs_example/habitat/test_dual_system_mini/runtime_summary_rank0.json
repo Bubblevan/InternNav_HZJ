@@ -1,0 +1,16 @@
+{
+  "episodes": 8,
+  "success": 0.875,
+  "spl": 0.7750503343129163,
+  "oracle_success": 0.875,
+  "navigation_error": 1.0230148239061236,
+  "episode_wall_clock_seconds": 44.210852321113634,
+  "avg_step_wall_clock_seconds": 0.5086022313743381,
+  "s2_call_count": 22.25,
+  "s2_avg_seconds": 0.5202478759415535,
+  "s1_avg_seconds": 0.1529770904579245,
+  "pixel_goal_ratio": 0.3750576487153584,
+  "discrete_ratio": 0.6249423512846417,
+  "stop_ratio": 0.012480744850185185,
+  "avg_s1_steps_per_cycle": 8.595940170940171
+}

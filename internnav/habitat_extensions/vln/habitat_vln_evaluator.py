@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from enum import IntEnum
 
 sys.path.append('./src/diffusion-policy')
@@ -70,6 +71,12 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         self.epoch = args.epoch
         self.max_steps_per_episode = args.max_steps_per_episode
         self.output_path = args.output_path
+        self.profile_runtime = bool(getattr(args, "profile_runtime", True))
+        self.profile_modules = bool(getattr(args, "profile_modules", True))
+
+        cfg.env.env_settings["allowed_scene_ids"] = list(getattr(args, "allowed_scene_ids", []) or [])
+        cfg.env.env_settings["allowed_episode_ids"] = list(getattr(args, "allowed_episode_ids", []) or [])
+        cfg.env.env_settings["max_eval_episodes"] = getattr(args, "max_eval_episodes", None)
 
         # create habitat config
         self.config_path = cfg.env.env_settings['config_path']
@@ -78,6 +85,15 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         self.sim_sensors_config = self.config.habitat.simulator.agents.main_agent.sim_sensors
 
         with habitat.config.read_write(self.config):
+            dataset_path_override = getattr(args, "dataset_path_override", None)
+            scenes_dir_override = getattr(args, "scenes_dir_override", None)
+            dataset_split_override = getattr(args, "dataset_split_override", None)
+            if dataset_path_override:
+                self.config.habitat.dataset.data_path = dataset_path_override
+            if scenes_dir_override:
+                self.config.habitat.dataset.scenes_dir = scenes_dir_override
+            if dataset_split_override:
+                self.config.habitat.dataset.split = dataset_split_override
             self.config.habitat.task.measurements.update(
                 {
                     "top_down_map": TopDownMapMeasurementConfig(
@@ -170,6 +186,160 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         camera_fov_rad = np.deg2rad(self.sim_sensors_config.depth_sensor.hfov)
         self._camera_fov = camera_fov_rad
         self._fx = self._fy = self.sim_sensors_config.depth_sensor.width / (2 * np.tan(camera_fov_rad / 2))
+
+        self.replay_enabled = bool(getattr(args, "export_replay_subset", False))
+        self.replay_seed = int(getattr(args, "replay_seed", 0))
+        self.replay_num_episodes = int(getattr(args, "replay_num_episodes", 0) or 0)
+        self.replay_root = os.path.join(self.output_path, "replay_subset")
+        self.replay_manifest_path = os.path.join(self.replay_root, f"manifest_rank{self.rank}.jsonl")
+        self.runtime_profile_path = os.path.join(self.output_path, f"runtime_rank{self.rank}.jsonl")
+        self.runtime_summary_path = os.path.join(self.output_path, f"runtime_summary_rank{self.rank}.json")
+        self.runtime_records = []
+        self.replay_episode_keys = self._select_replay_episodes()
+
+    def _select_replay_episodes(self):
+        if not self.replay_enabled or self.replay_num_episodes <= 0:
+            return set()
+        rng = random.Random(self.replay_seed + self.rank)
+        keys = [(ep.scene_id.split('/')[-2], int(ep.episode_id)) for ep in self.env.episodes]
+        if not keys:
+            return set()
+        sample_size = min(self.replay_num_episodes, len(keys))
+        return set(rng.sample(keys, sample_size))
+
+    def _init_episode_stats(self, scene_id, episode_id, instruction):
+        return {
+            "scene_id": scene_id,
+            "episode_id": episode_id,
+            "instruction": instruction,
+            "wall_clock_start": time.perf_counter(),
+            "step_wall_times": [],
+            "s2_call_count": 0,
+            "s2_generate_seconds": 0.0,
+            "s2_latent_seconds": 0.0,
+            "s1_call_count": 0,
+            "s1_generate_seconds": 0.0,
+            "pixel_goal_decisions": 0,
+            "discrete_decisions": 0,
+            "stop_actions": 0,
+            "pixel_goal_cycles": 0,
+            "pixel_goal_active_steps": 0,
+            "pixel_goal_burst_lengths": [],
+            "current_pixel_goal_burst": 0,
+        }
+
+    def _close_pixel_goal_burst(self, episode_stats):
+        if episode_stats["current_pixel_goal_burst"] > 0:
+            episode_stats["pixel_goal_burst_lengths"].append(episode_stats["current_pixel_goal_burst"])
+            episode_stats["current_pixel_goal_burst"] = 0
+
+    def _finalize_episode_stats(self, episode_stats, metrics, executed_steps):
+        self._close_pixel_goal_burst(episode_stats)
+        total_wall = time.perf_counter() - episode_stats["wall_clock_start"]
+        avg_step = total_wall / max(len(episode_stats["step_wall_times"]), 1)
+        total_actions = max(executed_steps, 1)
+        s2_calls = max(episode_stats["s2_call_count"], 1)
+        record = {
+            "scene_id": episode_stats["scene_id"],
+            "episode_id": episode_stats["episode_id"],
+            "instruction": episode_stats["instruction"],
+            "success": metrics["success"],
+            "spl": metrics["spl"],
+            "oracle_success": metrics["oracle_success"],
+            "navigation_error": metrics.get("oracle_navigation_error", metrics.get("distance_to_goal")),
+            "episode_wall_clock_seconds": total_wall,
+            "avg_step_wall_clock_seconds": avg_step,
+            "steps": executed_steps,
+            "s2_call_count": episode_stats["s2_call_count"],
+            "s2_generate_seconds": episode_stats["s2_generate_seconds"],
+            "s2_avg_seconds": episode_stats["s2_generate_seconds"] / s2_calls,
+            "s2_latent_seconds": episode_stats["s2_latent_seconds"],
+            "s1_call_count": episode_stats["s1_call_count"],
+            "s1_generate_seconds": episode_stats["s1_generate_seconds"],
+            "s1_avg_seconds": episode_stats["s1_generate_seconds"] / max(episode_stats["s1_call_count"], 1),
+            "pixel_goal_ratio": episode_stats["pixel_goal_decisions"] / s2_calls,
+            "discrete_ratio": episode_stats["discrete_decisions"] / s2_calls,
+            "stop_ratio": episode_stats["stop_actions"] / total_actions,
+            "pixel_goal_cycles": episode_stats["pixel_goal_cycles"],
+            "pixel_goal_active_steps": episode_stats["pixel_goal_active_steps"],
+            "avg_s1_steps_per_cycle": (
+                float(np.mean(episode_stats["pixel_goal_burst_lengths"]))
+                if episode_stats["pixel_goal_burst_lengths"]
+                else 0.0
+            ),
+        }
+        self.runtime_records.append(record)
+        if self.profile_runtime and self.rank == 0:
+            os.makedirs(self.output_path, exist_ok=True)
+            with open(self.runtime_profile_path, "a") as f:
+                f.write(json.dumps(record) + "\n")
+        return record
+
+    def _flush_runtime_summary(self):
+        if not self.runtime_records or self.rank != 0:
+            return
+        summary = {
+            "episodes": len(self.runtime_records),
+            "success": float(np.mean([r["success"] for r in self.runtime_records])),
+            "spl": float(np.mean([r["spl"] for r in self.runtime_records])),
+            "oracle_success": float(np.mean([r["oracle_success"] for r in self.runtime_records])),
+            "navigation_error": float(np.mean([r["navigation_error"] for r in self.runtime_records])),
+            "episode_wall_clock_seconds": float(np.mean([r["episode_wall_clock_seconds"] for r in self.runtime_records])),
+            "avg_step_wall_clock_seconds": float(np.mean([r["avg_step_wall_clock_seconds"] for r in self.runtime_records])),
+            "s2_call_count": float(np.mean([r["s2_call_count"] for r in self.runtime_records])),
+            "s2_avg_seconds": float(np.mean([r["s2_avg_seconds"] for r in self.runtime_records])),
+            "s1_avg_seconds": float(np.mean([r["s1_avg_seconds"] for r in self.runtime_records])),
+            "pixel_goal_ratio": float(np.mean([r["pixel_goal_ratio"] for r in self.runtime_records])),
+            "discrete_ratio": float(np.mean([r["discrete_ratio"] for r in self.runtime_records])),
+            "stop_ratio": float(np.mean([r["stop_ratio"] for r in self.runtime_records])),
+            "avg_s1_steps_per_cycle": float(np.mean([r["avg_s1_steps_per_cycle"] for r in self.runtime_records])),
+        }
+        with open(self.runtime_summary_path, "w") as f:
+            json.dump(summary, f, indent=2)
+
+    def _write_replay_step(
+        self,
+        scene_id,
+        episode_id,
+        instruction,
+        step_id,
+        rgb,
+        depth,
+        lookdown_rgb,
+        lookdown_depth,
+        pose_info,
+        history_frame_indices,
+        baseline_output,
+    ):
+        if (scene_id, episode_id) not in self.replay_episode_keys:
+            return
+        episode_dir = os.path.join(self.replay_root, f"{scene_id}_{episode_id:04d}")
+        os.makedirs(episode_dir, exist_ok=True)
+        Image.fromarray(rgb).save(os.path.join(episode_dir, f"step_{step_id:04d}_rgb.png"))
+        np.save(os.path.join(episode_dir, f"step_{step_id:04d}_depth.npy"), depth)
+        if lookdown_rgb is not None:
+            Image.fromarray(lookdown_rgb).save(os.path.join(episode_dir, f"step_{step_id:04d}_lookdown_rgb.png"))
+        if lookdown_depth is not None:
+            np.save(os.path.join(episode_dir, f"step_{step_id:04d}_lookdown_depth.npy"), lookdown_depth)
+        with open(self.replay_manifest_path, "a") as f:
+            f.write(
+                json.dumps(
+                    {
+                        "scene_id": scene_id,
+                        "episode_id": episode_id,
+                        "instruction": instruction,
+                        "step_id": step_id,
+                        "rgb_path": os.path.join(episode_dir, f"step_{step_id:04d}_rgb.png"),
+                        "depth_path": os.path.join(episode_dir, f"step_{step_id:04d}_depth.npy"),
+                        "lookdown_rgb_path": os.path.join(episode_dir, f"step_{step_id:04d}_lookdown_rgb.png"),
+                        "lookdown_depth_path": os.path.join(episode_dir, f"step_{step_id:04d}_lookdown_depth.npy"),
+                        "pose": pose_info,
+                        "history_frame_indices": history_frame_indices,
+                        "baseline_output": baseline_output,
+                    }
+                )
+                + "\n"
+            )
 
     def eval_action(self):
         """
@@ -281,6 +451,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             scene_id = episode.scene_id.split('/')[-2]
             episode_id = int(episode.episode_id)
             episode_instruction = episode.instruction.instruction_text
+            episode_stats = self._init_episode_stats(scene_id, episode_id, episode_instruction)
             print("episode start", episode_instruction)
 
             # save first frame per rank to validate sim quality
@@ -315,23 +486,34 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             done = False
             flag = False
             pixel_goal = None
+            output_kind = "discrete"
+            history_id = []
 
             # ---------- 2. Episode step loop -----------
             while (not done) and (step_id <= self.max_steps_per_episode):
+                step_wall_start = time.perf_counter()
                 draw_pixel_goal = False
                 # refactor agent get action
                 rgb = observations["rgb"]
-                depth = observations["depth"]
+                raw_depth = observations["depth"]
+                depth = raw_depth
                 x, y = observations["gps"]
+                compass_obs = observations["compass"]
+                compass = float(compass_obs[0]) if np.ndim(compass_obs) else float(compass_obs)
+                pose_info = {"gps": [float(x), float(y)], "compass": compass}
                 depth = filter_depth(depth.reshape(depth.shape[:2]), blur_type=None)
                 depth = depth * (self._max_depth - self._min_depth) + self._min_depth
                 depth = depth * 1000
 
                 image = Image.fromarray(rgb).convert('RGB')
                 save_raw_image = image.copy()
+                lookdown_rgb_for_replay = None
+                lookdown_depth_for_replay = None
 
                 if action == action_code.LOOKDOWN:
                     look_down_image = image
+                    lookdown_rgb_for_replay = np.asarray(look_down_image)
+                    lookdown_depth_for_replay = raw_depth
                     save_raw_image = look_down_image.copy()
                     look_down_depth, resize_shape = preprocess_depth_image_v2(
                         Image.fromarray(depth.astype(np.uint16), mode='I;16'),
@@ -350,6 +532,8 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     down_observations, _, _, _ = self.env.step(action_code.LOOKDOWN)
 
                     look_down_image = Image.fromarray(down_observations["rgb"]).convert('RGB')
+                    lookdown_rgb_for_replay = np.asarray(look_down_image)
+                    lookdown_depth_for_replay = down_observations["depth"]
                     depth = down_observations["depth"]
                     depth = filter_depth(depth.reshape(depth.shape[:2]), blur_type=None)
                     depth = depth * (self._max_depth - self._min_depth) + self._min_depth
@@ -368,6 +552,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     self.env.step(action_code.LOOKUP)
 
                 if len(action_seq) == 0 and pixel_goal is None:
+                    episode_stats["s2_call_count"] += 1
                     if action == action_code.LOOKDOWN:
                         # last action is look down
                         sources = [{"from": "human", "value": ""}, {"from": "gpt", "value": ""}]
@@ -414,6 +599,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
                     inputs = self.processor(text=[text], images=input_images, return_tensors="pt").to(self.model.device)
 
+                    s2_start = time.perf_counter()
                     with torch.no_grad():
                         output_ids = self.model.generate(
                             **inputs,
@@ -423,6 +609,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             past_key_values=None,
                             return_dict_in_generate=True,
                         ).sequences
+                    episode_stats["s2_generate_seconds"] += time.perf_counter() - s2_start
 
                     llm_outputs = self.processor.tokenizer.decode(
                         output_ids[0][inputs.input_ids.shape[1] :], skip_special_tokens=True
@@ -430,6 +617,9 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     print('step_id:', step_id, 'output text:', llm_outputs)
 
                     if bool(re.search(r'\d', llm_outputs)):  # output pixel goal
+                        output_kind = "pixel_goal"
+                        episode_stats["pixel_goal_decisions"] += 1
+                        episode_stats["pixel_goal_cycles"] += 1
                         forward_action = 0
                         coord = [int(c) for c in re.findall(r'\d+', llm_outputs)]
 
@@ -444,8 +634,10 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         pixel_values = inputs.pixel_values
                         image_grid_thw = torch.cat([thw.unsqueeze(0) for thw in inputs.image_grid_thw], dim=0)
 
+                        latent_start = time.perf_counter()
                         with torch.no_grad():
                             traj_latents = self.model.generate_latents(output_ids, pixel_values, image_grid_thw)
+                        episode_stats["s2_latent_seconds"] += time.perf_counter() - latent_start
 
                         # prepocess align with navdp
                         image_dp = torch.tensor(np.array(look_down_image.resize((224, 224)))).to(torch.bfloat16) / 255
@@ -455,8 +647,11 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         pix_goal_depth = copy.copy(depth_dp)
                         depths_dp = torch.stack([pix_goal_depth, depth_dp]).unsqueeze(0).to(self.device)
 
+                        episode_stats["s1_call_count"] += 1
+                        s1_start = time.perf_counter()
                         with torch.no_grad():
                             dp_actions = self.model.generate_traj(traj_latents, images_dp, depths_dp)
+                        episode_stats["s1_generate_seconds"] += time.perf_counter() - s1_start
 
                         action_list = traj_to_actions(dp_actions)
                         if len(action_list) < MAX_STEPS:
@@ -478,6 +673,8 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         print('predicted goal', pixel_goal, flush=True)
 
                     else:
+                        output_kind = "discrete"
+                        episode_stats["discrete_decisions"] += 1
                         action_seq = self.parse_actions(llm_outputs)
                         print('actions', action_seq, flush=True)
 
@@ -494,8 +691,11 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         depth_dp = look_down_depth.unsqueeze(-1).to(torch.bfloat16)
 
                         depths_dp = torch.stack([pix_goal_depth, depth_dp]).unsqueeze(0).to(self.device)
+                        episode_stats["s1_call_count"] += 1
+                        s1_start = time.perf_counter()
                         with torch.no_grad():
                             dp_actions = self.model.generate_traj(traj_latents, images_dp, depths_dp)
+                        episode_stats["s1_generate_seconds"] += time.perf_counter() - s1_start
 
                         action_list = traj_to_actions(dp_actions)
                         if len(action_list) < MAX_STEPS:
@@ -510,7 +710,10 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         action = local_actions.pop(0)
 
                     forward_action += 1
+                    episode_stats["pixel_goal_active_steps"] += 1
+                    episode_stats["current_pixel_goal_burst"] += 1
                     if forward_action > MAX_STEPS:
+                        self._close_pixel_goal_burst(episode_stats)
                         pixel_goal = None
                         output_ids = None
                         messages = []
@@ -519,6 +722,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         local_actions = []
                         continue
                     if action == action_code.STOP:
+                        self._close_pixel_goal_burst(episode_stats)
                         pixel_goal = None
                         output_ids = None
                         messages = []
@@ -528,6 +732,29 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         continue
                 else:
                     action = 0
+
+                if action == action_code.STOP:
+                    episode_stats["stop_actions"] += 1
+
+                self._write_replay_step(
+                    scene_id=scene_id,
+                    episode_id=episode_id,
+                    instruction=episode_instruction,
+                    step_id=step_id,
+                    rgb=np.asarray(save_raw_image),
+                    depth=raw_depth,
+                    lookdown_rgb=lookdown_rgb_for_replay,
+                    lookdown_depth=lookdown_depth_for_replay,
+                    pose_info=pose_info,
+                    history_frame_indices=history_id,
+                    baseline_output={
+                        "action": int(action),
+                        "pixel_goal": pixel_goal,
+                        "output_kind": output_kind,
+                        "llm_output": llm_outputs,
+                        "local_actions_remaining": [int(a) for a in local_actions],
+                    },
+                )
 
                 info = self.env.get_metrics()
 
@@ -564,6 +791,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     step_id += 1
                     messages = []
                     flag = False
+                episode_stats["step_wall_times"].append(time.perf_counter() - step_wall_start)
 
             # ---------- 3. End of episode -----------
             # collect the metric result of this episode and write progress to the output_path/progress.json
@@ -572,19 +800,21 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
             # After the episode finishes, collect metrics:
             metrics = self.env.get_metrics()
+            nav_error = metrics.get("oracle_navigation_error", metrics.get("distance_to_goal"))
 
             sucs.append(metrics['success'])
             spls.append(metrics['spl'])
             oss.append(metrics['oracle_success'])
-            nes.append(metrics["distance_to_goal"])
+            nes.append(nav_error)
             if 'ndtw' in metrics:
                 ndtw.append(metrics["ndtw"])
 
             print(
                 f"scene_episode {scene_id}_{episode_id:04d} success: {metrics['success']}, "
                 f"spl: {metrics['spl']}, os: {metrics['oracle_success']}, "
-                f"ne: {metrics['distance_to_goal']}"
+                f"ne: {nav_error}"
             )
+            runtime_record = self._finalize_episode_stats(episode_stats, metrics, step_id)
 
             # Write per-episode progress.json entry (still per-rank)
             result = {
@@ -592,10 +822,21 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 "episode_id": episode_id,
                 "success": metrics["success"],
                 "spl": metrics["spl"],
+                "oracle_success": metrics['oracle_success'],
+                "navigation_error": nav_error,
                 "os": metrics['oracle_success'],
-                "ne": metrics["distance_to_goal"],
+                "ne": nav_error,
                 "steps": step_id,
                 "episode_instruction": episode_instruction,
+                "episode_wall_clock_seconds": runtime_record["episode_wall_clock_seconds"],
+                "avg_step_wall_clock_seconds": runtime_record["avg_step_wall_clock_seconds"],
+                "s2_call_count": runtime_record["s2_call_count"],
+                "s2_avg_seconds": runtime_record["s2_avg_seconds"],
+                "s1_avg_seconds": runtime_record["s1_avg_seconds"],
+                "pixel_goal_ratio": runtime_record["pixel_goal_ratio"],
+                "discrete_ratio": runtime_record["discrete_ratio"],
+                "stop_ratio": runtime_record["stop_ratio"],
+                "avg_s1_steps_per_cycle": runtime_record["avg_s1_steps_per_cycle"],
             }
             if 'ndtw' in metrics:
                 result['ndtw'] = metrics['ndtw']
@@ -618,6 +859,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             if vis_writer is not None:
                 vis_writer.close()
 
+        self._flush_runtime_summary()
         self.env.close()
 
         return (

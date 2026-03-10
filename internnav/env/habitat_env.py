@@ -46,6 +46,15 @@ class HabitatEnv(base.Env):
             List[Any]: A list of episode objects for the current split.
         """
         all_episodes = []
+        allowed_scene_ids = self.config.habitat.dataset.get("allowed_scene_ids", None)
+        if allowed_scene_ids:
+            allowed_scene_ids = set(allowed_scene_ids)
+
+        allowed_episode_ids = self.config.habitat.dataset.get("allowed_episode_ids", None)
+        if allowed_episode_ids:
+            allowed_episode_ids = {str(ep_id) for ep_id in allowed_episode_ids}
+
+        max_eval_episodes = self.config.habitat.dataset.get("max_eval_episodes", None)
 
         # group episodes by scene
         scene_episode_dict: Dict[str, List[Any]] = {}
@@ -68,12 +77,20 @@ class HabitatEnv(base.Env):
             per_scene_eps = scene_episode_dict[scene]
             scene_id = scene.split('/')[-2]
 
+            # allow filtering to a tiny subset without modifying Habitat internals
+            if allowed_scene_ids and scene_id not in allowed_scene_ids:
+                continue
+
             # shard by rank index / world_size
             for episode in per_scene_eps[self.rank :: self.world_size]:
                 episode_id = int(episode.episode_id)
+                if allowed_episode_ids and str(episode_id) not in allowed_episode_ids:
+                    continue
                 if (scene_id, episode_id) in done_res:
                     continue
                 all_episodes.append(episode)
+                if max_eval_episodes is not None and len(all_episodes) >= int(max_eval_episodes):
+                    return all_episodes
 
         return all_episodes
 
