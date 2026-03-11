@@ -192,6 +192,8 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         self.replay_num_episodes = int(getattr(args, "replay_num_episodes", 0) or 0)
         self.replay_root = os.path.join(self.output_path, "replay_subset")
         self.replay_manifest_path = os.path.join(self.replay_root, f"manifest_rank{self.rank}.jsonl")
+        self.replay_v2_root = os.path.join(self.output_path, "replay_subset_v2")
+        self.replay_v2_manifest_path = os.path.join(self.replay_v2_root, f"manifest_rank{self.rank}.jsonl")
         self.runtime_profile_path = os.path.join(self.output_path, f"runtime_rank{self.rank}.jsonl")
         self.runtime_summary_path = os.path.join(self.output_path, f"runtime_summary_rank{self.rank}.json")
         self.runtime_records = []
@@ -341,6 +343,104 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 + "\n"
             )
 
+    def _init_replay_v2_state(self):
+        return {
+            "next_record_id": 0,
+            "next_decision_id": 0,
+            "next_pixel_goal_cycle_id": 0,
+            "active_decision_id": None,
+            "active_pixel_goal_cycle_id": None,
+            "active_decision_step_offset": 0,
+            "active_cycle_step_offset": 0,
+            "rgb_frame_paths": [],
+            "last_s2_context": None,
+            "last_input_image_paths": [],
+        }
+
+    def _replay_v2_asset_paths(self, scene_id, episode_id, record_id, step_id):
+        episode_dir = os.path.join(self.replay_v2_root, f"{scene_id}_{episode_id:04d}")
+        stem = f"record_{record_id:04d}_step_{step_id:04d}"
+        return {
+            "episode_dir": episode_dir,
+            "rgb_path": os.path.join(episode_dir, f"{stem}_rgb.png"),
+            "depth_path": os.path.join(episode_dir, f"{stem}_depth.npy"),
+            "lookdown_rgb_path": os.path.join(episode_dir, f"{stem}_lookdown_rgb.png"),
+            "lookdown_depth_path": os.path.join(episode_dir, f"{stem}_lookdown_depth.npy"),
+        }
+
+    def _to_jsonable(self, value):
+        if isinstance(value, dict):
+            return {k: self._to_jsonable(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [self._to_jsonable(v) for v in value]
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+        if isinstance(value, (np.integer,)):
+            return int(value)
+        if isinstance(value, (np.floating,)):
+            return float(value)
+        if isinstance(value, torch.Tensor):
+            return value.detach().cpu().tolist()
+        return value
+
+    def _serialize_messages(self, messages, image_paths):
+        serialized = []
+        image_idx = 0
+        for message in messages:
+            content_items = []
+            for item in message.get("content", []):
+                item_type = item.get("type")
+                if item_type == "image":
+                    content_items.append(
+                        {
+                            "type": "image",
+                            "image_index": image_idx,
+                            "path": image_paths[image_idx] if image_idx < len(image_paths) else None,
+                        }
+                    )
+                    image_idx += 1
+                elif item_type == "text":
+                    content_items.append({"type": "text", "text": item.get("text", "")})
+            serialized.append({"role": message.get("role"), "content": content_items})
+        return serialized
+
+    def _write_replay_step_v2(
+        self,
+        scene_id,
+        episode_id,
+        step_id,
+        rgb,
+        depth,
+        lookdown_rgb,
+        lookdown_depth,
+        asset_paths,
+        record,
+    ):
+        if (scene_id, episode_id) not in self.replay_episode_keys:
+            return
+
+        os.makedirs(asset_paths["episode_dir"], exist_ok=True)
+        Image.fromarray(rgb).save(asset_paths["rgb_path"])
+        np.save(asset_paths["depth_path"], depth)
+        if lookdown_rgb is not None:
+            Image.fromarray(lookdown_rgb).save(asset_paths["lookdown_rgb_path"])
+        if lookdown_depth is not None:
+            np.save(asset_paths["lookdown_depth_path"], lookdown_depth)
+
+        payload = {
+            "replay_version": "v2",
+            "scene_id": scene_id,
+            "episode_id": episode_id,
+            "step_id": step_id,
+            "rgb_path": asset_paths["rgb_path"],
+            "depth_path": asset_paths["depth_path"],
+            "lookdown_rgb_path": asset_paths["lookdown_rgb_path"],
+            "lookdown_depth_path": asset_paths["lookdown_depth_path"],
+            **record,
+        }
+        with open(self.replay_v2_manifest_path, "a") as f:
+            f.write(json.dumps(self._to_jsonable(payload)) + "\n")
+
     def eval_action(self):
         """
         Run local episodes on this rank.
@@ -488,11 +588,19 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             pixel_goal = None
             output_kind = "discrete"
             history_id = []
+            replay_v2_state = self._init_replay_v2_state()
 
             # ---------- 2. Episode step loop -----------
             while (not done) and (step_id <= self.max_steps_per_episode):
                 step_wall_start = time.perf_counter()
                 draw_pixel_goal = False
+                is_new_s2_decision = len(action_seq) == 0 and pixel_goal is None
+                is_lookdown_followup = bool(is_new_s2_decision and action == action_code.LOOKDOWN)
+                action_source = "idle"
+                s1_regenerated = False
+                record_id = replay_v2_state["next_record_id"]
+                replay_v2_state["next_record_id"] += 1
+                replay_v2_paths = self._replay_v2_asset_paths(scene_id, episode_id, record_id, step_id)
                 # refactor agent get action
                 rgb = observations["rgb"]
                 raw_depth = observations["depth"]
@@ -551,12 +659,28 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     self.env.step(action_code.LOOKUP)
                     self.env.step(action_code.LOOKUP)
 
-                if len(action_seq) == 0 and pixel_goal is None:
+                current_rgb_input_path = replay_v2_paths["rgb_path"]
+                current_lookdown_input_path = replay_v2_paths["lookdown_rgb_path"]
+                if action != action_code.LOOKDOWN and len(replay_v2_state["rgb_frame_paths"]) < len(rgb_list):
+                    replay_v2_state["rgb_frame_paths"].append(current_rgb_input_path)
+
+                if is_new_s2_decision:
                     episode_stats["s2_call_count"] += 1
+                    replay_v2_state["active_decision_id"] = replay_v2_state["next_decision_id"]
+                    replay_v2_state["next_decision_id"] += 1
+                    replay_v2_state["active_decision_step_offset"] = 0
+                    prompt_instruction = None
+                    text = None
+                    input_image_paths = []
+                    serialized_messages = []
+                    generated_token_count = 0
+                    initial_s2_action_seq = []
+                    initial_s1_actions = []
                     if action == action_code.LOOKDOWN:
                         # last action is look down
                         sources = [{"from": "human", "value": ""}, {"from": "gpt", "value": ""}]
                         input_images += [look_down_image]
+                        input_image_paths = list(replay_v2_state["last_input_image_paths"]) + [current_lookdown_input_path]
                         messages.append(
                             {'role': 'assistant', 'content': [{'type': 'text', 'text': llm_outputs}]}  # noqa: F405
                         )
@@ -578,6 +702,9 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
                         history_id = sorted(history_id)
                         input_images = [rgb_list[i] for i in history_id] + cur_images
+                        input_image_paths = [replay_v2_state["rgb_frame_paths"][i] for i in history_id] + [
+                            current_rgb_input_path
+                        ]
                         input_img_id = 0
 
                     prompt = random.choice(self.conjunctions) + DEFAULT_IMAGE_TOKEN
@@ -594,8 +721,10 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             content.append({"type": "text", "text": parts[i]})
 
                     messages.append({'role': 'user', 'content': content})
+                    serialized_messages = self._serialize_messages(messages, input_image_paths)
 
                     text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                    replay_v2_state["last_input_image_paths"] = list(input_image_paths)
 
                     inputs = self.processor(text=[text], images=input_images, return_tensors="pt").to(self.model.device)
 
@@ -614,12 +743,16 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     llm_outputs = self.processor.tokenizer.decode(
                         output_ids[0][inputs.input_ids.shape[1] :], skip_special_tokens=True
                     )
+                    generated_token_count = int(output_ids.shape[1] - inputs.input_ids.shape[1])
                     print('step_id:', step_id, 'output text:', llm_outputs)
 
                     if bool(re.search(r'\d', llm_outputs)):  # output pixel goal
                         output_kind = "pixel_goal"
                         episode_stats["pixel_goal_decisions"] += 1
                         episode_stats["pixel_goal_cycles"] += 1
+                        replay_v2_state["active_pixel_goal_cycle_id"] = replay_v2_state["next_pixel_goal_cycle_id"]
+                        replay_v2_state["next_pixel_goal_cycle_id"] += 1
+                        replay_v2_state["active_cycle_step_offset"] = 0
                         forward_action = 0
                         coord = [int(c) for c in re.findall(r'\d+', llm_outputs)]
 
@@ -658,6 +791,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             action_list += [0] * (MAX_STEPS - len(action_list))
 
                         local_actions = action_list
+                        initial_s1_actions = [int(a) for a in local_actions]
                         if len(local_actions) >= MAX_LOCAL_STEPS:
                             local_actions = local_actions[:MAX_LOCAL_STEPS]
 
@@ -669,6 +803,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             observations, _, done, _ = self.env.step(action)
                             step_id += 1
                             messages = []
+                            replay_v2_state["active_pixel_goal_cycle_id"] = None
                             continue
                         print('predicted goal', pixel_goal, flush=True)
 
@@ -676,11 +811,31 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         output_kind = "discrete"
                         episode_stats["discrete_decisions"] += 1
                         action_seq = self.parse_actions(llm_outputs)
+                        initial_s2_action_seq = [int(a) for a in action_seq]
+                        replay_v2_state["active_pixel_goal_cycle_id"] = None
+                        replay_v2_state["active_cycle_step_offset"] = 0
                         print('actions', action_seq, flush=True)
+
+                    replay_v2_state["last_s2_context"] = {
+                        "decision_id": replay_v2_state["active_decision_id"],
+                        "is_lookdown_followup": is_lookdown_followup,
+                        "history_frame_indices": list(history_id),
+                        "input_image_paths": list(input_image_paths),
+                        "prompt_text": prompt_instruction,
+                        "chat_template_text": text,
+                        "conversation_messages": serialized_messages,
+                        "s2_output_text": llm_outputs,
+                        "s2_generated_token_count": generated_token_count,
+                        "s2_output_kind": output_kind,
+                        "s2_output_pixel": list(pixel_goal) if pixel_goal is not None else None,
+                        "s2_action_seq": initial_s2_action_seq,
+                        "s1_initial_action_seq": initial_s1_actions,
+                    }
 
                 if len(action_seq) != 0:
                     action = action_seq[0]
                     action_seq.pop(0)
+                    action_source = "s2_discrete_initial" if is_new_s2_decision else "s2_discrete_continuation"
                 elif pixel_goal is not None:
                     if len(local_actions) == 0:
                         # navdp
@@ -702,12 +857,14 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             action_list += [0] * (MAX_STEPS - len(action_list))
 
                         local_actions = action_list
+                        s1_regenerated = True
                         if len(local_actions) >= MAX_LOCAL_STEPS:
                             local_actions = local_actions[:MAX_LOCAL_STEPS]
                         print("local_actions", local_actions)
                         action = local_actions.pop(0)
                     else:
                         action = local_actions.pop(0)
+                    action_source = "s1_cycle_initial" if is_new_s2_decision else "s1_cycle_continuation"
 
                     forward_action += 1
                     episode_stats["pixel_goal_active_steps"] += 1
@@ -720,6 +877,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         step_id += 1
                         forward_action = 0
                         local_actions = []
+                        replay_v2_state["active_pixel_goal_cycle_id"] = None
                         continue
                     if action == action_code.STOP:
                         self._close_pixel_goal_burst(episode_stats)
@@ -729,12 +887,29 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         step_id += 1
                         forward_action = 0
                         local_actions = []
+                        replay_v2_state["active_pixel_goal_cycle_id"] = None
                         continue
                 else:
                     action = 0
+                    action_source = "default_stop"
 
                 if action == action_code.STOP:
                     episode_stats["stop_actions"] += 1
+
+                decision_context = replay_v2_state["last_s2_context"] or {}
+                decision_id = replay_v2_state["active_decision_id"]
+                pixel_goal_cycle_id = replay_v2_state["active_pixel_goal_cycle_id"]
+                decision_step_offset = replay_v2_state["active_decision_step_offset"] if decision_id is not None else None
+                cycle_step_offset = (
+                    replay_v2_state["active_cycle_step_offset"] if pixel_goal_cycle_id is not None else None
+                )
+                baseline_output = {
+                    "action": int(action),
+                    "pixel_goal": pixel_goal,
+                    "output_kind": output_kind,
+                    "llm_output": llm_outputs,
+                    "local_actions_remaining": [int(a) for a in local_actions],
+                }
 
                 self._write_replay_step(
                     scene_id=scene_id,
@@ -747,15 +922,52 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     lookdown_depth=lookdown_depth_for_replay,
                     pose_info=pose_info,
                     history_frame_indices=history_id,
-                    baseline_output={
-                        "action": int(action),
-                        "pixel_goal": pixel_goal,
-                        "output_kind": output_kind,
-                        "llm_output": llm_outputs,
-                        "local_actions_remaining": [int(a) for a in local_actions],
+                    baseline_output=baseline_output,
+                )
+                self._write_replay_step_v2(
+                    scene_id=scene_id,
+                    episode_id=episode_id,
+                    step_id=step_id,
+                    rgb=np.asarray(save_raw_image),
+                    depth=raw_depth,
+                    lookdown_rgb=lookdown_rgb_for_replay,
+                    lookdown_depth=lookdown_depth_for_replay,
+                    asset_paths=replay_v2_paths,
+                    record={
+                        "record_id": record_id,
+                        "instruction": episode_instruction,
+                        "pose": pose_info,
+                        "history_frame_indices": decision_context.get("history_frame_indices", history_id),
+                        "history_rgb_paths": decision_context.get("input_image_paths", [])[:-1]
+                        if decision_context.get("input_image_paths")
+                        else [],
+                        "is_new_s2_decision": is_new_s2_decision,
+                        "is_lookdown_followup": is_lookdown_followup,
+                        "decision_id": decision_id,
+                        "decision_step_offset": decision_step_offset,
+                        "pixel_goal_cycle_id": pixel_goal_cycle_id,
+                        "cycle_step_offset": cycle_step_offset,
+                        "action_source": action_source,
+                        "s1_regenerated_this_step": s1_regenerated,
+                        "decision_prompt_text": decision_context.get("prompt_text"),
+                        "decision_chat_text": decision_context.get("chat_template_text"),
+                        "decision_input_image_paths": decision_context.get("input_image_paths", []),
+                        "conversation_messages": decision_context.get("conversation_messages", []),
+                        "s2_output_text": decision_context.get("s2_output_text", llm_outputs),
+                        "s2_generated_token_count": decision_context.get("s2_generated_token_count", 0),
+                        "s2_output_kind": decision_context.get("s2_output_kind", output_kind),
+                        "s2_output_pixel": decision_context.get("s2_output_pixel"),
+                        "s2_action_seq": decision_context.get("s2_action_seq", []),
+                        "s1_initial_action_seq": decision_context.get("s1_initial_action_seq", []),
+                        "baseline_output": baseline_output,
+                        "http_loopback": {
+                            "frame_id": record_id,
+                            "reset": step_id == 0 and not is_lookdown_followup,
+                            "instruction": episode_instruction,
+                            "use_recorded_lookdown": True,
+                        },
                     },
                 )
-
                 info = self.env.get_metrics()
 
                 if info['top_down_map'] is not None and self.save_video:
@@ -791,6 +1003,10 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     step_id += 1
                     messages = []
                     flag = False
+                if replay_v2_state["active_decision_id"] is not None:
+                    replay_v2_state["active_decision_step_offset"] += 1
+                if replay_v2_state["active_pixel_goal_cycle_id"] is not None:
+                    replay_v2_state["active_cycle_step_offset"] += 1
                 episode_stats["step_wall_times"].append(time.perf_counter() - step_wall_start)
 
             # ---------- 3. End of episode -----------
