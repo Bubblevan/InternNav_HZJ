@@ -60,6 +60,18 @@ def parse_args():
     parser.add_argument("--manifest", required=True, help="Replay manifest jsonl path")
     parser.add_argument("--model-path", required=True, help="DualVLN checkpoint path")
     parser.add_argument("--device", default="cuda:0", help="Torch device")
+    parser.add_argument(
+        "--attn-backend",
+        choices=["flash_attention_2", "sdpa", "eager"],
+        default="flash_attention_2",
+        help="Attention backend passed to from_pretrained",
+    )
+    parser.add_argument(
+        "--processor-use-fast",
+        choices=["auto", "true", "false"],
+        default="auto",
+        help="Forward use_fast to AutoProcessor when not set to auto",
+    )
     parser.add_argument("--num-history", type=int, default=8, help="History length")
     parser.add_argument(
         "--prompt-variant",
@@ -115,6 +127,25 @@ def summarize_latencies(values):
         "p99": percentile(values, 99),
         "max": max(values),
     }
+
+
+def summarize_numeric(values):
+    return summarize_latencies(values)
+
+
+def count_image_tokens(image_grid_thw):
+    if image_grid_thw is None:
+        return 0
+    if isinstance(image_grid_thw, torch.Tensor):
+        if image_grid_thw.ndim == 1:
+            image_grid_thw = image_grid_thw.unsqueeze(0)
+        counts = torch.prod(image_grid_thw.to(torch.int64), dim=-1)
+        return int(counts.sum().item())
+    total = 0
+    for thw in image_grid_thw:
+        tensor = thw if isinstance(thw, torch.Tensor) else torch.as_tensor(thw)
+        total += int(torch.prod(tensor.to(torch.int64)).item())
+    return total
 
 
 def load_manifest(path, base_path=None):
@@ -206,12 +237,15 @@ def main():
     total_planned_steps = count_total_steps(replay_steps)
 
     load_start = time.perf_counter()
-    processor = AutoProcessor.from_pretrained(args.model_path)
+    processor_kwargs = {}
+    if args.processor_use_fast != "auto":
+        processor_kwargs["use_fast"] = args.processor_use_fast == "true"
+    processor = AutoProcessor.from_pretrained(args.model_path, **processor_kwargs)
     processor.tokenizer.padding_side = "left"
     model = InternVLAN1ForCausalLM.from_pretrained(
         args.model_path,
         torch_dtype=torch.bfloat16,
-        attn_implementation="flash_attention_2",
+        attn_implementation=args.attn_backend,
         device_map={"": torch.device(args.device)},
     )
     model.eval()
@@ -226,6 +260,11 @@ def main():
     s1_generate_latencies = []
     discrete_total_latencies = []
     pixel_total_latencies = []
+    input_token_counts = []
+    input_image_counts = []
+    history_image_counts = []
+    prompt_char_counts = []
+    image_token_counts = []
     tokens_per_second = []
     gen_lengths = []
     action_matches = 0
@@ -262,6 +301,17 @@ def main():
                 )
                 text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
                 inputs = processor(text=[text], images=input_images, return_tensors="pt").to(model.device)
+                input_token_count = int(inputs.input_ids.shape[1])
+                input_image_count = int(len(input_images))
+                history_image_count = int(len(history_indices))
+                prompt_char_count = int(len(text))
+                image_token_count = count_image_tokens(getattr(inputs, "image_grid_thw", None))
+
+                input_token_counts.append(input_token_count)
+                input_image_counts.append(input_image_count)
+                history_image_counts.append(history_image_count)
+                prompt_char_counts.append(prompt_char_count)
+                image_token_counts.append(image_token_count)
 
                 step_start = time.perf_counter()
                 s2_start = time.perf_counter()
@@ -374,6 +424,11 @@ def main():
                     "s1_generate_seconds": s1_generate_seconds,
                     "generated_tokens": gen_token_count,
                     "tokens_per_second": gen_token_count / max(s2_generate_seconds, 1e-6),
+                    "input_token_count": input_token_count,
+                    "input_image_count": input_image_count,
+                    "history_image_count": history_image_count,
+                    "prompt_char_count": prompt_char_count,
+                    "image_token_count": image_token_count,
                     "output_text": output_text,
                     "baseline_text": baseline["llm_output"],
                     "predicted_action": predicted_action,
@@ -400,6 +455,8 @@ def main():
             "manifest": args.manifest,
             "model_path": args.model_path,
             "device": args.device,
+            "attn_backend": args.attn_backend,
+            "processor_use_fast": args.processor_use_fast,
             "num_history": args.num_history,
             "prompt_variant": args.prompt_variant,
             "max_new_tokens": args.max_new_tokens,
@@ -429,6 +486,13 @@ def main():
             "tokens_per_second_mean": statistics.mean(tokens_per_second) if tokens_per_second else 0.0,
             "tokens_per_second_p50": percentile(tokens_per_second, 50),
             "tokens_per_second_p95": percentile(tokens_per_second, 95),
+        },
+        "prefill": {
+            "input_token_count": summarize_numeric(input_token_counts),
+            "input_image_count": summarize_numeric(input_image_counts),
+            "history_image_count": summarize_numeric(history_image_counts),
+            "prompt_char_count": summarize_numeric(prompt_char_counts),
+            "image_token_count": summarize_numeric(image_token_counts),
         },
         "consistency": {
             "action_match_rate_all": (action_matches / action_total) if action_total else 0.0,

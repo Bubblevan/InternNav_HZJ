@@ -91,6 +91,7 @@ def build_run_cfg(base_config_path, dataset, num_history, output_root, max_eval_
     cfg.eval_settings["allowed_episode_ids"] = []
     cfg.eval_settings["max_eval_episodes"] = None if max_eval_episodes is None else int(max_eval_episodes)
     cfg.eval_settings["replay_num_episodes"] = int(replay_num_episodes)
+    cfg.eval_settings["export_replay_subset"] = int(replay_num_episodes) > 0
     cfg.eval_settings["scenes_dir_override"] = "data/scene_data"
     return cfg
 

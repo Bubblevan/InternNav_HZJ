@@ -198,10 +198,32 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--model_path", type=str, default="checkpoints/InternVLA-N1-DualVLN")
+    parser.add_argument(
+        "--attn_backend",
+        type=str,
+        default="flash_attention_2",
+        choices=["flash_attention_2", "sdpa", "eager"],
+        help="Attention backend passed to the DualVLN loader",
+    )
+    parser.add_argument(
+        "--processor_use_fast",
+        type=str,
+        default="auto",
+        choices=["auto", "true", "false"],
+        help="Forward use_fast to AutoProcessor when not auto",
+    )
     parser.add_argument("--resize_w", type=int, default=384)
     parser.add_argument("--resize_h", type=int, default=384)
     parser.add_argument("--num_history", type=int, default=8)
     parser.add_argument("--plan_step_gap", type=int, default=4)
+    parser.add_argument(
+        "--kv_cache_mode",
+        type=str,
+        default="disabled",
+        choices=["disabled", "lookdown_experimental"],
+        help="Experimental KV cache mode for look_down continuation",
+    )
+    parser.add_argument("--kv_cache_debug", action="store_true", help="Print KV cache debug information")
     parser.add_argument("--camera_height", type=float, default=0.4,
                        help="相机离地高度(m)，用于 trajectory->pixel 投影（无 pixel_goal 时）")
     args = parser.parse_args()

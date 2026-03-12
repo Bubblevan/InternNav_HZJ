@@ -23,6 +23,18 @@ def parse_args():
     parser.add_argument("--manifest", required=True, help="Replay manifest jsonl path, preferably replay_subset_v2")
     parser.add_argument("--model-path", required=True, help="DualVLN checkpoint path")
     parser.add_argument("--device", default="cuda:0", help="Torch device")
+    parser.add_argument(
+        "--attn-backend",
+        choices=["flash_attention_2", "sdpa", "eager"],
+        default="flash_attention_2",
+        help="Attention backend passed to the realworld agent model loader",
+    )
+    parser.add_argument(
+        "--processor-use-fast",
+        choices=["auto", "true", "false"],
+        default="auto",
+        help="Forward use_fast to AutoProcessor inside the realworld agent when not auto",
+    )
     parser.add_argument("--output", required=True, help="Summary json output path")
     parser.add_argument("--details-output", default=None, help="Optional per-step details jsonl path")
     parser.add_argument("--base-path", default=None, help="Optional base path to replace ./logs/ in manifest paths")
@@ -31,6 +43,13 @@ def parse_args():
     parser.add_argument("--resize-h", type=int, default=384, help="Agent RGB resize height")
     parser.add_argument("--num-history", type=int, default=8, help="Agent history length")
     parser.add_argument("--plan-step-gap", type=int, default=4, help="Realworld agent plan step gap")
+    parser.add_argument(
+        "--kv-cache-mode",
+        choices=["disabled", "lookdown_experimental"],
+        default="disabled",
+        help="KV cache experiment mode forwarded to the realworld agent",
+    )
+    parser.add_argument("--kv-cache-debug", action="store_true", help="Enable verbose KV cache debug logging")
     parser.add_argument("--camera-height", type=float, default=0.4, help="Camera height for agent intrinsic")
     parser.add_argument("--use-recorded-lookdown", action="store_true", help="Use recorded lookdown RGB/depth if present")
     parser.add_argument("--verbose-every", type=int, default=20, help="Print one timing line every N replay steps")
@@ -112,10 +131,14 @@ class LocalHTTPDualLoopback:
         agent_args = SimpleNamespace(
             device=args.device,
             model_path=args.model_path,
+            attn_backend=args.attn_backend,
+            processor_use_fast=args.processor_use_fast,
             resize_w=args.resize_w,
             resize_h=args.resize_h,
             num_history=args.num_history,
             plan_step_gap=args.plan_step_gap,
+            kv_cache_mode=args.kv_cache_mode,
+            kv_cache_debug=args.kv_cache_debug,
         )
         self.camera_intrinsic = np.array(
             [[386.5, 0.0, 328.9, 0.0], [0.0, 386.5, 244.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]],
@@ -132,6 +155,12 @@ class LocalHTTPDualLoopback:
 
     def reset(self):
         self.agent.reset()
+
+    def get_kv_cache_stats(self):
+        return self.agent.get_kv_cache_stats()
+
+    def get_last_kv_cache_event(self):
+        return self.agent.get_last_kv_cache_event()
 
     def _decode_request(self, rgb_bytes, depth_bytes):
         image = Image.open(io.BytesIO(rgb_bytes)).convert("RGB")
@@ -302,6 +331,7 @@ def main():
                     "predicted_pixel_goal": response["pixel_goal"],
                     "baseline_action": baseline["action"],
                     "baseline_pixel_goal": baseline["pixel_goal"],
+                    "kv_cache_event": server.get_last_kv_cache_event(),
                 }
                 records.append(record)
                 detail_f.write(json.dumps(record) + "\n")
@@ -324,8 +354,11 @@ def main():
             "manifest": args.manifest,
             "model_path": args.model_path,
             "device": args.device,
+            "attn_backend": args.attn_backend,
+            "processor_use_fast": args.processor_use_fast,
             "num_history": args.num_history,
             "plan_step_gap": args.plan_step_gap,
+            "kv_cache_mode": args.kv_cache_mode,
             "use_recorded_lookdown": bool(args.use_recorded_lookdown),
             "num_steps": len(records),
             "num_episodes": len(replay_steps),
@@ -356,6 +389,7 @@ def main():
         },
         "breakdown": {
             "lookdown_used_steps": lookdown_count,
+            "kv_cache_stats": server.get_kv_cache_stats(),
         },
     }
     with open(args.output, "w", encoding="utf-8") as f:

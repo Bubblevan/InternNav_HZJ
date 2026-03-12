@@ -122,6 +122,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
         # ------------------------------------- model ------------------------------------------
         self.model_args = argparse.Namespace(**cfg.agent.model_settings)
+        self._init_env_capabilities()
         self.vis_debug = bool(getattr(self.model_args, "vis_debug", False))
         self.vis_debug_path = getattr(self.model_args, "vis_debug_path", os.path.join(self.output_path, "vis_debug"))
 
@@ -153,7 +154,16 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         self.processor = processor
 
         # refactor: this part used in three places
-        prompt = "You are an autonomous navigation assistant. Your task is to <instruction>. Where should you go next to stay on track? Please output the next waypoint\'s coordinates in the image. Please output STOP when you have successfully completed the task."
+        prompt = (
+            "You are an autonomous navigation assistant. Your task is to <instruction>. "
+            "Where should you go next to stay on track? Please output the next waypoint's "
+            "coordinates in the image. Please output STOP when you have successfully completed the task."
+        )
+        if not self.has_lookdown_support:
+            prompt += (
+                " Available discrete actions are only ↑, ←, →, and STOP. "
+                "Do not output ↓."
+            )
         answer = ""
         self.conversation = [{"from": "human", "value": prompt}, {"from": "gpt", "value": answer}]
 
@@ -173,9 +183,15 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 "↑": [1],
                 "←": [2],
                 "→": [3],
-                "↓": [5],
             }
         )
+        if self.has_lookdown_support:
+            self.actions2idx["↓"] = [5]
+        else:
+            # HA-VLN exposes a 4-action interface. Map "look down / continue
+            # local planning" to a forward move instead of silently falling
+            # back to STOP when the model emits "↓".
+            self.actions2idx["↓"] = [1]
 
         self.num_history = self.model_args.num_history
 
@@ -198,6 +214,92 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         self.runtime_summary_path = os.path.join(self.output_path, f"runtime_summary_rank{self.rank}.json")
         self.runtime_records = []
         self.replay_episode_keys = self._select_replay_episodes()
+
+    def _init_env_capabilities(self):
+        lab_sensors = getattr(self.config.habitat.task, "lab_sensors", None)
+        lab_sensor_names = set(lab_sensors.keys()) if lab_sensors is not None else set()
+        action_names = set(self.config.habitat.task.actions.keys())
+        env_capabilities = {}
+        if hasattr(self.env, "get_capabilities"):
+            env_capabilities = self.env.get_capabilities() or {}
+
+        self.has_pose_sensors = "gps_sensor" in lab_sensor_names and "compass_sensor" in lab_sensor_names
+        self.has_pitch_actions = "look_up" in action_names and "look_down" in action_names
+        self.has_external_lookdown_views = bool(env_capabilities.get("has_external_lookdown_views", False))
+        self.has_lookdown_support = self.has_pitch_actions or self.has_external_lookdown_views
+        self.use_system1_local_policy = self.model_args.mode == 'dual_system' and self.has_lookdown_support
+
+        print(
+            "env_capabilities:",
+            {
+                "has_pose_sensors": self.has_pose_sensors,
+                "has_pitch_actions": self.has_pitch_actions,
+                "has_external_lookdown_views": self.has_external_lookdown_views,
+                "has_lookdown_support": self.has_lookdown_support,
+                "use_system1_local_policy": self.use_system1_local_policy,
+            },
+            flush=True,
+        )
+
+    def _pixel_goal_to_discrete_actions(self, pixel_goal, image_width: int) -> list[int]:
+        x_coord = int(pixel_goal[0])
+        far_left_threshold = int(image_width * 0.2)
+        left_threshold = int(image_width * 0.4)
+        right_threshold = int(image_width * 0.6)
+        far_right_threshold = int(image_width * 0.8)
+
+        if x_coord < far_left_threshold:
+            return [action_code.LEFT, action_code.FORWARD]
+        if x_coord < left_threshold:
+            return [action_code.LEFT]
+        if x_coord > far_right_threshold:
+            return [action_code.RIGHT, action_code.FORWARD]
+        if x_coord > right_threshold:
+            return [action_code.RIGHT]
+        return [action_code.FORWARD, action_code.FORWARD]
+
+    def _fallback_actions_for_unavailable_lookdown(self, depth: np.ndarray, step_id: int) -> list[int]:
+        depth_map = np.asarray(depth).squeeze()
+        if depth_map.ndim != 2:
+            return [action_code.FORWARD]
+
+        height, width = depth_map.shape
+        center = depth_map[:, width // 3 : (2 * width) // 3]
+        left = depth_map[:, : width // 3]
+        right = depth_map[:, (2 * width) // 3 :]
+
+        def median_clearance(region: np.ndarray) -> float:
+            valid = region[np.isfinite(region) & (region > 1e-3)]
+            if valid.size == 0:
+                return 0.0
+            return float(np.median(valid))
+
+        center_clearance = median_clearance(center)
+        left_clearance = median_clearance(left)
+        right_clearance = median_clearance(right)
+
+        if center_clearance >= 1.0:
+            return [action_code.FORWARD]
+        if left_clearance > right_clearance:
+            return [action_code.LEFT, action_code.FORWARD]
+        if right_clearance > left_clearance:
+            return [action_code.RIGHT, action_code.FORWARD]
+        return [action_code.LEFT] if step_id % 2 == 0 else [action_code.RIGHT]
+
+    def _get_external_lookdown_observations(self, observations):
+        if "lookdown_rgb" not in observations or "lookdown_depth" not in observations:
+            raise KeyError(
+                "Environment advertised external lookdown views but current observation "
+                f"keys are only {sorted(observations.keys())}"
+            )
+        return observations["lookdown_rgb"], observations["lookdown_depth"]
+
+    def _make_internal_lookdown_followup_observations(self, observations):
+        lookdown_rgb, lookdown_depth = self._get_external_lookdown_observations(observations)
+        followup = dict(observations)
+        followup["rgb"] = lookdown_rgb
+        followup["depth"] = lookdown_depth
+        return followup
 
     def _select_replay_episodes(self):
         if not self.replay_enabled or self.replay_num_episodes <= 0:
@@ -605,10 +707,13 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 rgb = observations["rgb"]
                 raw_depth = observations["depth"]
                 depth = raw_depth
-                x, y = observations["gps"]
-                compass_obs = observations["compass"]
-                compass = float(compass_obs[0]) if np.ndim(compass_obs) else float(compass_obs)
-                pose_info = {"gps": [float(x), float(y)], "compass": compass}
+                if self.has_pose_sensors:
+                    x, y = observations["gps"]
+                    compass_obs = observations["compass"]
+                    compass = float(compass_obs[0]) if np.ndim(compass_obs) else float(compass_obs)
+                    pose_info = {"gps": [float(x), float(y)], "compass": compass}
+                else:
+                    pose_info = {}
                 depth = filter_depth(depth.reshape(depth.shape[:2]), blur_type=None)
                 depth = depth * (self._max_depth - self._min_depth) + self._min_depth
                 depth = depth * 1000
@@ -618,13 +723,27 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 lookdown_rgb_for_replay = None
                 lookdown_depth_for_replay = None
 
-                if action == action_code.LOOKDOWN:
-                    look_down_image = image
-                    lookdown_rgb_for_replay = np.asarray(look_down_image)
-                    lookdown_depth_for_replay = raw_depth
-                    save_raw_image = look_down_image.copy()
+                if action == action_code.LOOKDOWN and self.has_lookdown_support:
+                    if self.has_external_lookdown_views and not self.has_pitch_actions:
+                        lookdown_rgb_array, lookdown_depth_raw = self._get_external_lookdown_observations(observations)
+                        look_down_image = Image.fromarray(lookdown_rgb_array).convert('RGB')
+                        lookdown_rgb_for_replay = np.asarray(look_down_image)
+                        lookdown_depth_for_replay = lookdown_depth_raw
+                        save_raw_image = look_down_image.copy()
+                        depth_for_local = filter_depth(
+                            lookdown_depth_raw.reshape(lookdown_depth_raw.shape[:2]),
+                            blur_type=None,
+                        )
+                        depth_for_local = depth_for_local * (self._max_depth - self._min_depth) + self._min_depth
+                        depth_for_local = depth_for_local * 1000
+                    else:
+                        look_down_image = image
+                        lookdown_rgb_for_replay = np.asarray(look_down_image)
+                        lookdown_depth_for_replay = raw_depth
+                        save_raw_image = look_down_image.copy()
+                        depth_for_local = depth
                     look_down_depth, resize_shape = preprocess_depth_image_v2(
-                        Image.fromarray(depth.astype(np.uint16), mode='I;16'),
+                        Image.fromarray(depth_for_local.astype(np.uint16), mode='I;16'),
                         do_depth_scale=True,
                         depth_scale=1000,
                         target_height=224,
@@ -636,18 +755,36 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     image = image.resize((self.model_args.resize_w, self.model_args.resize_h))
                     rgb_list.append(image)
 
-                    down_observations, _, _, _ = self.env.step(action_code.LOOKDOWN)
-                    down_observations, _, _, _ = self.env.step(action_code.LOOKDOWN)
+                    if self.has_pitch_actions:
+                        down_observations, _, _, _ = self.env.step(action_code.LOOKDOWN)
+                        down_observations, _, _, _ = self.env.step(action_code.LOOKDOWN)
 
-                    look_down_image = Image.fromarray(down_observations["rgb"]).convert('RGB')
-                    lookdown_rgb_for_replay = np.asarray(look_down_image)
-                    lookdown_depth_for_replay = down_observations["depth"]
-                    depth = down_observations["depth"]
-                    depth = filter_depth(depth.reshape(depth.shape[:2]), blur_type=None)
-                    depth = depth * (self._max_depth - self._min_depth) + self._min_depth
-                    depth = depth * 1000
+                        look_down_image = Image.fromarray(down_observations["rgb"]).convert('RGB')
+                        lookdown_rgb_for_replay = np.asarray(look_down_image)
+                        lookdown_depth_for_replay = down_observations["depth"]
+                        depth_for_local = down_observations["depth"]
+                        depth_for_local = filter_depth(depth_for_local.reshape(depth_for_local.shape[:2]), blur_type=None)
+                        depth_for_local = depth_for_local * (self._max_depth - self._min_depth) + self._min_depth
+                        depth_for_local = depth_for_local * 1000
+                    elif self.has_external_lookdown_views:
+                        lookdown_rgb_array, lookdown_depth_raw = self._get_external_lookdown_observations(observations)
+                        look_down_image = Image.fromarray(lookdown_rgb_array).convert('RGB')
+                        lookdown_rgb_for_replay = np.asarray(look_down_image)
+                        lookdown_depth_for_replay = lookdown_depth_raw
+                        depth_for_local = filter_depth(
+                            lookdown_depth_raw.reshape(lookdown_depth_raw.shape[:2]),
+                            blur_type=None,
+                        )
+                        depth_for_local = depth_for_local * (self._max_depth - self._min_depth) + self._min_depth
+                        depth_for_local = depth_for_local * 1000
+                    else:
+                        look_down_image = image.copy()
+                        lookdown_rgb_for_replay = np.asarray(look_down_image)
+                        lookdown_depth_for_replay = raw_depth
+                        depth_for_local = depth
+
                     look_down_depth, resize_shape = preprocess_depth_image_v2(
-                        Image.fromarray(depth.astype(np.uint16), mode='I;16'),
+                        Image.fromarray(depth_for_local.astype(np.uint16), mode='I;16'),
                         do_depth_scale=True,
                         depth_scale=1000,
                         target_height=224,
@@ -656,8 +793,9 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     look_down_depth = torch.as_tensor(np.ascontiguousarray(look_down_depth)).float()
                     look_down_depth[look_down_depth > 5.0] = 5.0
 
-                    self.env.step(action_code.LOOKUP)
-                    self.env.step(action_code.LOOKUP)
+                    if self.has_pitch_actions:
+                        self.env.step(action_code.LOOKUP)
+                        self.env.step(action_code.LOOKUP)
 
                 current_rgb_input_path = replay_v2_paths["rgb_path"]
                 current_lookdown_input_path = replay_v2_paths["lookdown_rgb_path"]
@@ -676,7 +814,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     generated_token_count = 0
                     initial_s2_action_seq = []
                     initial_s1_actions = []
-                    if action == action_code.LOOKDOWN:
+                    if self.has_lookdown_support and action == action_code.LOOKDOWN:
                         # last action is look down
                         sources = [{"from": "human", "value": ""}, {"from": "gpt", "value": ""}]
                         input_images += [look_down_image]
@@ -709,6 +847,8 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
                     prompt = random.choice(self.conjunctions) + DEFAULT_IMAGE_TOKEN
                     sources[0]["value"] += f" {prompt}."
+                    if not self.has_lookdown_support:
+                        sources[0]["value"] += " Only output ↑, ←, →, STOP, or image coordinates. Never output ↓."
                     prompt_instruction = copy.deepcopy(sources[0]["value"])
                     parts = split_and_clean(prompt_instruction)
 
@@ -759,58 +899,76 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         pixel_goal = [int(coord[1]), int(coord[0])]
                         draw_pixel_goal = True
 
-                        # look down --> horizontal
-                        self.env.step(action_code.LOOKUP)
-                        self.env.step(action_code.LOOKUP)
-
-                        local_actions = []
-                        pixel_values = inputs.pixel_values
-                        image_grid_thw = torch.cat([thw.unsqueeze(0) for thw in inputs.image_grid_thw], dim=0)
-
-                        latent_start = time.perf_counter()
-                        with torch.no_grad():
-                            traj_latents = self.model.generate_latents(output_ids, pixel_values, image_grid_thw)
-                        episode_stats["s2_latent_seconds"] += time.perf_counter() - latent_start
-
-                        # prepocess align with navdp
-                        image_dp = torch.tensor(np.array(look_down_image.resize((224, 224)))).to(torch.bfloat16) / 255
-                        pix_goal_image = copy.copy(image_dp)
-                        images_dp = torch.stack([pix_goal_image, image_dp]).unsqueeze(0).to(self.device)
-                        depth_dp = look_down_depth.unsqueeze(-1).to(torch.bfloat16)
-                        pix_goal_depth = copy.copy(depth_dp)
-                        depths_dp = torch.stack([pix_goal_depth, depth_dp]).unsqueeze(0).to(self.device)
-
-                        episode_stats["s1_call_count"] += 1
-                        s1_start = time.perf_counter()
-                        with torch.no_grad():
-                            dp_actions = self.model.generate_traj(traj_latents, images_dp, depths_dp)
-                        episode_stats["s1_generate_seconds"] += time.perf_counter() - s1_start
-
-                        action_list = traj_to_actions(dp_actions)
-                        if len(action_list) < MAX_STEPS:
-                            action_list += [0] * (MAX_STEPS - len(action_list))
-
-                        local_actions = action_list
-                        initial_s1_actions = [int(a) for a in local_actions]
-                        if len(local_actions) >= MAX_LOCAL_STEPS:
-                            local_actions = local_actions[:MAX_LOCAL_STEPS]
-
-                        action = local_actions[0]
-                        if action == action_code.STOP:
+                        if not self.use_system1_local_policy:
+                            action_seq = self._pixel_goal_to_discrete_actions(pixel_goal, rgb.shape[1])
+                            initial_s1_actions = []
+                            print('pixel_goal_fallback_actions', action_seq, flush=True)
                             pixel_goal = None
                             output_ids = None
-                            action = action_code.LEFT
-                            observations, _, done, _ = self.env.step(action)
-                            step_id += 1
-                            messages = []
                             replay_v2_state["active_pixel_goal_cycle_id"] = None
-                            continue
-                        print('predicted goal', pixel_goal, flush=True)
+                        else:
+                            # In the original Habitat setup, two LOOKUP actions
+                            # restore the camera from the tilted view back to
+                            # the horizontal frame before running System 1.
+                            # For the HA-VLN HTTP bridge, the lookdown frame is
+                            # provided as an auxiliary sensor, so there is no
+                            # simulator-side pitch state to undo.
+                            if self.has_pitch_actions:
+                                self.env.step(action_code.LOOKUP)
+                                self.env.step(action_code.LOOKUP)
+
+                            local_actions = []
+                            pixel_values = inputs.pixel_values
+                            image_grid_thw = torch.cat([thw.unsqueeze(0) for thw in inputs.image_grid_thw], dim=0)
+
+                            latent_start = time.perf_counter()
+                            with torch.no_grad():
+                                traj_latents = self.model.generate_latents(output_ids, pixel_values, image_grid_thw)
+                            episode_stats["s2_latent_seconds"] += time.perf_counter() - latent_start
+
+                            # prepocess align with navdp
+                            image_dp = torch.tensor(np.array(look_down_image.resize((224, 224)))).to(torch.bfloat16) / 255
+                            pix_goal_image = copy.copy(image_dp)
+                            images_dp = torch.stack([pix_goal_image, image_dp]).unsqueeze(0).to(self.device)
+                            depth_dp = look_down_depth.unsqueeze(-1).to(torch.bfloat16)
+                            pix_goal_depth = copy.copy(depth_dp)
+                            depths_dp = torch.stack([pix_goal_depth, depth_dp]).unsqueeze(0).to(self.device)
+
+                            episode_stats["s1_call_count"] += 1
+                            s1_start = time.perf_counter()
+                            with torch.no_grad():
+                                dp_actions = self.model.generate_traj(traj_latents, images_dp, depths_dp)
+                            episode_stats["s1_generate_seconds"] += time.perf_counter() - s1_start
+
+                            action_list = traj_to_actions(dp_actions)
+                            if len(action_list) < MAX_STEPS:
+                                action_list += [0] * (MAX_STEPS - len(action_list))
+
+                            local_actions = action_list
+                            initial_s1_actions = [int(a) for a in local_actions]
+                            if len(local_actions) >= MAX_LOCAL_STEPS:
+                                local_actions = local_actions[:MAX_LOCAL_STEPS]
+
+                            action = local_actions[0]
+                            if action == action_code.STOP:
+                                pixel_goal = None
+                                output_ids = None
+                                action = action_code.LEFT
+                                observations, _, done, _ = self.env.step(action)
+                                step_id += 1
+                                messages = []
+                                replay_v2_state["active_pixel_goal_cycle_id"] = None
+                                continue
+                            print('predicted goal', pixel_goal, flush=True)
 
                     else:
                         output_kind = "discrete"
                         episode_stats["discrete_decisions"] += 1
-                        action_seq = self.parse_actions(llm_outputs)
+                        if not self.has_lookdown_support and re.fullmatch(r"\s*↓+\s*", llm_outputs or ""):
+                            action_seq = self._fallback_actions_for_unavailable_lookdown(depth, step_id)
+                            print('lookdown_fallback_actions', action_seq, flush=True)
+                        else:
+                            action_seq = self.parse_actions(llm_outputs)
                         initial_s2_action_seq = [int(a) for a in action_seq]
                         replay_v2_state["active_pixel_goal_cycle_id"] = None
                         replay_v2_state["active_cycle_step_offset"] = 0
@@ -994,9 +1152,13 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             cv2.circle(vis, (pixel_goal[0], pixel_goal[1]), radius=8, color=(255, 0, 0), thickness=-1)
                     vis_writer.append_data(vis)
 
-                if action == action_code.LOOKDOWN:
-                    self.env.step(action)
-                    observations, _, done, _ = self.env.step(action)
+                if action == action_code.LOOKDOWN and self.has_lookdown_support:
+                    if self.has_pitch_actions:
+                        self.env.step(action)
+                        observations, _, done, _ = self.env.step(action)
+                    else:
+                        observations = self._make_internal_lookdown_followup_observations(observations)
+                        done = False
                     flag = True
                 else:
                     observations, _, done, _ = self.env.step(action)
@@ -1118,10 +1280,12 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             transformation_matrix[:3, :3] = rotation_matrix
             transformation_matrix[:3, 3] = translation
 
-            agent = ShortestPathFollower(self.env._env.sim, 0.25, False)
+            agent = ShortestPathFollower(self.env._env.sim, 0.25, False) if self.has_pose_sensors else None
 
-            intrinsic_matrix = get_intrinsic_matrix(
-                self.config.habitat.simulator.agents.main_agent.sim_sensors.rgb_sensor
+            intrinsic_matrix = (
+                get_intrinsic_matrix(self.config.habitat.simulator.agents.main_agent.sim_sensors.rgb_sensor)
+                if self.has_pose_sensors
+                else None
             )
 
             # save first frame per rank to validate sim quality
@@ -1163,31 +1327,44 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 # refactor agent get action
                 rgb = observations["rgb"]
                 depth = observations["depth"]
-                x, y = observations["gps"]
-                camera_yaw = observations["compass"][0]
                 depth = filter_depth(depth.reshape(depth.shape[:2]), blur_type=None)
                 depth = depth * (self._max_depth - self._min_depth) + self._min_depth
                 depth = depth * 1000
 
-                agent_state = self.env._env.sim.get_agent_state()
-                height = agent_state.position[1] - initial_height  # Habitat GPS makes west negative, so flip y
-                camera_position = np.array([x, -y, self._camera_height + height])
-                tf_camera_to_episodic = (
-                    xyz_yaw_pitch_to_tf_matrix(camera_position, camera_yaw, np.deg2rad(30)) @ get_axis_align_matrix()
-                )
+                if self.has_pose_sensors:
+                    x, y = observations["gps"]
+                    camera_yaw = observations["compass"][0]
+                    agent_state = self.env._env.sim.get_agent_state()
+                    height = agent_state.position[1] - initial_height  # Habitat GPS makes west negative, so flip y
+                    camera_position = np.array([x, -y, self._camera_height + height])
+                    tf_camera_to_episodic = (
+                        xyz_yaw_pitch_to_tf_matrix(camera_position, camera_yaw, np.deg2rad(30))
+                        @ get_axis_align_matrix()
+                    )
 
                 image = Image.fromarray(rgb).convert('RGB')
                 save_raw_image = image.copy()
 
-                if action == action_code.LOOKDOWN:
-                    look_down_image = image
-                    save_raw_image = look_down_image.copy()
+                if self.has_lookdown_support and action == action_code.LOOKDOWN:
+                    if self.has_external_lookdown_views and not self.has_pitch_actions:
+                        lookdown_rgb_array, lookdown_depth_raw = self._get_external_lookdown_observations(observations)
+                        look_down_image = Image.fromarray(lookdown_rgb_array).convert('RGB')
+                        save_raw_image = look_down_image.copy()
+                        look_down_depth = filter_depth(
+                            lookdown_depth_raw.reshape(lookdown_depth_raw.shape[:2]),
+                            blur_type=None,
+                        )
+                        look_down_depth = look_down_depth * (self._max_depth - self._min_depth) + self._min_depth
+                        look_down_depth = look_down_depth * 1000
+                    else:
+                        look_down_image = image
+                        save_raw_image = look_down_image.copy()
                 else:
                     image = image.resize((self.model_args.resize_w, self.model_args.resize_h))
                     rgb_list.append(image)
 
                 if len(action_seq) == 0 and goal is None:
-                    if action == action_code.LOOKDOWN:
+                    if self.has_lookdown_support and action == action_code.LOOKDOWN:
                         # last action is look down
                         sources = [{"from": "human", "value": ""}, {"from": "gpt", "value": ""}]
                         input_images += [look_down_image]
@@ -1216,6 +1393,8 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
                     prompt = random.choice(self.conjunctions) + DEFAULT_IMAGE_TOKEN
                     sources[0]["value"] += f" {prompt}."
+                    if not self.has_lookdown_support:
+                        sources[0]["value"] += " Only output ↑, ←, →, STOP, or image coordinates. Never output ↓."
                     prompt_instruction = copy.deepcopy(sources[0]["value"])
                     parts = split_and_clean(prompt_instruction)
 
@@ -1255,30 +1434,38 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         pixel_goal = [int(coord[1]), int(coord[0])]
                         draw_pixel_goal = True
 
-                        # look down --> horizontal
-                        self.env.step(action_code.LOOKUP)
-                        self.env.step(action_code.LOOKUP)
+                        if not (self.has_pose_sensors and self.has_lookdown_support):
+                            action_seq = self._pixel_goal_to_discrete_actions(pixel_goal, rgb.shape[1])
+                            print('pixel_goal_fallback_actions', action_seq, flush=True)
+                        else:
+                            if self.has_pitch_actions:
+                                self.env.step(action_code.LOOKUP)
+                                self.env.step(action_code.LOOKUP)
 
-                        goal = pixel_to_gps(pixel_goal, depth / 1000, intrinsic_matrix, tf_camera_to_episodic)
+                            goal = pixel_to_gps(pixel_goal, depth / 1000, intrinsic_matrix, tf_camera_to_episodic)
 
-                        goal = (transformation_matrix @ np.array([-goal[1], 0, -goal[0], 1]))[:3]
+                            goal = (transformation_matrix @ np.array([-goal[1], 0, -goal[0], 1]))[:3]
 
-                        if not self.env._env.sim.pathfinder.is_navigable(np.array(goal)):
-                            goal = np.array(self.env._env.sim.pathfinder.snap_point(np.array(goal)))
+                            if not self.env._env.sim.pathfinder.is_navigable(np.array(goal)):
+                                goal = np.array(self.env._env.sim.pathfinder.snap_point(np.array(goal)))
 
-                        action = agent.get_next_action(goal)
-                        if action == action_code.STOP:
-                            goal = None
-                            output_ids = None
-                            action = action_code.LEFT  # random action to avoid deadlock
-                            observations, _, done, _ = self.env.step(action)
-                            step_id += 1
-                            messages = []
-                            continue
-                        print('predicted goal', pixel_goal, goal, flush=True)
+                            action = agent.get_next_action(goal)
+                            if action == action_code.STOP:
+                                goal = None
+                                output_ids = None
+                                action = action_code.LEFT  # random action to avoid deadlock
+                                observations, _, done, _ = self.env.step(action)
+                                step_id += 1
+                                messages = []
+                                continue
+                            print('predicted goal', pixel_goal, goal, flush=True)
 
                     else:
-                        action_seq = self.parse_actions(llm_outputs)
+                        if not self.has_lookdown_support and re.fullmatch(r"\s*↓+\s*", llm_outputs or ""):
+                            action_seq = self._fallback_actions_for_unavailable_lookdown(depth, step_id)
+                            print('lookdown_fallback_actions', action_seq, flush=True)
+                        else:
+                            action_seq = self.parse_actions(llm_outputs)
                         print('actions', action_seq, flush=True)
 
                 if len(action_seq) != 0:
@@ -1332,9 +1519,13 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         cv2.circle(vis, (pixel_goal[0], pixel_goal[1]), radius=8, color=(255, 0, 0), thickness=-1)
                     vis_writer.append_data(vis)
 
-                if action == action_code.LOOKDOWN:
-                    self.env.step(action)
-                    observations, _, done, _ = self.env.step(action)
+                if action == action_code.LOOKDOWN and self.has_lookdown_support:
+                    if self.has_pitch_actions:
+                        self.env.step(action)
+                        observations, _, done, _ = self.env.step(action)
+                    else:
+                        observations = self._make_internal_lookdown_followup_observations(observations)
+                        done = False
                     flag = True
                 else:
                     observations, _, done, _ = self.env.step(action)

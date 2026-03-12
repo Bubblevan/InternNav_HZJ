@@ -1,14 +1,11 @@
 import sys
+import os
 
 sys.path.append('.')
 sys.path.append('./third_party/diffusion-policy')
 
 import argparse
 import importlib.util
-
-from internnav.evaluator import Evaluator
-
-# This file is the main file
 
 
 def parse_args():
@@ -32,6 +29,8 @@ def load_eval_cfg(config_path, attr_name='eval_cfg'):
 
 def main():
     args = parse_args()
+    from internnav.evaluator import Evaluator
+
     evaluator_cfg = load_eval_cfg(args.config, attr_name='eval_cfg')
 
     # fill in evaluator default config

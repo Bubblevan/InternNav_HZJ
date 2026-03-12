@@ -243,6 +243,357 @@
 - 生成瓶颈通常先受益于 cache 和 backend
 - 量化更适合放在已经明确主瓶颈之后做收益补充
 
+## 5.2 2026-03-12 后的策略更新
+
+截至 2026-03-12，`num_history` 闭环 sweep 已经把“删上下文换速度”这条路线基本排除了，因此当前优化顺序应更新为：
+
+1. 先跑 KV cache Phase A，量化 prefill 压力
+2. 再跑 KV cache Phase B，验证 `look_down=True` follow-up 是否存在可复用空间
+3. 如果 Phase B 的命中率或收益太差，再转向 prefix reuse / 更快 backend
+4. 量化继续放在后面
+
+当前已经有可直接执行的两条实验链：
+
+- `benchmark_dualvln_replay.py`
+  负责 Phase A 的输入压力统计
+- `benchmark_dualvln_http_loopback.py`
+  负责 Phase B 的 `disabled` vs `lookdown_experimental` 对比
+
+截至 2026-03-12，目前已经拿到一份 Phase B 的 `disabled` baseline。它说明：
+
+- 普通非 look-down step 的 `server_model p50` 约为 `0.20s`
+- look-down continuation 的 `server_model p50` 约为 `1.93s`
+
+因此当前 loopback 的长尾几乎全部集中在 look-down follow-up 上。这进一步支持了当前策略：
+
+> 优先把第一条 cache 实验放在 `look_down=True` 路径，而不是平均优化所有 step。
+
+但同一天的 `lookdown_experimental` AB 对比也表明：
+
+- `lookdown_attempts = 93`
+- `lookdown_cache_hits = 93`
+- `lookdown_cache_exceptions = 93`
+- `lookdown_used_cache_total = 0`
+
+这意味着当前实验实现虽然能够识别并构造出可复用的 delta 输入，但在真正调用带 `past_key_values` 的多模态 `generate()` 时全部异常，最终全部 fallback 到原始路径。
+
+因此当前策略应再收紧一步：
+
+1. 先补异常日志，确认 API 阻塞点
+2. 如果确认是 Hugging Face 多模态 cache 路径不兼容，则不要继续在同一接法上投入太多
+3. 更优先考虑：
+   - prefix reuse / partial prefill
+   - 更快的 S2 backend
+
+目前首错 traceback 已经显示出一个很强的结构性信号：
+
+- 默认 cache continuation 会因为空 `cache_position` 直接报错
+- 即使手动补 `cache_position`，Qwen2.5-VL 在 `cache_position[0] != 0` 时会主动把 `pixel_values` 置空
+
+这意味着当前标准 HF 接口并不自然支持：
+
+> 带新图像输入的多模态 cache continuation
+
+因此这条路线的工程风险已经进一步升高。
+
+这也是为什么当前不建议继续在 `past_key_values + multimodal generate` 这条接法上反复试：
+
+1. 这条路线当前不是“小修小补就能通”的状态
+2. 它已经进入“需要改底层多模态 generate 假设”的状态
+3. 而 prefix reuse 不依赖 continuation 图像输入语义，更适合作为下一条低风险路线
+
+截至 2026-03-12，prefix reuse 已经有一个最小实验版本：
+
+- `scripts/eval/tools/analyze_dualvln_prefix_reuse.py`
+
+它不直接改模型推理，而是先用 `replay_v2` 精确统计：
+
+- 静态文本前缀 token 数
+- 图像 token 数
+- 静态前缀在总多模态输入中的占比
+- 与前一决策相比可复用的文本前缀长度
+
+这一步的意义是先回答：
+
+> prefix reuse 在 DualVLN 里有没有足够大的理论收益，值得继续做成 runtime 优化。
+
+为支持这一步排查，当前代码已经新增：
+
+- loopback summary 内的 `exception_type_counts` 和 `exception_samples`
+- per-step details 内的 `kv_cache_event`
+- `debug_dualvln_http_kv_cache.py` 的 stop-on-first-exception 调试脚本
+
+因此当前最推荐的动作不是继续跑更多完整 benchmark，而是：
+
+1. 先抓到第一条完整异常栈
+2. 确认是否是 HF 多模态 cache API 的结构性限制
+3. 再决定是否继续推进 cache，还是切 backend / prefix reuse
+
+随后已完成一轮 prefix reuse 理论空间分析，结果来自：
+
+- [prefix_reuse_analysis.json](/root/backup/InternNav/logs/habitat/test_dual_system_mini_replay_v2/prefix_reuse_analysis.json)
+
+关键结果：
+
+- `metadata.num_records = 167`
+- 实际完成统计的记录数：`145`
+- 因图像缺失被跳过：`22`
+- 缺失图像总数：`32`
+
+整体输入结构：
+
+- `full_input_tokens mean = 3494.10`
+- `chat_text_tokens mean = 145.48`
+- `image_token_count mean = 13428.83`
+- `static_prefix_tokens mean = 103.50`
+
+关键比例：
+
+- `static_prefix_ratio_full mean = 0.0386`
+- `static_prefix_ratio_text mean = 0.7153`
+
+按路径拆分：
+
+- `normal_decision.static_prefix_ratio_full mean = 0.0456`
+- `lookdown_followup.static_prefix_ratio_full mean = 0.0267`
+
+这组结果说明：
+
+1. 静态 instruction/template 文本在“文本空间”里确实高度重复
+2. 但在“真实多模态输入”里，其占比只有约 `3.9%`
+3. 当前 prefill 主成本主要来自图像 token，而不是静态文本前缀
+4. 真正的慢路径 `lookdown_followup` 上，纯文本 prefix reuse 的理论收益更低
+
+因此当前优先级应调整为：
+
+1. 优先探索更快的 System 2 backend
+2. 其次考虑更广义的 partial prefill / multimodal prefill 优化
+3. 纯文本 prefix reuse 作为低风险辅助手段保留，但不应被视为主攻方向
+
+## 5.2 下一步：S2 backend 低风险 sweep
+
+基于当前结果，最先值得做的 backend 实验，不是直接接入全新的 serving 框架，而是先扫两类低风险变量：
+
+1. `attn_backend`
+   - `flash_attention_2`
+   - `sdpa`
+   - `eager`
+2. `processor_use_fast`
+   - `auto`
+   - `true`
+   - `false`
+
+这样做的原因是：
+
+1. 当前日志里已经出现了 `AutoProcessor` 的 slow processor 警告
+2. 这类变量不会改变高层 DualVLN 逻辑，也不依赖新的部署基础设施
+3. 可以先判断“仅靠 HF loader / processor 层面的 backend 变量，能不能拿到可观收益”
+
+当前代码已经支持这些参数，并新增了统一 runner：
+
+- `scripts/eval/tools/run_dualvln_backend_sweeps.py`
+
+### 5.2.1 replay sweep 命令
+
+```bash
+source /root/miniforge3/etc/profile.d/conda.sh
+conda activate habitat
+cd /root/backup/InternNav
+export TOKENIZERS_PARALLELISM=false
+python scripts/eval/tools/run_dualvln_backend_sweeps.py \
+  --mode replay \
+  --manifest /root/backup/InternNav/logs/habitat/test_dual_system_mini/replay_subset/manifest_rank0.jsonl \
+  --model-path /root/backup/InternNav/checkpoints/InternVLA-N1-DualVLN \
+  --output-dir /root/backup/InternNav/logs/habitat/test_dual_system_mini/backend_sweeps_replay \
+  --base-path /root/backup/InternNav/logs \
+  --attn-backends flash_attention_2 sdpa \
+  --processor-fast-options auto true \
+  --num-history 8 \
+  --prompt-variant full \
+  --max-new-tokens 128 \
+  --verbose-every 20
+```
+
+### 5.2.2 loopback sweep 命令
+
+```bash
+source /root/miniforge3/etc/profile.d/conda.sh
+conda activate habitat
+cd /root/backup/InternNav
+export TOKENIZERS_PARALLELISM=false
+python scripts/eval/tools/run_dualvln_backend_sweeps.py \
+  --mode loopback \
+  --manifest /root/backup/InternNav/logs/habitat/test_dual_system_mini_replay_v2/replay_subset_v2/manifest_rank0.jsonl \
+  --model-path /root/backup/InternNav/checkpoints/InternVLA-N1-DualVLN \
+  --output-dir /root/backup/InternNav/logs/habitat/test_dual_system_mini_replay_v2/backend_sweeps_loopback \
+  --base-path /root/backup/InternNav/logs \
+  --attn-backends flash_attention_2 sdpa \
+  --processor-fast-options auto true \
+  --num-history 8 \
+  --plan-step-gap 4 \
+  --use-recorded-lookdown \
+  --kv-cache-mode disabled \
+  --verbose-every 20
+```
+
+### 5.2.3 结果文件
+
+runner 会自动生成：
+
+- `comparison_backend_replay.csv`
+- `comparison_backend_loopback.csv`
+- `comparison_backend_all.json`
+
+建议优先比较：
+
+1. replay:
+   - `s2_generate_p50 / p95`
+   - `total_step_p50 / p95`
+   - `gpu_peak_memory_mb`
+   - `output_kind_match_rate`
+2. loopback:
+   - `server_model_p50 / p95`
+   - `total_step_p50 / p95`
+   - `output_kind_match_rate`
+   - `discrete_action_match_rate`
+
+## 5.3 vLLM 路线
+
+在 2026-03-12 的当前判断下，vLLM 是一条值得尽快验证的路线，而且工程量并不一定很重，但前提是切法要对。
+
+### 5.3.1 为什么值得试
+
+当前不建议继续主攻：
+
+- `past_key_values + multimodal generate`
+
+因为这条路已经暴露出较强的底层接口冲突，尤其是在：
+
+- look-down continuation 里要“复用旧 cache + 再喂一张新图”
+
+而 vLLM 更适合处理：
+
+- 更快的 S2 文本生成
+- 更成熟的 KV / prefix 管理
+- 多请求推理 backend 优化
+
+### 5.3.2 为什么不能一上来整套 DualVLN 迁过去
+
+本地 checkpoint 的 [config.json](/root/backup/InternNav/checkpoints/InternVLA-N1-DualVLN/config.json) 显示：
+
+- `model_type = internvla_n1`
+- `architectures = ["InternVLAN1ForCausalLM"]`
+
+这不是标准的 `Qwen2.5-VL` checkpoint。与此同时，权重里还带有：
+
+- `model.latent_queries`
+- `model.rgb_model.*`
+- `model.memory_encoder.*`
+- `model.rgb_resampler.*`
+- `model.cond_projector.*`
+
+也就是说：
+
+1. 整个 DualVLN 不是一个“直接拿标准 Qwen2.5-VL serving 就能替换”的模型
+2. 但其中的 S2 文本生成部分，仍然高度建立在 Qwen2.5-VL 视觉-语言主干上
+3. 因此更合理的切法是：
+   - 只把 S2 拿去试 vLLM
+   - S1 继续保留现有 PyTorch 路径
+
+### 5.3.3 当前新增脚本
+
+已新增：
+
+- `scripts/eval/tools/check_dualvln_vllm_feasibility.py`
+- `scripts/eval/tools/benchmark_dualvln_s2_backends.py`
+
+其中：
+
+`check_dualvln_vllm_feasibility.py` 用于：
+
+- 检查当前 checkpoint 是否是标准 Qwen2.5-VL
+- 统计是否包含大量 DualVLN/System1 额外模块
+- 可选生成一个“patched standard-Qwen2.5-VL config view”
+
+`benchmark_dualvln_s2_backends.py` 用于：
+
+- 在同一份 replay manifest 上对比 `hf` 和 `vllm`
+- 只测 S2 文本生成，不牵涉 S1
+- 输出：
+  - `cold_start_load_seconds`
+  - `s2_generate p50/p95`
+  - `tokens_per_second`
+  - `output_kind_match_rate`
+  - `text_exact_match_rate`
+  - `discrete_action_match_rate`
+
+### 5.3.4 建议执行顺序
+
+先做 feasibility + patched view：
+
+```bash
+source /root/miniforge3/etc/profile.d/conda.sh
+conda activate habitat
+cd /root/backup/InternNav
+python scripts/eval/tools/check_dualvln_vllm_feasibility.py \
+  --model-path /root/backup/InternNav/checkpoints/InternVLA-N1-DualVLN \
+  --output /root/backup/InternNav/logs/habitat/test_dual_system_mini_replay_v2/vllm_feasibility.json \
+  --patched-model-path /root/backup/InternNav/checkpoints/InternVLA-N1-DualVLN-qwen25vl-s2-view
+```
+
+再跑 HF baseline：
+
+```bash
+source /root/miniforge3/etc/profile.d/conda.sh
+conda activate habitat
+cd /root/backup/InternNav
+export TOKENIZERS_PARALLELISM=false
+python scripts/eval/tools/benchmark_dualvln_s2_backends.py \
+  --backend hf \
+  --manifest /root/backup/InternNav/logs/habitat/test_dual_system_mini/replay_subset/manifest_rank0.jsonl \
+  --model-path /root/backup/InternNav/checkpoints/InternVLA-N1-DualVLN \
+  --output /root/backup/InternNav/logs/habitat/test_dual_system_mini/s2_backend_hf.json \
+  --base-path /root/backup/InternNav/logs \
+  --num-history 8 \
+  --prompt-variant full \
+  --max-new-tokens 128 \
+  --verbose-every 20
+```
+
+如果已安装 vLLM，再跑 S2-only vLLM：
+
+```bash
+source /root/miniforge3/etc/profile.d/conda.sh
+conda activate habitat
+cd /root/backup/InternNav
+export TOKENIZERS_PARALLELISM=false
+python scripts/eval/tools/benchmark_dualvln_s2_backends.py \
+  --backend vllm \
+  --manifest /root/backup/InternNav/logs/habitat/test_dual_system_mini/replay_subset/manifest_rank0.jsonl \
+  --model-path /root/backup/InternNav/checkpoints/InternVLA-N1-DualVLN-qwen25vl-s2-view \
+  --output /root/backup/InternNav/logs/habitat/test_dual_system_mini/s2_backend_vllm.json \
+  --base-path /root/backup/InternNav/logs \
+  --num-history 8 \
+  --prompt-variant full \
+  --max-new-tokens 128 \
+  --processor-use-fast true \
+  --trust-remote-code \
+  --verbose-every 20
+```
+
+### 5.3.5 当前边界
+
+截至目前：
+
+1. 这些脚本已经完成并通过静态检查
+2. 本地环境尚未安装 `vllm`
+3. 因此还没有完成真实的 HF vs vLLM 数值对比
+
+所以现在的定位仍然是：
+
+- 已完成实验入口与兼容性准备
+- 下一步等安装 `vllm` 后做真实 A/B
+
 ## 5.1 当前离线 replay benchmark 的限制
 
 需要特别说明：当前第一版离线 replay benchmark 更适合测“纯推理 baseline”，还不等于“严格复现闭环大小脑切换”。
@@ -498,4 +849,49 @@ python scripts/eval/tools/run_habitat_closed_loop_num_history_sweeps.py \
 跑完后会自动产出：
 
 - 每个 `num_history` 的独立输出目录
+- `comparison_num_history_closed_loop.csv`
+
+## 11. 2026-03-12 闭环验证后的策略更新
+
+今天的 Habitat 闭环 sweep 已经证明：
+
+- `num_history` 压缩虽然能显著降低离线 `S2` 推理时延
+- 但回到闭环后会带来明显功能退化
+
+因此当前策略应更新为：
+
+1. 保持 `num_history=8`
+2. 不再把 history 压缩当作主线优化方向
+3. 正式把重点转到 `KV cache / prefix reuse / backend`
+
+## 12. 日志体积控制
+
+当前大日志的主要来源不是 summary，而是：
+
+- `replay_subset`
+- `replay_subset_v2`
+
+尤其在闭环 sweep 中，会快速膨胀到几十 GB。
+
+因此：
+
+1. 如果当前目标只是做闭环功能对比，不需要导出 replay
+2. 应在闭环 runner 中使用：
+
+```bash
+--replay-num-episodes 0
+```
+
+当前代码已支持：
+
+- 当 `replay_num_episodes=0` 时自动关闭 replay 导出
+
+同时新增了清理脚本：
+
+- `scripts/eval/tools/prune_habitat_logs.py`
+
+可用于删除 bulky replay 资产，但保留：
+
+- `result.json`
+- `runtime_summary_rank0.json`
 - `comparison_num_history_closed_loop.csv`
