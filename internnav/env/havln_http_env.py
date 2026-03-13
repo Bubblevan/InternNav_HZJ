@@ -27,6 +27,11 @@ class HAVLNHttpEnv(base.Env):
         meta = self.session.get(f"{self.server_url}/metadata", timeout=30).json()
         self._capabilities.update(meta.get("capabilities", {}))
         total_episodes = int(meta.get("max_episodes") or meta.get("total_episodes") or 0)
+        client_cap = env_config.env_settings.get("max_eval_episodes")
+        if client_cap is not None:
+            client_cap = int(client_cap)
+            if client_cap > 0:
+                total_episodes = min(total_episodes, client_cap) if total_episodes > 0 else client_cap
         self.episodes = [None] * total_episodes
 
     def _decode_obs(self, payload: Dict[str, Any]) -> Dict[str, Any]:

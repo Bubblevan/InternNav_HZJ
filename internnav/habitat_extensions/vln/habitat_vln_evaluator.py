@@ -4,6 +4,7 @@ import os
 import sys
 import time
 from enum import IntEnum
+from pathlib import Path
 
 sys.path.append('./src/diffusion-policy')
 import copy
@@ -214,6 +215,11 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         self.runtime_summary_path = os.path.join(self.output_path, f"runtime_summary_rank{self.rank}.json")
         self.runtime_records = []
         self.replay_episode_keys = self._select_replay_episodes()
+        self.havln_root = cfg.env.env_settings.get("havln_root")
+        self.havln_split = None
+        if hasattr(self.env, "get_capabilities"):
+            self.havln_split = (self.env.get_capabilities() or {}).get("split")
+        self._havln_collision_baseline = self._load_havln_collision_baseline()
 
     def _init_env_capabilities(self):
         lab_sensors = getattr(self.config.habitat.task, "lab_sensors", None)
@@ -240,6 +246,15 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             },
             flush=True,
         )
+
+    def _build_compact_lookdown_followup(self, instruction_text: str):
+        prompt = (
+            "You are still solving the same navigation instruction: "
+            f"{instruction_text.rstrip('.')}."
+            f" You requested a look-down view. Based only on this look-down image, output the next waypoint's "
+            "coordinates in the image, or output STOP if the task is complete."
+        )
+        return [{"from": "human", "value": prompt}, {"from": "gpt", "value": ""}]
 
     def _pixel_goal_to_discrete_actions(self, pixel_goal, image_width: int) -> list[int]:
         x_coord = int(pixel_goal[0])
@@ -311,6 +326,60 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         sample_size = min(self.replay_num_episodes, len(keys))
         return set(rng.sample(keys, sample_size))
 
+    def _load_havln_collision_baseline(self):
+        if not self.havln_root or not self.havln_split:
+            return None
+        path = (
+            Path(self.havln_root)
+            / "Data"
+            / "HA-R2R-tools"
+            / f"collision_num_{self.havln_split}.json"
+        )
+        if not path.exists():
+            return None
+        with path.open() as f:
+            return json.load(f)
+
+    def _extract_human_aware_metrics(self, metrics, episode_id=None):
+        summary = {}
+
+        collisions = metrics.get("collisions")
+        if isinstance(collisions, dict):
+            summary["collisions_count"] = int(collisions.get("count", 0))
+            summary["is_collision"] = bool(collisions.get("is_collision", False))
+
+        collisions_detail = metrics.get("collisions_detail")
+        if isinstance(collisions_detail, dict):
+            summary["collisions_detail_count"] = int(collisions_detail.get("count", 0))
+            steps = collisions_detail.get("steps", [])
+            if isinstance(steps, list):
+                summary["collision_steps_count"] = int(sum(bool(v) for v in steps))
+
+        distance_to_human = metrics.get("distance_to_human")
+        if isinstance(distance_to_human, dict):
+            distances = []
+            angles = []
+            for value in distance_to_human.values():
+                if isinstance(value, (list, tuple)) and len(value) >= 2:
+                    distances.append(float(value[0]))
+                    angles.append(float(value[1]))
+            if distances:
+                summary["human_count"] = len(distances)
+                summary["min_distance_to_human"] = float(min(distances))
+                summary["mean_distance_to_human"] = float(np.mean(distances))
+                summary["min_human_relative_angle"] = float(min(angles))
+                summary["mean_human_relative_angle"] = float(np.mean(angles))
+
+        if self._havln_collision_baseline is not None and episode_id is not None and "collisions_count" in summary:
+            base_collisions = int(self._havln_collision_baseline.get(str(int(episode_id)), 0))
+            tcr = max(0, summary["collisions_count"] - base_collisions)
+            summary["TCR"] = int(tcr)
+            summary["CR"] = int(min(tcr, 1))
+            if "success" in metrics:
+                summary["SR"] = float(metrics["success"]) * float(int(tcr == 0))
+
+        return summary
+
     def _init_episode_stats(self, scene_id, episode_id, instruction):
         return {
             "scene_id": scene_id,
@@ -343,6 +412,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         avg_step = total_wall / max(len(episode_stats["step_wall_times"]), 1)
         total_actions = max(executed_steps, 1)
         s2_calls = max(episode_stats["s2_call_count"], 1)
+        human_aware = self._extract_human_aware_metrics(metrics, episode_stats["episode_id"])
         record = {
             "scene_id": episode_stats["scene_id"],
             "episode_id": episode_stats["episode_id"],
@@ -371,7 +441,10 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 if episode_stats["pixel_goal_burst_lengths"]
                 else 0.0
             ),
+            "human_aware_metrics": self._to_jsonable(human_aware),
+            "raw_metrics": self._to_jsonable(metrics),
         }
+        record.update(human_aware)
         self.runtime_records.append(record)
         if self.profile_runtime and self.rank == 0:
             os.makedirs(self.output_path, exist_ok=True)
@@ -398,6 +471,23 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             "stop_ratio": float(np.mean([r["stop_ratio"] for r in self.runtime_records])),
             "avg_s1_steps_per_cycle": float(np.mean([r["avg_s1_steps_per_cycle"] for r in self.runtime_records])),
         }
+        optional_keys = [
+            "collisions_count",
+            "collisions_detail_count",
+            "collision_steps_count",
+            "human_count",
+            "min_distance_to_human",
+            "mean_distance_to_human",
+            "min_human_relative_angle",
+            "mean_human_relative_angle",
+            "TCR",
+            "CR",
+            "SR",
+        ]
+        for key in optional_keys:
+            values = [r[key] for r in self.runtime_records if key in r]
+            if values:
+                summary[key] = float(np.mean(values))
         with open(self.runtime_summary_path, "w") as f:
             json.dump(summary, f, indent=2)
 
@@ -815,14 +905,14 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     initial_s2_action_seq = []
                     initial_s1_actions = []
                     if self.has_lookdown_support and action == action_code.LOOKDOWN:
-                        # last action is look down
-                        sources = [{"from": "human", "value": ""}, {"from": "gpt", "value": ""}]
-                        input_images += [look_down_image]
-                        input_image_paths = list(replay_v2_state["last_input_image_paths"]) + [current_lookdown_input_path]
-                        messages.append(
-                            {'role': 'assistant', 'content': [{'type': 'text', 'text': llm_outputs}]}  # noqa: F405
-                        )
-                        input_img_id = -1
+                        # Keep look-down follow-up compact. Reusing the full
+                        # multi-image conversation can push Qwen-VL past its
+                        # 8k context window in long episodes.
+                        sources = self._build_compact_lookdown_followup(episode.instruction.instruction_text)
+                        input_images = [look_down_image]
+                        input_image_paths = [current_lookdown_input_path]
+                        messages = []
+                        input_img_id = 0
                     else:
                         sources = copy.deepcopy(self.conversation)
                         sources[0]["value"] = sources[0]["value"].replace(
@@ -1215,7 +1305,24 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 "discrete_ratio": runtime_record["discrete_ratio"],
                 "stop_ratio": runtime_record["stop_ratio"],
                 "avg_s1_steps_per_cycle": runtime_record["avg_s1_steps_per_cycle"],
+                "human_aware_metrics": runtime_record.get("human_aware_metrics", {}),
+                "raw_metrics": runtime_record.get("raw_metrics", {}),
             }
+            for key in [
+                "collisions_count",
+                "collisions_detail_count",
+                "collision_steps_count",
+                "human_count",
+                "min_distance_to_human",
+                "mean_distance_to_human",
+                "min_human_relative_angle",
+                "mean_human_relative_angle",
+                "TCR",
+                "CR",
+                "SR",
+            ]:
+                if key in runtime_record:
+                    result[key] = runtime_record[key]
             if 'ndtw' in metrics:
                 result['ndtw'] = metrics['ndtw']
 
@@ -1365,13 +1472,12 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
                 if len(action_seq) == 0 and goal is None:
                     if self.has_lookdown_support and action == action_code.LOOKDOWN:
-                        # last action is look down
-                        sources = [{"from": "human", "value": ""}, {"from": "gpt", "value": ""}]
-                        input_images += [look_down_image]
-                        messages.append(
-                            {'role': 'assistant', 'content': [{'type': 'text', 'text': llm_outputs}]}  # noqa: F405
-                        )
-                        input_img_id = -1
+                        # Keep look-down follow-up compact to avoid
+                        # accumulating a long multi-turn, multi-image prompt.
+                        sources = self._build_compact_lookdown_followup(episode.instruction.instruction_text)
+                        input_images = [look_down_image]
+                        messages = []
+                        input_img_id = 0
                     else:
                         sources = copy.deepcopy(self.conversation)
                         sources[0]["value"] = sources[0]["value"].replace(
@@ -1564,7 +1670,10 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 "ne": metrics["distance_to_goal"],
                 "steps": step_id,
                 "episode_instruction": episode_instruction,
+                "human_aware_metrics": self._to_jsonable(self._extract_human_aware_metrics(metrics, episode_id)),
+                "raw_metrics": self._to_jsonable(metrics),
             }
+            result.update(self._extract_human_aware_metrics(metrics, episode_id))
             if 'ndtw' in metrics:
                 result['ndtw'] = metrics['ndtw']
 

@@ -20,6 +20,7 @@ eval_cfg = EvalCfg(
         env_settings={
             'server_url': 'http://127.0.0.1:8899',
             'config_path': 'scripts/eval/configs/vln_ha_r2r.yaml',
+            'havln_root': '/root/backup/HA-VLN',
         },
     ),
     eval_type='habitat_vln',
