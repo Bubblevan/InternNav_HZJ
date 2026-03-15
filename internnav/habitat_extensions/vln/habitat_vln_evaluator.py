@@ -2,9 +2,7 @@ import argparse
 import json
 import os
 import sys
-import time
 from enum import IntEnum
-from pathlib import Path
 
 sys.path.append('./src/diffusion-policy')
 import copy
@@ -15,7 +13,6 @@ from collections import OrderedDict
 
 import cv2
 import habitat
-import imageio
 import numpy as np
 import quaternion
 import torch
@@ -72,12 +69,6 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         self.epoch = args.epoch
         self.max_steps_per_episode = args.max_steps_per_episode
         self.output_path = args.output_path
-        self.profile_runtime = bool(getattr(args, "profile_runtime", True))
-        self.profile_modules = bool(getattr(args, "profile_modules", True))
-
-        cfg.env.env_settings["allowed_scene_ids"] = list(getattr(args, "allowed_scene_ids", []) or [])
-        cfg.env.env_settings["allowed_episode_ids"] = list(getattr(args, "allowed_episode_ids", []) or [])
-        cfg.env.env_settings["max_eval_episodes"] = getattr(args, "max_eval_episodes", None)
 
         # create habitat config
         self.config_path = cfg.env.env_settings['config_path']
@@ -86,15 +77,6 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         self.sim_sensors_config = self.config.habitat.simulator.agents.main_agent.sim_sensors
 
         with habitat.config.read_write(self.config):
-            dataset_path_override = getattr(args, "dataset_path_override", None)
-            scenes_dir_override = getattr(args, "scenes_dir_override", None)
-            dataset_split_override = getattr(args, "dataset_split_override", None)
-            if dataset_path_override:
-                self.config.habitat.dataset.data_path = dataset_path_override
-            if scenes_dir_override:
-                self.config.habitat.dataset.scenes_dir = scenes_dir_override
-            if dataset_split_override:
-                self.config.habitat.dataset.split = dataset_split_override
             self.config.habitat.task.measurements.update(
                 {
                     "top_down_map": TopDownMapMeasurementConfig(
@@ -124,8 +106,6 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         # ------------------------------------- model ------------------------------------------
         self.model_args = argparse.Namespace(**cfg.agent.model_settings)
         self._init_env_capabilities()
-        self.vis_debug = bool(getattr(self.model_args, "vis_debug", False))
-        self.vis_debug_path = getattr(self.model_args, "vis_debug_path", os.path.join(self.output_path, "vis_debug"))
 
         processor = AutoProcessor.from_pretrained(self.model_args.model_path)
         processor.tokenizer.padding_side = 'left'
@@ -155,16 +135,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         self.processor = processor
 
         # refactor: this part used in three places
-        prompt = (
-            "You are an autonomous navigation assistant. Your task is to <instruction>. "
-            "Where should you go next to stay on track? Please output the next waypoint's "
-            "coordinates in the image. Please output STOP when you have successfully completed the task."
-        )
-        if not self.has_lookdown_support:
-            prompt += (
-                " Available discrete actions are only ↑, ←, →, and STOP. "
-                "Do not output ↓."
-            )
+        prompt = "You are an autonomous navigation assistant. Your task is to <instruction>. Where should you go next to stay on track? Please output the next waypoint\'s coordinates in the image. Please output STOP when you have successfully completed the task."
         answer = ""
         self.conversation = [{"from": "human", "value": prompt}, {"from": "gpt", "value": answer}]
 
@@ -186,13 +157,8 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 "→": [3],
             }
         )
-        if self.has_lookdown_support:
+        if self.has_pitch_actions:
             self.actions2idx["↓"] = [5]
-        else:
-            # HA-VLN exposes a 4-action interface. Map "look down / continue
-            # local planning" to a forward move instead of silently falling
-            # back to STOP when the model emits "↓".
-            self.actions2idx["↓"] = [1]
 
         self.num_history = self.model_args.num_history
 
@@ -204,434 +170,33 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         self._camera_fov = camera_fov_rad
         self._fx = self._fy = self.sim_sensors_config.depth_sensor.width / (2 * np.tan(camera_fov_rad / 2))
 
-        self.replay_enabled = bool(getattr(args, "export_replay_subset", False))
-        self.replay_seed = int(getattr(args, "replay_seed", 0))
-        self.replay_num_episodes = int(getattr(args, "replay_num_episodes", 0) or 0)
-        self.replay_root = os.path.join(self.output_path, "replay_subset")
-        self.replay_manifest_path = os.path.join(self.replay_root, f"manifest_rank{self.rank}.jsonl")
-        self.replay_v2_root = os.path.join(self.output_path, "replay_subset_v2")
-        self.replay_v2_manifest_path = os.path.join(self.replay_v2_root, f"manifest_rank{self.rank}.jsonl")
-        self.runtime_profile_path = os.path.join(self.output_path, f"runtime_rank{self.rank}.jsonl")
-        self.runtime_summary_path = os.path.join(self.output_path, f"runtime_summary_rank{self.rank}.json")
-        self.runtime_records = []
-        self.replay_episode_keys = self._select_replay_episodes()
-        self.havln_root = cfg.env.env_settings.get("havln_root")
-        self.havln_split = None
-        if hasattr(self.env, "get_capabilities"):
-            self.havln_split = (self.env.get_capabilities() or {}).get("split")
-        self._havln_collision_baseline = self._load_havln_collision_baseline()
-
     def _init_env_capabilities(self):
         lab_sensors = getattr(self.config.habitat.task, "lab_sensors", None)
         lab_sensor_names = set(lab_sensors.keys()) if lab_sensors is not None else set()
         action_names = set(self.config.habitat.task.actions.keys())
-        env_capabilities = {}
-        if hasattr(self.env, "get_capabilities"):
-            env_capabilities = self.env.get_capabilities() or {}
 
         self.has_pose_sensors = "gps_sensor" in lab_sensor_names and "compass_sensor" in lab_sensor_names
         self.has_pitch_actions = "look_up" in action_names and "look_down" in action_names
-        self.has_external_lookdown_views = bool(env_capabilities.get("has_external_lookdown_views", False))
-        self.has_lookdown_support = self.has_pitch_actions or self.has_external_lookdown_views
-        self.use_system1_local_policy = self.model_args.mode == 'dual_system' and self.has_lookdown_support
+        self.use_system1_local_policy = self.model_args.mode == 'dual_system' and self.has_pitch_actions
 
         print(
             "env_capabilities:",
             {
                 "has_pose_sensors": self.has_pose_sensors,
                 "has_pitch_actions": self.has_pitch_actions,
-                "has_external_lookdown_views": self.has_external_lookdown_views,
-                "has_lookdown_support": self.has_lookdown_support,
                 "use_system1_local_policy": self.use_system1_local_policy,
             },
             flush=True,
         )
 
-    def _build_compact_lookdown_followup(self, instruction_text: str):
-        prompt = (
-            "You are still solving the same navigation instruction: "
-            f"{instruction_text.rstrip('.')}."
-            f" You requested a look-down view. Based only on this look-down image, output the next waypoint's "
-            "coordinates in the image, or output STOP if the task is complete."
-        )
-        return [{"from": "human", "value": prompt}, {"from": "gpt", "value": ""}]
-
-    def _pixel_goal_to_discrete_actions(self, pixel_goal, image_width: int) -> list[int]:
-        x_coord = int(pixel_goal[0])
-        far_left_threshold = int(image_width * 0.2)
+    def _pixel_goal_to_discrete_action(self, pixel_goal, image_width: int) -> int:
         left_threshold = int(image_width * 0.4)
         right_threshold = int(image_width * 0.6)
-        far_right_threshold = int(image_width * 0.8)
-
-        if x_coord < far_left_threshold:
-            return [action_code.LEFT, action_code.FORWARD]
-        if x_coord < left_threshold:
-            return [action_code.LEFT]
-        if x_coord > far_right_threshold:
-            return [action_code.RIGHT, action_code.FORWARD]
-        if x_coord > right_threshold:
-            return [action_code.RIGHT]
-        return [action_code.FORWARD, action_code.FORWARD]
-
-    def _fallback_actions_for_unavailable_lookdown(self, depth: np.ndarray, step_id: int) -> list[int]:
-        depth_map = np.asarray(depth).squeeze()
-        if depth_map.ndim != 2:
-            return [action_code.FORWARD]
-
-        height, width = depth_map.shape
-        center = depth_map[:, width // 3 : (2 * width) // 3]
-        left = depth_map[:, : width // 3]
-        right = depth_map[:, (2 * width) // 3 :]
-
-        def median_clearance(region: np.ndarray) -> float:
-            valid = region[np.isfinite(region) & (region > 1e-3)]
-            if valid.size == 0:
-                return 0.0
-            return float(np.median(valid))
-
-        center_clearance = median_clearance(center)
-        left_clearance = median_clearance(left)
-        right_clearance = median_clearance(right)
-
-        if center_clearance >= 1.0:
-            return [action_code.FORWARD]
-        if left_clearance > right_clearance:
-            return [action_code.LEFT, action_code.FORWARD]
-        if right_clearance > left_clearance:
-            return [action_code.RIGHT, action_code.FORWARD]
-        return [action_code.LEFT] if step_id % 2 == 0 else [action_code.RIGHT]
-
-    def _get_external_lookdown_observations(self, observations):
-        if "lookdown_rgb" not in observations or "lookdown_depth" not in observations:
-            raise KeyError(
-                "Environment advertised external lookdown views but current observation "
-                f"keys are only {sorted(observations.keys())}"
-            )
-        return observations["lookdown_rgb"], observations["lookdown_depth"]
-
-    def _make_internal_lookdown_followup_observations(self, observations):
-        lookdown_rgb, lookdown_depth = self._get_external_lookdown_observations(observations)
-        followup = dict(observations)
-        followup["rgb"] = lookdown_rgb
-        followup["depth"] = lookdown_depth
-        return followup
-
-    def _select_replay_episodes(self):
-        if not self.replay_enabled or self.replay_num_episodes <= 0:
-            return set()
-        rng = random.Random(self.replay_seed + self.rank)
-        keys = [(ep.scene_id.split('/')[-2], int(ep.episode_id)) for ep in self.env.episodes]
-        if not keys:
-            return set()
-        sample_size = min(self.replay_num_episodes, len(keys))
-        return set(rng.sample(keys, sample_size))
-
-    def _load_havln_collision_baseline(self):
-        if not self.havln_root or not self.havln_split:
-            return None
-        path = (
-            Path(self.havln_root)
-            / "Data"
-            / "HA-R2R-tools"
-            / f"collision_num_{self.havln_split}.json"
-        )
-        if not path.exists():
-            return None
-        with path.open() as f:
-            return json.load(f)
-
-    def _extract_human_aware_metrics(self, metrics, episode_id=None):
-        summary = {}
-
-        collisions = metrics.get("collisions")
-        if isinstance(collisions, dict):
-            summary["collisions_count"] = int(collisions.get("count", 0))
-            summary["is_collision"] = bool(collisions.get("is_collision", False))
-
-        collisions_detail = metrics.get("collisions_detail")
-        if isinstance(collisions_detail, dict):
-            summary["collisions_detail_count"] = int(collisions_detail.get("count", 0))
-            steps = collisions_detail.get("steps", [])
-            if isinstance(steps, list):
-                summary["collision_steps_count"] = int(sum(bool(v) for v in steps))
-
-        distance_to_human = metrics.get("distance_to_human")
-        if isinstance(distance_to_human, dict):
-            distances = []
-            angles = []
-            for value in distance_to_human.values():
-                if isinstance(value, (list, tuple)) and len(value) >= 2:
-                    distances.append(float(value[0]))
-                    angles.append(float(value[1]))
-            if distances:
-                summary["human_count"] = len(distances)
-                summary["min_distance_to_human"] = float(min(distances))
-                summary["mean_distance_to_human"] = float(np.mean(distances))
-                summary["min_human_relative_angle"] = float(min(angles))
-                summary["mean_human_relative_angle"] = float(np.mean(angles))
-
-        if self._havln_collision_baseline is not None and episode_id is not None and "collisions_count" in summary:
-            base_collisions = int(self._havln_collision_baseline.get(str(int(episode_id)), 0))
-            tcr = max(0, summary["collisions_count"] - base_collisions)
-            summary["TCR"] = int(tcr)
-            summary["CR"] = int(min(tcr, 1))
-            if "success" in metrics:
-                summary["SR"] = float(metrics["success"]) * float(int(tcr == 0))
-
-        return summary
-
-    def _init_episode_stats(self, scene_id, episode_id, instruction):
-        return {
-            "scene_id": scene_id,
-            "episode_id": episode_id,
-            "instruction": instruction,
-            "wall_clock_start": time.perf_counter(),
-            "step_wall_times": [],
-            "s2_call_count": 0,
-            "s2_generate_seconds": 0.0,
-            "s2_latent_seconds": 0.0,
-            "s1_call_count": 0,
-            "s1_generate_seconds": 0.0,
-            "pixel_goal_decisions": 0,
-            "discrete_decisions": 0,
-            "stop_actions": 0,
-            "pixel_goal_cycles": 0,
-            "pixel_goal_active_steps": 0,
-            "pixel_goal_burst_lengths": [],
-            "current_pixel_goal_burst": 0,
-        }
-
-    def _close_pixel_goal_burst(self, episode_stats):
-        if episode_stats["current_pixel_goal_burst"] > 0:
-            episode_stats["pixel_goal_burst_lengths"].append(episode_stats["current_pixel_goal_burst"])
-            episode_stats["current_pixel_goal_burst"] = 0
-
-    def _finalize_episode_stats(self, episode_stats, metrics, executed_steps):
-        self._close_pixel_goal_burst(episode_stats)
-        total_wall = time.perf_counter() - episode_stats["wall_clock_start"]
-        avg_step = total_wall / max(len(episode_stats["step_wall_times"]), 1)
-        total_actions = max(executed_steps, 1)
-        s2_calls = max(episode_stats["s2_call_count"], 1)
-        human_aware = self._extract_human_aware_metrics(metrics, episode_stats["episode_id"])
-        record = {
-            "scene_id": episode_stats["scene_id"],
-            "episode_id": episode_stats["episode_id"],
-            "instruction": episode_stats["instruction"],
-            "success": metrics["success"],
-            "spl": metrics["spl"],
-            "oracle_success": metrics["oracle_success"],
-            "navigation_error": metrics.get("oracle_navigation_error", metrics.get("distance_to_goal")),
-            "episode_wall_clock_seconds": total_wall,
-            "avg_step_wall_clock_seconds": avg_step,
-            "steps": executed_steps,
-            "s2_call_count": episode_stats["s2_call_count"],
-            "s2_generate_seconds": episode_stats["s2_generate_seconds"],
-            "s2_avg_seconds": episode_stats["s2_generate_seconds"] / s2_calls,
-            "s2_latent_seconds": episode_stats["s2_latent_seconds"],
-            "s1_call_count": episode_stats["s1_call_count"],
-            "s1_generate_seconds": episode_stats["s1_generate_seconds"],
-            "s1_avg_seconds": episode_stats["s1_generate_seconds"] / max(episode_stats["s1_call_count"], 1),
-            "pixel_goal_ratio": episode_stats["pixel_goal_decisions"] / s2_calls,
-            "discrete_ratio": episode_stats["discrete_decisions"] / s2_calls,
-            "stop_ratio": episode_stats["stop_actions"] / total_actions,
-            "pixel_goal_cycles": episode_stats["pixel_goal_cycles"],
-            "pixel_goal_active_steps": episode_stats["pixel_goal_active_steps"],
-            "avg_s1_steps_per_cycle": (
-                float(np.mean(episode_stats["pixel_goal_burst_lengths"]))
-                if episode_stats["pixel_goal_burst_lengths"]
-                else 0.0
-            ),
-            "human_aware_metrics": self._to_jsonable(human_aware),
-            "raw_metrics": self._to_jsonable(metrics),
-        }
-        record.update(human_aware)
-        self.runtime_records.append(record)
-        if self.profile_runtime and self.rank == 0:
-            os.makedirs(self.output_path, exist_ok=True)
-            with open(self.runtime_profile_path, "a") as f:
-                f.write(json.dumps(record) + "\n")
-        return record
-
-    def _flush_runtime_summary(self):
-        if not self.runtime_records or self.rank != 0:
-            return
-        summary = {
-            "episodes": len(self.runtime_records),
-            "success": float(np.mean([r["success"] for r in self.runtime_records])),
-            "spl": float(np.mean([r["spl"] for r in self.runtime_records])),
-            "oracle_success": float(np.mean([r["oracle_success"] for r in self.runtime_records])),
-            "navigation_error": float(np.mean([r["navigation_error"] for r in self.runtime_records])),
-            "episode_wall_clock_seconds": float(np.mean([r["episode_wall_clock_seconds"] for r in self.runtime_records])),
-            "avg_step_wall_clock_seconds": float(np.mean([r["avg_step_wall_clock_seconds"] for r in self.runtime_records])),
-            "s2_call_count": float(np.mean([r["s2_call_count"] for r in self.runtime_records])),
-            "s2_avg_seconds": float(np.mean([r["s2_avg_seconds"] for r in self.runtime_records])),
-            "s1_avg_seconds": float(np.mean([r["s1_avg_seconds"] for r in self.runtime_records])),
-            "pixel_goal_ratio": float(np.mean([r["pixel_goal_ratio"] for r in self.runtime_records])),
-            "discrete_ratio": float(np.mean([r["discrete_ratio"] for r in self.runtime_records])),
-            "stop_ratio": float(np.mean([r["stop_ratio"] for r in self.runtime_records])),
-            "avg_s1_steps_per_cycle": float(np.mean([r["avg_s1_steps_per_cycle"] for r in self.runtime_records])),
-        }
-        optional_keys = [
-            "collisions_count",
-            "collisions_detail_count",
-            "collision_steps_count",
-            "human_count",
-            "min_distance_to_human",
-            "mean_distance_to_human",
-            "min_human_relative_angle",
-            "mean_human_relative_angle",
-            "TCR",
-            "CR",
-            "SR",
-        ]
-        for key in optional_keys:
-            values = [r[key] for r in self.runtime_records if key in r]
-            if values:
-                summary[key] = float(np.mean(values))
-        with open(self.runtime_summary_path, "w") as f:
-            json.dump(summary, f, indent=2)
-
-    def _write_replay_step(
-        self,
-        scene_id,
-        episode_id,
-        instruction,
-        step_id,
-        rgb,
-        depth,
-        lookdown_rgb,
-        lookdown_depth,
-        pose_info,
-        history_frame_indices,
-        baseline_output,
-    ):
-        if (scene_id, episode_id) not in self.replay_episode_keys:
-            return
-        episode_dir = os.path.join(self.replay_root, f"{scene_id}_{episode_id:04d}")
-        os.makedirs(episode_dir, exist_ok=True)
-        Image.fromarray(rgb).save(os.path.join(episode_dir, f"step_{step_id:04d}_rgb.png"))
-        np.save(os.path.join(episode_dir, f"step_{step_id:04d}_depth.npy"), depth)
-        if lookdown_rgb is not None:
-            Image.fromarray(lookdown_rgb).save(os.path.join(episode_dir, f"step_{step_id:04d}_lookdown_rgb.png"))
-        if lookdown_depth is not None:
-            np.save(os.path.join(episode_dir, f"step_{step_id:04d}_lookdown_depth.npy"), lookdown_depth)
-        with open(self.replay_manifest_path, "a") as f:
-            f.write(
-                json.dumps(
-                    {
-                        "scene_id": scene_id,
-                        "episode_id": episode_id,
-                        "instruction": instruction,
-                        "step_id": step_id,
-                        "rgb_path": os.path.join(episode_dir, f"step_{step_id:04d}_rgb.png"),
-                        "depth_path": os.path.join(episode_dir, f"step_{step_id:04d}_depth.npy"),
-                        "lookdown_rgb_path": os.path.join(episode_dir, f"step_{step_id:04d}_lookdown_rgb.png"),
-                        "lookdown_depth_path": os.path.join(episode_dir, f"step_{step_id:04d}_lookdown_depth.npy"),
-                        "pose": pose_info,
-                        "history_frame_indices": history_frame_indices,
-                        "baseline_output": baseline_output,
-                    }
-                )
-                + "\n"
-            )
-
-    def _init_replay_v2_state(self):
-        return {
-            "next_record_id": 0,
-            "next_decision_id": 0,
-            "next_pixel_goal_cycle_id": 0,
-            "active_decision_id": None,
-            "active_pixel_goal_cycle_id": None,
-            "active_decision_step_offset": 0,
-            "active_cycle_step_offset": 0,
-            "rgb_frame_paths": [],
-            "last_s2_context": None,
-            "last_input_image_paths": [],
-        }
-
-    def _replay_v2_asset_paths(self, scene_id, episode_id, record_id, step_id):
-        episode_dir = os.path.join(self.replay_v2_root, f"{scene_id}_{episode_id:04d}")
-        stem = f"record_{record_id:04d}_step_{step_id:04d}"
-        return {
-            "episode_dir": episode_dir,
-            "rgb_path": os.path.join(episode_dir, f"{stem}_rgb.png"),
-            "depth_path": os.path.join(episode_dir, f"{stem}_depth.npy"),
-            "lookdown_rgb_path": os.path.join(episode_dir, f"{stem}_lookdown_rgb.png"),
-            "lookdown_depth_path": os.path.join(episode_dir, f"{stem}_lookdown_depth.npy"),
-        }
-
-    def _to_jsonable(self, value):
-        if isinstance(value, dict):
-            return {k: self._to_jsonable(v) for k, v in value.items()}
-        if isinstance(value, (list, tuple)):
-            return [self._to_jsonable(v) for v in value]
-        if isinstance(value, np.ndarray):
-            return value.tolist()
-        if isinstance(value, (np.integer,)):
-            return int(value)
-        if isinstance(value, (np.floating,)):
-            return float(value)
-        if isinstance(value, torch.Tensor):
-            return value.detach().cpu().tolist()
-        return value
-
-    def _serialize_messages(self, messages, image_paths):
-        serialized = []
-        image_idx = 0
-        for message in messages:
-            content_items = []
-            for item in message.get("content", []):
-                item_type = item.get("type")
-                if item_type == "image":
-                    content_items.append(
-                        {
-                            "type": "image",
-                            "image_index": image_idx,
-                            "path": image_paths[image_idx] if image_idx < len(image_paths) else None,
-                        }
-                    )
-                    image_idx += 1
-                elif item_type == "text":
-                    content_items.append({"type": "text", "text": item.get("text", "")})
-            serialized.append({"role": message.get("role"), "content": content_items})
-        return serialized
-
-    def _write_replay_step_v2(
-        self,
-        scene_id,
-        episode_id,
-        step_id,
-        rgb,
-        depth,
-        lookdown_rgb,
-        lookdown_depth,
-        asset_paths,
-        record,
-    ):
-        if (scene_id, episode_id) not in self.replay_episode_keys:
-            return
-
-        os.makedirs(asset_paths["episode_dir"], exist_ok=True)
-        Image.fromarray(rgb).save(asset_paths["rgb_path"])
-        np.save(asset_paths["depth_path"], depth)
-        if lookdown_rgb is not None:
-            Image.fromarray(lookdown_rgb).save(asset_paths["lookdown_rgb_path"])
-        if lookdown_depth is not None:
-            np.save(asset_paths["lookdown_depth_path"], lookdown_depth)
-
-        payload = {
-            "replay_version": "v2",
-            "scene_id": scene_id,
-            "episode_id": episode_id,
-            "step_id": step_id,
-            "rgb_path": asset_paths["rgb_path"],
-            "depth_path": asset_paths["depth_path"],
-            "lookdown_rgb_path": asset_paths["lookdown_rgb_path"],
-            "lookdown_depth_path": asset_paths["lookdown_depth_path"],
-            **record,
-        }
-        with open(self.replay_v2_manifest_path, "a") as f:
-            f.write(json.dumps(self._to_jsonable(payload)) + "\n")
+        if pixel_goal[0] < left_threshold:
+            return action_code.LEFT
+        if pixel_goal[0] > right_threshold:
+            return action_code.RIGHT
+        return action_code.FORWARD
 
     def eval_action(self):
         """
@@ -721,7 +286,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         ndtw.append(res['ndtw'])
         return sucs, spls, oss, nes, ndtw
 
-    def _run_eval_dual_system(self) -> tuple:  # noqa: C901
+    def _run_eval_dual_system(self) -> tuple:
         self.model.eval()
 
         # resume from previous results
@@ -743,7 +308,6 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             scene_id = episode.scene_id.split('/')[-2]
             episode_id = int(episode.episode_id)
             episode_instruction = episode.instruction.instruction_text
-            episode_stats = self._init_episode_stats(scene_id, episode_id, episode_instruction)
             print("episode start", episode_instruction)
 
             # save first frame per rank to validate sim quality
@@ -754,17 +318,9 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
             vis_frames = []
             step_id = 0
-            vis_writer = None
 
             if self.save_video:
                 os.makedirs(os.path.join(self.output_path, f'vis_{self.epoch}', f'{scene_id}'), exist_ok=True)
-            if self.vis_debug:
-                debug_dir = os.path.join(self.vis_debug_path, f'epoch_{self.epoch}')
-                os.makedirs(debug_dir, exist_ok=True)
-                vis_writer = imageio.get_writer(
-                    os.path.join(debug_dir, f'{scene_id}_{episode_id:04d}.mp4'),
-                    fps=5,
-                )
 
             rgb_list = []
             action_seq = []
@@ -778,62 +334,24 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             done = False
             flag = False
             pixel_goal = None
-            output_kind = "discrete"
-            history_id = []
-            replay_v2_state = self._init_replay_v2_state()
 
             # ---------- 2. Episode step loop -----------
             while (not done) and (step_id <= self.max_steps_per_episode):
-                step_wall_start = time.perf_counter()
-                draw_pixel_goal = False
-                is_new_s2_decision = len(action_seq) == 0 and pixel_goal is None
-                is_lookdown_followup = bool(is_new_s2_decision and action == action_code.LOOKDOWN)
-                action_source = "idle"
-                s1_regenerated = False
-                record_id = replay_v2_state["next_record_id"]
-                replay_v2_state["next_record_id"] += 1
-                replay_v2_paths = self._replay_v2_asset_paths(scene_id, episode_id, record_id, step_id)
                 # refactor agent get action
                 rgb = observations["rgb"]
-                raw_depth = observations["depth"]
-                depth = raw_depth
-                if self.has_pose_sensors:
-                    x, y = observations["gps"]
-                    compass_obs = observations["compass"]
-                    compass = float(compass_obs[0]) if np.ndim(compass_obs) else float(compass_obs)
-                    pose_info = {"gps": [float(x), float(y)], "compass": compass}
-                else:
-                    pose_info = {}
+                depth = observations["depth"]
                 depth = filter_depth(depth.reshape(depth.shape[:2]), blur_type=None)
                 depth = depth * (self._max_depth - self._min_depth) + self._min_depth
                 depth = depth * 1000
 
                 image = Image.fromarray(rgb).convert('RGB')
                 save_raw_image = image.copy()
-                lookdown_rgb_for_replay = None
-                lookdown_depth_for_replay = None
 
-                if action == action_code.LOOKDOWN and self.has_lookdown_support:
-                    if self.has_external_lookdown_views and not self.has_pitch_actions:
-                        lookdown_rgb_array, lookdown_depth_raw = self._get_external_lookdown_observations(observations)
-                        look_down_image = Image.fromarray(lookdown_rgb_array).convert('RGB')
-                        lookdown_rgb_for_replay = np.asarray(look_down_image)
-                        lookdown_depth_for_replay = lookdown_depth_raw
-                        save_raw_image = look_down_image.copy()
-                        depth_for_local = filter_depth(
-                            lookdown_depth_raw.reshape(lookdown_depth_raw.shape[:2]),
-                            blur_type=None,
-                        )
-                        depth_for_local = depth_for_local * (self._max_depth - self._min_depth) + self._min_depth
-                        depth_for_local = depth_for_local * 1000
-                    else:
-                        look_down_image = image
-                        lookdown_rgb_for_replay = np.asarray(look_down_image)
-                        lookdown_depth_for_replay = raw_depth
-                        save_raw_image = look_down_image.copy()
-                        depth_for_local = depth
+                if self.has_pitch_actions and action == action_code.LOOKDOWN:
+                    look_down_image = image
+                    save_raw_image = look_down_image.copy()
                     look_down_depth, resize_shape = preprocess_depth_image_v2(
-                        Image.fromarray(depth_for_local.astype(np.uint16), mode='I;16'),
+                        Image.fromarray(depth.astype(np.uint16), mode='I;16'),
                         do_depth_scale=True,
                         depth_scale=1000,
                         target_height=224,
@@ -848,29 +366,13 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     if self.has_pitch_actions:
                         down_observations, _, _, _ = self.env.step(action_code.LOOKDOWN)
                         down_observations, _, _, _ = self.env.step(action_code.LOOKDOWN)
-
                         look_down_image = Image.fromarray(down_observations["rgb"]).convert('RGB')
-                        lookdown_rgb_for_replay = np.asarray(look_down_image)
-                        lookdown_depth_for_replay = down_observations["depth"]
                         depth_for_local = down_observations["depth"]
                         depth_for_local = filter_depth(depth_for_local.reshape(depth_for_local.shape[:2]), blur_type=None)
                         depth_for_local = depth_for_local * (self._max_depth - self._min_depth) + self._min_depth
                         depth_for_local = depth_for_local * 1000
-                    elif self.has_external_lookdown_views:
-                        lookdown_rgb_array, lookdown_depth_raw = self._get_external_lookdown_observations(observations)
-                        look_down_image = Image.fromarray(lookdown_rgb_array).convert('RGB')
-                        lookdown_rgb_for_replay = np.asarray(look_down_image)
-                        lookdown_depth_for_replay = lookdown_depth_raw
-                        depth_for_local = filter_depth(
-                            lookdown_depth_raw.reshape(lookdown_depth_raw.shape[:2]),
-                            blur_type=None,
-                        )
-                        depth_for_local = depth_for_local * (self._max_depth - self._min_depth) + self._min_depth
-                        depth_for_local = depth_for_local * 1000
                     else:
                         look_down_image = image.copy()
-                        lookdown_rgb_for_replay = np.asarray(look_down_image)
-                        lookdown_depth_for_replay = raw_depth
                         depth_for_local = depth
 
                     look_down_depth, resize_shape = preprocess_depth_image_v2(
@@ -887,32 +389,15 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         self.env.step(action_code.LOOKUP)
                         self.env.step(action_code.LOOKUP)
 
-                current_rgb_input_path = replay_v2_paths["rgb_path"]
-                current_lookdown_input_path = replay_v2_paths["lookdown_rgb_path"]
-                if action != action_code.LOOKDOWN and len(replay_v2_state["rgb_frame_paths"]) < len(rgb_list):
-                    replay_v2_state["rgb_frame_paths"].append(current_rgb_input_path)
-
-                if is_new_s2_decision:
-                    episode_stats["s2_call_count"] += 1
-                    replay_v2_state["active_decision_id"] = replay_v2_state["next_decision_id"]
-                    replay_v2_state["next_decision_id"] += 1
-                    replay_v2_state["active_decision_step_offset"] = 0
-                    prompt_instruction = None
-                    text = None
-                    input_image_paths = []
-                    serialized_messages = []
-                    generated_token_count = 0
-                    initial_s2_action_seq = []
-                    initial_s1_actions = []
-                    if self.has_lookdown_support and action == action_code.LOOKDOWN:
-                        # Keep look-down follow-up compact. Reusing the full
-                        # multi-image conversation can push Qwen-VL past its
-                        # 8k context window in long episodes.
-                        sources = self._build_compact_lookdown_followup(episode.instruction.instruction_text)
-                        input_images = [look_down_image]
-                        input_image_paths = [current_lookdown_input_path]
-                        messages = []
-                        input_img_id = 0
+                if len(action_seq) == 0 and pixel_goal is None:
+                    if self.has_pitch_actions and action == action_code.LOOKDOWN:
+                        # last action is look down
+                        sources = [{"from": "human", "value": ""}, {"from": "gpt", "value": ""}]
+                        input_images += [look_down_image]
+                        messages.append(
+                            {'role': 'assistant', 'content': [{'type': 'text', 'text': llm_outputs}]}  # noqa: F405
+                        )
+                        input_img_id = -1
                     else:
                         sources = copy.deepcopy(self.conversation)
                         sources[0]["value"] = sources[0]["value"].replace(
@@ -930,15 +415,10 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
                         history_id = sorted(history_id)
                         input_images = [rgb_list[i] for i in history_id] + cur_images
-                        input_image_paths = [replay_v2_state["rgb_frame_paths"][i] for i in history_id] + [
-                            current_rgb_input_path
-                        ]
                         input_img_id = 0
 
                     prompt = random.choice(self.conjunctions) + DEFAULT_IMAGE_TOKEN
                     sources[0]["value"] += f" {prompt}."
-                    if not self.has_lookdown_support:
-                        sources[0]["value"] += " Only output ↑, ←, →, STOP, or image coordinates. Never output ↓."
                     prompt_instruction = copy.deepcopy(sources[0]["value"])
                     parts = split_and_clean(prompt_instruction)
 
@@ -951,14 +431,11 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             content.append({"type": "text", "text": parts[i]})
 
                     messages.append({'role': 'user', 'content': content})
-                    serialized_messages = self._serialize_messages(messages, input_image_paths)
 
                     text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-                    replay_v2_state["last_input_image_paths"] = list(input_image_paths)
 
                     inputs = self.processor(text=[text], images=input_images, return_tensors="pt").to(self.model.device)
 
-                    s2_start = time.perf_counter()
                     with torch.no_grad():
                         output_ids = self.model.generate(
                             **inputs,
@@ -968,53 +445,34 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             past_key_values=None,
                             return_dict_in_generate=True,
                         ).sequences
-                    episode_stats["s2_generate_seconds"] += time.perf_counter() - s2_start
 
                     llm_outputs = self.processor.tokenizer.decode(
                         output_ids[0][inputs.input_ids.shape[1] :], skip_special_tokens=True
                     )
-                    generated_token_count = int(output_ids.shape[1] - inputs.input_ids.shape[1])
                     print('step_id:', step_id, 'output text:', llm_outputs)
 
                     if bool(re.search(r'\d', llm_outputs)):  # output pixel goal
-                        output_kind = "pixel_goal"
-                        episode_stats["pixel_goal_decisions"] += 1
-                        episode_stats["pixel_goal_cycles"] += 1
-                        replay_v2_state["active_pixel_goal_cycle_id"] = replay_v2_state["next_pixel_goal_cycle_id"]
-                        replay_v2_state["next_pixel_goal_cycle_id"] += 1
-                        replay_v2_state["active_cycle_step_offset"] = 0
                         forward_action = 0
                         coord = [int(c) for c in re.findall(r'\d+', llm_outputs)]
 
                         pixel_goal = [int(coord[1]), int(coord[0])]
-                        draw_pixel_goal = True
 
                         if not self.use_system1_local_policy:
-                            action_seq = self._pixel_goal_to_discrete_actions(pixel_goal, rgb.shape[1])
-                            initial_s1_actions = []
+                            action_seq = [self._pixel_goal_to_discrete_action(pixel_goal, rgb.shape[1])]
                             print('pixel_goal_fallback_actions', action_seq, flush=True)
                             pixel_goal = None
                             output_ids = None
-                            replay_v2_state["active_pixel_goal_cycle_id"] = None
                         else:
-                            # In the original Habitat setup, two LOOKUP actions
-                            # restore the camera from the tilted view back to
-                            # the horizontal frame before running System 1.
-                            # For the HA-VLN HTTP bridge, the lookdown frame is
-                            # provided as an auxiliary sensor, so there is no
-                            # simulator-side pitch state to undo.
-                            if self.has_pitch_actions:
-                                self.env.step(action_code.LOOKUP)
-                                self.env.step(action_code.LOOKUP)
+                            # look down --> horizontal
+                            self.env.step(action_code.LOOKUP)
+                            self.env.step(action_code.LOOKUP)
 
                             local_actions = []
                             pixel_values = inputs.pixel_values
                             image_grid_thw = torch.cat([thw.unsqueeze(0) for thw in inputs.image_grid_thw], dim=0)
 
-                            latent_start = time.perf_counter()
                             with torch.no_grad():
                                 traj_latents = self.model.generate_latents(output_ids, pixel_values, image_grid_thw)
-                            episode_stats["s2_latent_seconds"] += time.perf_counter() - latent_start
 
                             # prepocess align with navdp
                             image_dp = torch.tensor(np.array(look_down_image.resize((224, 224)))).to(torch.bfloat16) / 255
@@ -1024,18 +482,14 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             pix_goal_depth = copy.copy(depth_dp)
                             depths_dp = torch.stack([pix_goal_depth, depth_dp]).unsqueeze(0).to(self.device)
 
-                            episode_stats["s1_call_count"] += 1
-                            s1_start = time.perf_counter()
                             with torch.no_grad():
                                 dp_actions = self.model.generate_traj(traj_latents, images_dp, depths_dp)
-                            episode_stats["s1_generate_seconds"] += time.perf_counter() - s1_start
 
                             action_list = traj_to_actions(dp_actions)
                             if len(action_list) < MAX_STEPS:
                                 action_list += [0] * (MAX_STEPS - len(action_list))
 
                             local_actions = action_list
-                            initial_s1_actions = [int(a) for a in local_actions]
                             if len(local_actions) >= MAX_LOCAL_STEPS:
                                 local_actions = local_actions[:MAX_LOCAL_STEPS]
 
@@ -1047,43 +501,16 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                                 observations, _, done, _ = self.env.step(action)
                                 step_id += 1
                                 messages = []
-                                replay_v2_state["active_pixel_goal_cycle_id"] = None
                                 continue
                             print('predicted goal', pixel_goal, flush=True)
 
                     else:
-                        output_kind = "discrete"
-                        episode_stats["discrete_decisions"] += 1
-                        if not self.has_lookdown_support and re.fullmatch(r"\s*↓+\s*", llm_outputs or ""):
-                            action_seq = self._fallback_actions_for_unavailable_lookdown(depth, step_id)
-                            print('lookdown_fallback_actions', action_seq, flush=True)
-                        else:
-                            action_seq = self.parse_actions(llm_outputs)
-                        initial_s2_action_seq = [int(a) for a in action_seq]
-                        replay_v2_state["active_pixel_goal_cycle_id"] = None
-                        replay_v2_state["active_cycle_step_offset"] = 0
+                        action_seq = self.parse_actions(llm_outputs)
                         print('actions', action_seq, flush=True)
-
-                    replay_v2_state["last_s2_context"] = {
-                        "decision_id": replay_v2_state["active_decision_id"],
-                        "is_lookdown_followup": is_lookdown_followup,
-                        "history_frame_indices": list(history_id),
-                        "input_image_paths": list(input_image_paths),
-                        "prompt_text": prompt_instruction,
-                        "chat_template_text": text,
-                        "conversation_messages": serialized_messages,
-                        "s2_output_text": llm_outputs,
-                        "s2_generated_token_count": generated_token_count,
-                        "s2_output_kind": output_kind,
-                        "s2_output_pixel": list(pixel_goal) if pixel_goal is not None else None,
-                        "s2_action_seq": initial_s2_action_seq,
-                        "s1_initial_action_seq": initial_s1_actions,
-                    }
 
                 if len(action_seq) != 0:
                     action = action_seq[0]
                     action_seq.pop(0)
-                    action_source = "s2_discrete_initial" if is_new_s2_decision else "s2_discrete_continuation"
                 elif pixel_goal is not None:
                     if len(local_actions) == 0:
                         # navdp
@@ -1094,172 +521,63 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         depth_dp = look_down_depth.unsqueeze(-1).to(torch.bfloat16)
 
                         depths_dp = torch.stack([pix_goal_depth, depth_dp]).unsqueeze(0).to(self.device)
-                        episode_stats["s1_call_count"] += 1
-                        s1_start = time.perf_counter()
                         with torch.no_grad():
                             dp_actions = self.model.generate_traj(traj_latents, images_dp, depths_dp)
-                        episode_stats["s1_generate_seconds"] += time.perf_counter() - s1_start
 
                         action_list = traj_to_actions(dp_actions)
                         if len(action_list) < MAX_STEPS:
                             action_list += [0] * (MAX_STEPS - len(action_list))
 
                         local_actions = action_list
-                        s1_regenerated = True
                         if len(local_actions) >= MAX_LOCAL_STEPS:
                             local_actions = local_actions[:MAX_LOCAL_STEPS]
                         print("local_actions", local_actions)
                         action = local_actions.pop(0)
                     else:
                         action = local_actions.pop(0)
-                    action_source = "s1_cycle_initial" if is_new_s2_decision else "s1_cycle_continuation"
 
                     forward_action += 1
-                    episode_stats["pixel_goal_active_steps"] += 1
-                    episode_stats["current_pixel_goal_burst"] += 1
                     if forward_action > MAX_STEPS:
-                        self._close_pixel_goal_burst(episode_stats)
                         pixel_goal = None
                         output_ids = None
                         messages = []
                         step_id += 1
                         forward_action = 0
                         local_actions = []
-                        replay_v2_state["active_pixel_goal_cycle_id"] = None
                         continue
                     if action == action_code.STOP:
-                        self._close_pixel_goal_burst(episode_stats)
                         pixel_goal = None
                         output_ids = None
                         messages = []
                         step_id += 1
                         forward_action = 0
                         local_actions = []
-                        replay_v2_state["active_pixel_goal_cycle_id"] = None
                         continue
                 else:
                     action = 0
-                    action_source = "default_stop"
 
-                if action == action_code.STOP:
-                    episode_stats["stop_actions"] += 1
-
-                decision_context = replay_v2_state["last_s2_context"] or {}
-                decision_id = replay_v2_state["active_decision_id"]
-                pixel_goal_cycle_id = replay_v2_state["active_pixel_goal_cycle_id"]
-                decision_step_offset = replay_v2_state["active_decision_step_offset"] if decision_id is not None else None
-                cycle_step_offset = (
-                    replay_v2_state["active_cycle_step_offset"] if pixel_goal_cycle_id is not None else None
-                )
-                baseline_output = {
-                    "action": int(action),
-                    "pixel_goal": pixel_goal,
-                    "output_kind": output_kind,
-                    "llm_output": llm_outputs,
-                    "local_actions_remaining": [int(a) for a in local_actions],
-                }
-
-                self._write_replay_step(
-                    scene_id=scene_id,
-                    episode_id=episode_id,
-                    instruction=episode_instruction,
-                    step_id=step_id,
-                    rgb=np.asarray(save_raw_image),
-                    depth=raw_depth,
-                    lookdown_rgb=lookdown_rgb_for_replay,
-                    lookdown_depth=lookdown_depth_for_replay,
-                    pose_info=pose_info,
-                    history_frame_indices=history_id,
-                    baseline_output=baseline_output,
-                )
-                self._write_replay_step_v2(
-                    scene_id=scene_id,
-                    episode_id=episode_id,
-                    step_id=step_id,
-                    rgb=np.asarray(save_raw_image),
-                    depth=raw_depth,
-                    lookdown_rgb=lookdown_rgb_for_replay,
-                    lookdown_depth=lookdown_depth_for_replay,
-                    asset_paths=replay_v2_paths,
-                    record={
-                        "record_id": record_id,
-                        "instruction": episode_instruction,
-                        "pose": pose_info,
-                        "history_frame_indices": decision_context.get("history_frame_indices", history_id),
-                        "history_rgb_paths": decision_context.get("input_image_paths", [])[:-1]
-                        if decision_context.get("input_image_paths")
-                        else [],
-                        "is_new_s2_decision": is_new_s2_decision,
-                        "is_lookdown_followup": is_lookdown_followup,
-                        "decision_id": decision_id,
-                        "decision_step_offset": decision_step_offset,
-                        "pixel_goal_cycle_id": pixel_goal_cycle_id,
-                        "cycle_step_offset": cycle_step_offset,
-                        "action_source": action_source,
-                        "s1_regenerated_this_step": s1_regenerated,
-                        "decision_prompt_text": decision_context.get("prompt_text"),
-                        "decision_chat_text": decision_context.get("chat_template_text"),
-                        "decision_input_image_paths": decision_context.get("input_image_paths", []),
-                        "conversation_messages": decision_context.get("conversation_messages", []),
-                        "s2_output_text": decision_context.get("s2_output_text", llm_outputs),
-                        "s2_generated_token_count": decision_context.get("s2_generated_token_count", 0),
-                        "s2_output_kind": decision_context.get("s2_output_kind", output_kind),
-                        "s2_output_pixel": decision_context.get("s2_output_pixel"),
-                        "s2_action_seq": decision_context.get("s2_action_seq", []),
-                        "s1_initial_action_seq": decision_context.get("s1_initial_action_seq", []),
-                        "baseline_output": baseline_output,
-                        "http_loopback": {
-                            "frame_id": record_id,
-                            "reset": step_id == 0 and not is_lookdown_followup,
-                            "instruction": episode_instruction,
-                            "use_recorded_lookdown": True,
-                        },
-                    },
-                )
                 info = self.env.get_metrics()
 
-                if info['top_down_map'] is not None and self.save_video:
-                    frame = observations_to_image({'rgb': np.asarray(save_raw_image)}, info)
+                if self.save_video:
+                    if info.get('top_down_map') is not None:
+                        frame = observations_to_image({'rgb': np.asarray(save_raw_image)}, info)
+                    else:
+                        frame = np.array(save_raw_image)
                     if pixel_goal is not None and flag:
                         cv2.circle(frame, (pixel_goal[0], pixel_goal[1]), radius=8, color=(255, 0, 0), thickness=-1)
                     vis_frames.append(frame)
 
                 print("step_id", step_id, "action", action)
 
-                if vis_writer is not None:
-                    vis = np.asarray(save_raw_image).copy()
-                    vis = cv2.putText(
-                        vis,
-                        f"step {step_id} action {int(action)}",
-                        (20, 40),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        1,
-                        (0, 255, 0),
-                        2,
-                    )
-                    if pixel_goal is not None:
-                        if draw_pixel_goal:
-                            cv2.circle(vis, (pixel_goal[0], pixel_goal[1]), radius=8, color=(255, 0, 0), thickness=-1)
-                    vis_writer.append_data(vis)
-
-                if action == action_code.LOOKDOWN and self.has_lookdown_support:
-                    if self.has_pitch_actions:
-                        self.env.step(action)
-                        observations, _, done, _ = self.env.step(action)
-                    else:
-                        observations = self._make_internal_lookdown_followup_observations(observations)
-                        done = False
+                if self.has_pitch_actions and action == action_code.LOOKDOWN:
+                    self.env.step(action)
+                    observations, _, done, _ = self.env.step(action)
                     flag = True
                 else:
                     observations, _, done, _ = self.env.step(action)
                     step_id += 1
                     messages = []
                     flag = False
-                if replay_v2_state["active_decision_id"] is not None:
-                    replay_v2_state["active_decision_step_offset"] += 1
-                if replay_v2_state["active_pixel_goal_cycle_id"] is not None:
-                    replay_v2_state["active_cycle_step_offset"] += 1
-                episode_stats["step_wall_times"].append(time.perf_counter() - step_wall_start)
 
             # ---------- 3. End of episode -----------
             # collect the metric result of this episode and write progress to the output_path/progress.json
@@ -1268,21 +586,19 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
             # After the episode finishes, collect metrics:
             metrics = self.env.get_metrics()
-            nav_error = metrics.get("oracle_navigation_error", metrics.get("distance_to_goal"))
 
             sucs.append(metrics['success'])
             spls.append(metrics['spl'])
             oss.append(metrics['oracle_success'])
-            nes.append(nav_error)
+            nes.append(metrics["distance_to_goal"])
             if 'ndtw' in metrics:
                 ndtw.append(metrics["ndtw"])
 
             print(
                 f"scene_episode {scene_id}_{episode_id:04d} success: {metrics['success']}, "
                 f"spl: {metrics['spl']}, os: {metrics['oracle_success']}, "
-                f"ne: {nav_error}"
+                f"ne: {metrics['distance_to_goal']}"
             )
-            runtime_record = self._finalize_episode_stats(episode_stats, metrics, step_id)
 
             # Write per-episode progress.json entry (still per-rank)
             result = {
@@ -1290,39 +606,11 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 "episode_id": episode_id,
                 "success": metrics["success"],
                 "spl": metrics["spl"],
-                "oracle_success": metrics['oracle_success'],
-                "navigation_error": nav_error,
                 "os": metrics['oracle_success'],
-                "ne": nav_error,
+                "ne": metrics["distance_to_goal"],
                 "steps": step_id,
                 "episode_instruction": episode_instruction,
-                "episode_wall_clock_seconds": runtime_record["episode_wall_clock_seconds"],
-                "avg_step_wall_clock_seconds": runtime_record["avg_step_wall_clock_seconds"],
-                "s2_call_count": runtime_record["s2_call_count"],
-                "s2_avg_seconds": runtime_record["s2_avg_seconds"],
-                "s1_avg_seconds": runtime_record["s1_avg_seconds"],
-                "pixel_goal_ratio": runtime_record["pixel_goal_ratio"],
-                "discrete_ratio": runtime_record["discrete_ratio"],
-                "stop_ratio": runtime_record["stop_ratio"],
-                "avg_s1_steps_per_cycle": runtime_record["avg_s1_steps_per_cycle"],
-                "human_aware_metrics": runtime_record.get("human_aware_metrics", {}),
-                "raw_metrics": runtime_record.get("raw_metrics", {}),
             }
-            for key in [
-                "collisions_count",
-                "collisions_detail_count",
-                "collision_steps_count",
-                "human_count",
-                "min_distance_to_human",
-                "mean_distance_to_human",
-                "min_human_relative_angle",
-                "mean_human_relative_angle",
-                "TCR",
-                "CR",
-                "SR",
-            ]:
-                if key in runtime_record:
-                    result[key] = runtime_record[key]
             if 'ndtw' in metrics:
                 result['ndtw'] = metrics['ndtw']
 
@@ -1331,8 +619,8 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             with open(os.path.join(self.output_path, 'progress.json'), 'a') as f:
                 f.write(json.dumps(result) + "\n")
 
-            # save video
-            if self.save_video and metrics['success'] == 1.0:
+            # save video for all episodes
+            if self.save_video and len(vis_frames) > 0:
                 images_to_video(
                     vis_frames,
                     os.path.join(self.output_path, f'vis_{self.epoch}', f'{scene_id}'),
@@ -1341,10 +629,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     quality=9,
                 )
             vis_frames.clear()
-            if vis_writer is not None:
-                vis_writer.close()
 
-        self._flush_runtime_summary()
         self.env.close()
 
         return (
@@ -1403,17 +688,9 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
             vis_frames = []
             step_id = 0
-            vis_writer = None
 
             if self.save_video:
                 os.makedirs(os.path.join(self.output_path, f'vis_{self.epoch}', f'{scene_id}'), exist_ok=True)
-            if self.vis_debug:
-                debug_dir = os.path.join(self.vis_debug_path, f'epoch_{self.epoch}')
-                os.makedirs(debug_dir, exist_ok=True)
-                vis_writer = imageio.get_writer(
-                    os.path.join(debug_dir, f'{scene_id}_{episode_id:04d}.mp4'),
-                    fps=5,
-                )
             initial_height = self.env._env.sim.get_agent_state().position[1]
 
             rgb_list = []
@@ -1430,7 +707,6 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
             # ---------- 2. Episode step loop -----------
             while (not done) and (step_id <= self.max_steps_per_episode):
-                draw_pixel_goal = False
                 # refactor agent get action
                 rgb = observations["rgb"]
                 depth = observations["depth"]
@@ -1452,32 +728,22 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 image = Image.fromarray(rgb).convert('RGB')
                 save_raw_image = image.copy()
 
-                if self.has_lookdown_support and action == action_code.LOOKDOWN:
-                    if self.has_external_lookdown_views and not self.has_pitch_actions:
-                        lookdown_rgb_array, lookdown_depth_raw = self._get_external_lookdown_observations(observations)
-                        look_down_image = Image.fromarray(lookdown_rgb_array).convert('RGB')
-                        save_raw_image = look_down_image.copy()
-                        look_down_depth = filter_depth(
-                            lookdown_depth_raw.reshape(lookdown_depth_raw.shape[:2]),
-                            blur_type=None,
-                        )
-                        look_down_depth = look_down_depth * (self._max_depth - self._min_depth) + self._min_depth
-                        look_down_depth = look_down_depth * 1000
-                    else:
-                        look_down_image = image
-                        save_raw_image = look_down_image.copy()
+                if self.has_pitch_actions and action == action_code.LOOKDOWN:
+                    look_down_image = image
+                    save_raw_image = look_down_image.copy()
                 else:
                     image = image.resize((self.model_args.resize_w, self.model_args.resize_h))
                     rgb_list.append(image)
 
                 if len(action_seq) == 0 and goal is None:
-                    if self.has_lookdown_support and action == action_code.LOOKDOWN:
-                        # Keep look-down follow-up compact to avoid
-                        # accumulating a long multi-turn, multi-image prompt.
-                        sources = self._build_compact_lookdown_followup(episode.instruction.instruction_text)
-                        input_images = [look_down_image]
-                        messages = []
-                        input_img_id = 0
+                    if self.has_pitch_actions and action == action_code.LOOKDOWN:
+                        # last action is look down
+                        sources = [{"from": "human", "value": ""}, {"from": "gpt", "value": ""}]
+                        input_images += [look_down_image]
+                        messages.append(
+                            {'role': 'assistant', 'content': [{'type': 'text', 'text': llm_outputs}]}  # noqa: F405
+                        )
+                        input_img_id = -1
                     else:
                         sources = copy.deepcopy(self.conversation)
                         sources[0]["value"] = sources[0]["value"].replace(
@@ -1499,8 +765,6 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
                     prompt = random.choice(self.conjunctions) + DEFAULT_IMAGE_TOKEN
                     sources[0]["value"] += f" {prompt}."
-                    if not self.has_lookdown_support:
-                        sources[0]["value"] += " Only output ↑, ←, →, STOP, or image coordinates. Never output ↓."
                     prompt_instruction = copy.deepcopy(sources[0]["value"])
                     parts = split_and_clean(prompt_instruction)
 
@@ -1538,15 +802,14 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         coord = [int(c) for c in re.findall(r'\d+', llm_outputs)]
 
                         pixel_goal = [int(coord[1]), int(coord[0])]
-                        draw_pixel_goal = True
 
-                        if not (self.has_pose_sensors and self.has_lookdown_support):
-                            action_seq = self._pixel_goal_to_discrete_actions(pixel_goal, rgb.shape[1])
+                        if not (self.has_pose_sensors and self.has_pitch_actions):
+                            action_seq = [self._pixel_goal_to_discrete_action(pixel_goal, rgb.shape[1])]
                             print('pixel_goal_fallback_actions', action_seq, flush=True)
                         else:
-                            if self.has_pitch_actions:
-                                self.env.step(action_code.LOOKUP)
-                                self.env.step(action_code.LOOKUP)
+                            # look down --> horizontal
+                            self.env.step(action_code.LOOKUP)
+                            self.env.step(action_code.LOOKUP)
 
                             goal = pixel_to_gps(pixel_goal, depth / 1000, intrinsic_matrix, tf_camera_to_episodic)
 
@@ -1567,11 +830,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             print('predicted goal', pixel_goal, goal, flush=True)
 
                     else:
-                        if not self.has_lookdown_support and re.fullmatch(r"\s*↓+\s*", llm_outputs or ""):
-                            action_seq = self._fallback_actions_for_unavailable_lookdown(depth, step_id)
-                            print('lookdown_fallback_actions', action_seq, flush=True)
-                        else:
-                            action_seq = self.parse_actions(llm_outputs)
+                        action_seq = self.parse_actions(llm_outputs)
                         print('actions', action_seq, flush=True)
 
                 if len(action_seq) != 0:
@@ -1602,36 +861,20 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
                 info = self.env.get_metrics()
 
-                if info['top_down_map'] is not None and self.save_video:
-                    frame = observations_to_image({'rgb': np.asarray(save_raw_image)}, info)
+                if self.save_video:
+                    if info.get('top_down_map') is not None:
+                        frame = observations_to_image({'rgb': np.asarray(save_raw_image)}, info)
+                    else:
+                        frame = np.array(save_raw_image)
                     if goal is not None and flag:
                         cv2.circle(frame, (pixel_goal[0], pixel_goal[1]), radius=8, color=(255, 0, 0), thickness=-1)
                     vis_frames.append(frame)
 
                 print("step_id", step_id, "action", action)
 
-                if vis_writer is not None:
-                    vis = np.asarray(save_raw_image).copy()
-                    vis = cv2.putText(
-                        vis,
-                        f"step {step_id} action {int(action)}",
-                        (20, 40),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        1,
-                        (0, 255, 0),
-                        2,
-                    )
-                    if draw_pixel_goal:
-                        cv2.circle(vis, (pixel_goal[0], pixel_goal[1]), radius=8, color=(255, 0, 0), thickness=-1)
-                    vis_writer.append_data(vis)
-
-                if action == action_code.LOOKDOWN and self.has_lookdown_support:
-                    if self.has_pitch_actions:
-                        self.env.step(action)
-                        observations, _, done, _ = self.env.step(action)
-                    else:
-                        observations = self._make_internal_lookdown_followup_observations(observations)
-                        done = False
+                if self.has_pitch_actions and action == action_code.LOOKDOWN:
+                    self.env.step(action)
+                    observations, _, done, _ = self.env.step(action)
                     flag = True
                 else:
                     observations, _, done, _ = self.env.step(action)
@@ -1670,17 +913,14 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 "ne": metrics["distance_to_goal"],
                 "steps": step_id,
                 "episode_instruction": episode_instruction,
-                "human_aware_metrics": self._to_jsonable(self._extract_human_aware_metrics(metrics, episode_id)),
-                "raw_metrics": self._to_jsonable(metrics),
             }
-            result.update(self._extract_human_aware_metrics(metrics, episode_id))
             if 'ndtw' in metrics:
                 result['ndtw'] = metrics['ndtw']
 
             os.makedirs(self.output_path, exist_ok=True)
             with open(os.path.join(self.output_path, 'progress.json'), 'a') as f:
                 f.write(json.dumps(result) + "\n")
-            if self.save_video and metrics['success'] == 1.0:
+            if self.save_video and len(vis_frames) > 0:
                 images_to_video(
                     vis_frames,
                     os.path.join(self.output_path, f'vis_{self.epoch}', f'{scene_id}'),
@@ -1689,8 +929,6 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     quality=9,
                 )
             vis_frames.clear()
-            if vis_writer is not None:
-                vis_writer.close()
 
         self.env.close()
 

@@ -50,6 +50,10 @@ class HAVLNHttpEnv(base.Env):
                 io.BytesIO(base64.b64decode(payload["lookdown_depth_npy_b64"])),
                 allow_pickle=False,
             )
+        if "gps" in payload:
+            obs["gps"] = np.array(payload["gps"], dtype=np.float32)
+        if "compass" in payload:
+            obs["compass"] = np.array([payload["compass"]], dtype=np.float32)
         return obs
 
     def _set_episode(self, payload: Dict[str, Any]):
