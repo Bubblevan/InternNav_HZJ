@@ -26,13 +26,19 @@ class HAVLNHttpEnv(base.Env):
 
         meta = self.session.get(f"{self.server_url}/metadata", timeout=30).json()
         self._capabilities.update(meta.get("capabilities", {}))
-        total_episodes = int(meta.get("max_episodes") or meta.get("total_episodes") or 0)
+        # max_episodes=-1 means "serve all"; use total_episodes as the tqdm count in that case.
+        server_max = meta.get("max_episodes")
+        total_episodes = int(meta.get("total_episodes") or 0)
+        if server_max is not None:
+            server_max = int(server_max)
+            if server_max > 0:
+                total_episodes = min(server_max, total_episodes) if total_episodes > 0 else server_max
         client_cap = env_config.env_settings.get("max_eval_episodes")
         if client_cap is not None:
             client_cap = int(client_cap)
             if client_cap > 0:
                 total_episodes = min(total_episodes, client_cap) if total_episodes > 0 else client_cap
-        self.episodes = [None] * total_episodes
+        self.episodes = [None] * max(0, total_episodes)
 
     def _decode_obs(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         rgb = np.asarray(Image.open(io.BytesIO(base64.b64decode(payload["rgb_png_b64"]))).convert("RGB"))

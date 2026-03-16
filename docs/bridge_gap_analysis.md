@@ -272,6 +272,169 @@ metrics 中不包含 `top_down_map`（永远为 None），导致 `vis_frames` �
 2. 通过视频回放分析模型的导航质量，定位 success rate 低的原因
 3. 对比基准：同配置跑 InternNav 原生 R2R（无人类）确认模型本身正常
 
+### 已知问题：视频中人类模型完全静止
+
+**现象**：save_video 保存的视频中，人类 3D 模型完全一动不动，但 `demo.py` 中人类有正常动画。
+
+**根因**：`HAVLNCE._handle_signals()` 中的 `total_signals_sent <= 120` 硬性上限。
+
+#### 人类动画渲染机制
+
+HA-VLN 的人类动画采用 **双线程信号队列** 架构（Algorithm A2）：
+
+```
+┌─────────────────────┐        signal_queue         ┌──────────────────────┐
+│  子线程：_signal_sender │  ──── "REFRESH_HUMAN" ───▷  │  主线程：_handle_signals │
+│  每 0.1s 发一次信号    │        (maxsize=120)       │  每次 env.step 消费    │
+│  total_signals_sent++  │                            │  计算 frame_id         │
+└─────────────────────┘                             └──────────────────────┘
+```
+
+**每帧人类更新流程**：
+1. `_handle_signals()` 从队列批量取出所有信号
+2. `frame_id = (total_signals_sent - 1) % 120`（120 帧循环）
+3. `refresh_human_model(frame_id)`：移除旧人体 GLB → 加载新帧 GLB → 设置位移/旋转
+4. 重建/加载该帧对应的 navmesh
+
+**关键代码（`HASimulator/environments.py` line 120-127）**：
+```python
+if signals_processed > 0:
+    frame_id = (self.total_signals_sent - 1) % 120
+    if self.total_signals_sent <= 120:      # ← 这行是问题根源
+        self.refresh_human_model(frame_id)
+```
+
+#### 为什么人类完全静止
+
+`total_signals_sent` 是子线程的累计计数器（每 0.1s +1），**基于墙钟时间**，不是模拟步数：
+
+| 时间点 | total_signals_sent | 说明 |
+|--------|-------------------|------|
+| reset() | 0 → 1 | 重置后立即发一个初始信号 |
+| +1s（HTTP 编码+传输） | ~11 | 客户端还在解码 |
+| +3s（S2 首次推理） | ~31 | 模型生成第一个动作 |
+| +5s（4 次 pitch 步骤） | ~51 | LOOKDOWN×2 + LOOKUP×2 |
+| +7s（S2 followup） | ~71 | lookdown followup 推理 |
+| +9s（S1 + 几个步骤） | ~91 | S1 本地规划执行 |
+| **+12s** | **>120** | **上限突破，人类永久冻结** |
+
+实际测量：每个 evaluator step 耗时约 0.5-3 秒（含模型推理 + HTTP 往返），
+12 秒墙钟时间内只能完成约 5-15 个导航步骤。之后整个 episode（可能长达 200+ 步）
+的人类全部冻结在最后一帧。
+
+由于每次 episode `reset()` 会重置 `total_signals_sent=0`，人类在每个 episode 开头
+的前 ~12 秒有微小移动（如果此时有 `env.step()` 调用 `_handle_signals()`），
+但由于 save_video 捕获的是离散步骤的 RGB 帧（非连续渲染），且前几步的动画跳帧严重，
+视觉上人类看起来完全不动。
+
+#### 对比 `demo.py`
+
+`demo.py` 的 `HumanManager` 机制完全不同：
+
+| | demo.py (HumanManager) | HA-VLN (HAVLNCE) |
+|---|---|---|
+| 帧索引 | `total_signals_processed % 120` | `(total_signals_sent - 1) % 120` |
+| 更新上限 | **无上限**，永远循环 | `total_signals_sent <= 120` 后停止 |
+| 更新触发 | 每帧 while 循环（~60 FPS） | 仅在 `env.step()` 时 |
+| 计数基准 | 已消费的信号数 | 子线程已发送的信号数 |
+
+demo.py 没有 120 帧上限，动画永远循环播放。
+
+#### 视频帧保存逻辑 vs 人类渲染速度
+
+**视频帧保存逻辑**（evaluator `_run_eval_dual_system`）：
+
+每次 while 循环迭代保存一帧到 `vis_frames`。一次迭代对应一个 `action` 的执行，
+但注意 evaluator 的一个"导航步"实际包含多次 while 循环迭代：
+
+```
+每个导航步的 while 循环迭代:
+  1. LOOKDOWN×2（2 次迭代，pitch action，step_id 不增）→ 保存 2 帧
+  2. LOOKUP×2（2 次迭代，pitch action，step_id 不增）→ 保存 2 帧
+  3. S2 推理 + action 执行（1 次迭代，step_id +1）→ 保存 1 帧
+  合计：每导航步 ≈ 5 帧（实际因 S1 多步执行可能更多）
+```
+
+每帧保存时机是 `env.step()` 返回观测之后、下一个动作发送之前。
+所以视频帧是**每次动作执行后的快照**，不是连续渲染。
+
+**人类渲染速度**：
+
+- 子线程每 0.1s 发一次信号 → 10 Hz
+- `_handle_signals()` 仅在 `env.step()`（非 pitch）时被调用
+- 每次调用批量消费队列中积攒的所有信号，一次性跳到最新 frame_id
+- 一个导航步耗时约 1-3 秒（含推理 + HTTP），期间积攒 10-30 个信号
+- 所以每次 `_handle_signals()` 调用时，动画跳 10-30 帧
+
+**帧率对比**：
+
+| | 频率 | 说明 |
+|---|---|---|
+| 信号发送 | 10 Hz（0.1s/帧） | 子线程墙钟驱动 |
+| 动画更新 | ~0.3-1 Hz | 仅 `env.step()` 非 pitch 时触发 |
+| 视频帧捕获 | ~1-2 Hz | 每次 while 迭代一帧 |
+
+人类渲染更新频率（0.3-1 Hz）**远低于**信号发送频率（10 Hz），
+所以动画跳帧严重：视频中人类会在几个姿态之间大幅跳变，而不是流畅动画。
+方案 2（步数驱动）会让每步推进 1 帧，但总共 120 帧、100+ 步的 episode
+意味着动画只播放不到 1 遍，运动幅度小的人类几乎看不出变化。
+
+#### 人类动画数据统计
+
+**HAPS 2.0 数据集概况**：
+
+| 项目 | 数值 |
+|---|---|
+| 场景数 | 72 |
+| 人类总实例 | 749 |
+| 唯一动作类型 | 419 |
+| 每种动作帧数 | **固定 120 帧**（120 个 .glb 文件） |
+| 有位移的动作 | **196 / 419 类型**（317 / 749 实例） |
+| 纯原地动作 | 223 / 419 类型 |
+
+**典型有位移动作**（最大位移 >1m）：
+
+| 动作 | 实例数 | 最大位移 |
+|---|---|---|
+| `hallway:Someone_talking_on_the_phone_while_pacing` | 6 | **3.47m** |
+| `living_room:Someone_talking_on_the_phone_while_pacing` | 6 | **2.98m** |
+| `hallway:Someone_hanging_pictures_or_artwork` | 6 | 1.79m |
+| `hallway:An_individual_cleaning_or_vacuuming` | 5+5 | 1.50m |
+| `hallway:A_child_running_through_the_hallway` | 7 | 1.20m |
+| `hallway:A_group_of_friends...impromptu_gathering` | - | 1.08m |
+
+**纯原地动作**示例：`Someone_napping_on_the_couch`、`Someone_reading_a_book_in_bed`、
+`Friends_laughing_and_sharing_stories_over_dinner`、`A_person_taking_photographs`。
+
+GitHub 演示中可见的走路位移（如 pacing、running、cleaning）确实存在于数据中，
+但需要动画正常播放才能看到。由于之前 `total_signals_sent <= 120` 的限制，
+动画在前 12 秒就冻结了，有位移的人类也只显示初始姿态。
+
+#### 修复方向（HA-VLN 侧）
+
+**方案 1：移除上限，循环播放（已实施）**
+```python
+# 改前：
+if self.total_signals_sent <= 120:
+    self.refresh_human_model(frame_id)
+
+# 改后：
+self.refresh_human_model(frame_id)
+```
+- 最简单，让人类动画无限循环
+- 改变 HA-VLN 语义（原设计是播放一次后停止），但对 benchmark 评测影响极小
+- 修改文件：`HASimulator/environments.py` `_handle_signals()`
+
+**方案 2：步数驱动代替墙钟驱动**
+- 每次 `_handle_signals()` 被调用时 `step_count += 1`
+- `frame_id = step_count % 120`
+- 不推荐：每步推进 1 帧 + 120 帧总量 → 100 步 episode 还没播完一遍动画
+  → 有位移的人类动作幅度被严重压缩，位移速度不自然
+
+**方案 3：大幅提高上限**
+- `total_signals_sent <= 12000`
+- 不治本，只是延长了冻结前的时间
+
 ---
 
 ## 八、运行命令速查
@@ -291,20 +454,24 @@ conda run -n havlnce python ../scripts/havln_http_env_server.py \
 - `--scene-filter x8F5xyUWy9e,zsNo4HB9uLZ`：按场景过滤
 - `--episode-filter 1,2,505`：按 episode ID 过滤
 - `--max-episodes -1`：serve 全部 episode
-- `--disable-lookdown-sensors`：关闭外挂俯视传感器（**不推荐**，会导致 LOOKDOWN followup 使用倾斜视图）
+- `--disable-lookdown-sensors`：关闭外挂俯视传感器（可选，原版 evaluator 不使用）
 
 ### InternNav DualVLN 客户端
 
 ```bash
 cd /root/backup/InternNav
 
-# 少量 episode 调试（3 episodes + vis_debug 录像）
+# 少量 episode 调试（3 episodes）
 conda run -n internnav python scripts/eval/eval.py \
   --config scripts/eval/configs/havln_http_dual_system_debug_cfg.py
 
-# 32 episodes 正式评测
+# 32 episodes 评测（带视频）
 conda run -n internnav python scripts/eval/eval.py \
   --config scripts/eval/configs/havln_http_dual_system_32_cfg.py
+
+# val_unseen 全量评测（1839 episodes，无视频）
+conda run -n internnav python scripts/eval/eval.py \
+  --config scripts/eval/configs/havln_http_dual_system_full_cfg.py
 ```
 
 ### HA-VLN RandomAgent 基线
@@ -315,3 +482,52 @@ conda run -n havlnce python run.py \
   --exp-config config/nonlearning_internnav.yaml \
   --run-type eval
 ```
+
+---
+
+## 九、全量 val_unseen 实验配置
+
+### 数据集规模
+
+| split | episodes | scenes |
+|---|---|---|
+| train | 10,819 | 61 |
+| val_seen | 778 | 53 |
+| **val_unseen** | **1,839** | **11** |
+
+### 预估运行时间
+
+- 每 episode 平均 30-100 步 × 每步 1-3 秒 ≈ 30-300 秒/episode
+- 1,839 episodes × ~120 秒/episode ≈ **~61 小时**（单 GPU）
+- 建议先跑 32-128 episodes 验证，再决定是否全量跑
+
+### 服务端命令（全量）
+
+```bash
+cd /root/backup/HA-VLN/agent
+conda run -n havlnce python ../scripts/havln_http_env_server.py \
+  --config-path config/internnav_bridge.yaml \
+  --split val_unseen \
+  --max-episodes -1 \
+  --port 8899
+```
+
+### 客户端命令（全量）
+
+```bash
+cd /root/backup/InternNav
+conda run -n internnav python scripts/eval/eval.py \
+  --config scripts/eval/configs/havln_http_dual_system_full_cfg.py
+```
+
+配置说明（`havln_http_dual_system_full_cfg.py`）：
+- `save_video: False`（全量跑时关闭视频，避免磁盘占用过大）
+- `max_eval_episodes: 0`（0 = 不限制，跟随服务端）
+- `output_path: ./logs/habitat/havln_val_unseen_full`
+- 结果写入 `{output_path}/progress.json`（每行一个 episode 的 JSON）
+
+### 断点续传
+
+若中途中断，可通过 `progress.json` 中已完成的 episode 列表恢复：
+- 服务端用 `--episode-filter` 排除已完成 episodes
+- 或修改客户端 `allowed_episode_ids` 指定剩余 episodes

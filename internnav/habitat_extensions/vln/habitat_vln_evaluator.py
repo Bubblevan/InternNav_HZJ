@@ -66,6 +66,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
     def __init__(self, cfg: EvalCfg):
         args = argparse.Namespace(**cfg.eval_settings)
         self.save_video = args.save_video
+        self.save_video_failures = getattr(args, 'save_video_failures', False)
         self.epoch = args.epoch
         self.max_steps_per_episode = args.max_steps_per_episode
         self.output_path = args.output_path
@@ -209,9 +210,9 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         # Now just implement the actual eval here and return dict.
 
         if self.model_args.mode == 'dual_system':
-            sucs, spls, oss, nes, ndtws = self._run_eval_dual_system()
+            sucs, spls, oss, nes, ndtws, collision_counts, psi_rates = self._run_eval_dual_system()
         elif self.model_args.mode == 'system2':
-            sucs, spls, oss, nes, ndtws = self._run_eval_system2()
+            sucs, spls, oss, nes, ndtws, collision_counts, psi_rates = self._run_eval_system2()
         else:
             raise ValueError(f"Invalid mode: {self.model_args.mode}")
 
@@ -220,6 +221,8 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             "spls": spls,  # shape [N_local]
             "oss": oss,  # shape [N_local]
             "nes": nes,  # shape [N_local]
+            "collision_counts": collision_counts,
+            "psi_rates": psi_rates,
         }
 
         if ndtws is not None:
@@ -257,6 +260,12 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             ndtws_all = global_metrics["ndtws"]
             result_all["ndtws_all"] = float(ndtws_all.mean().item()) if denom > 0 else 0.0
 
+        if "collision_counts" in global_metrics:
+            ccs = global_metrics["collision_counts"]
+            prs = global_metrics["psi_rates"]
+            result_all["avg_collision_count"] = float(ccs.mean().item()) if denom > 0 else 0.0
+            result_all["psi_rate_all"] = float(prs.mean().item()) if denom > 0 else 0.0
+
         return result_all
 
     def parse_actions(self, output):
@@ -291,6 +300,8 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
         # resume from previous results
         sucs, spls, oss, nes, ndtw = self.resume_from_output_path()
+        collision_counts: list = []
+        psi_rates: list = []
 
         # Episode loop is now driven by env.reset() + env.is_running
         process_bar = tqdm.tqdm(total=len(self.env.episodes), desc=f"Eval Epoch {self.epoch} Rank {self.rank}")
@@ -319,7 +330,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             vis_frames = []
             step_id = 0
 
-            if self.save_video:
+            if self.save_video or self.save_video_failures:
                 os.makedirs(os.path.join(self.output_path, f'vis_{self.epoch}', f'{scene_id}'), exist_ok=True)
 
             rgb_list = []
@@ -334,6 +345,11 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             done = False
             flag = False
             pixel_goal = None
+
+            # social metric accumulators (reset per episode)
+            _psi_steps = 0          # steps where any human was within 1.2 m
+            _sum_min_dist_h = 0.0
+            _dist_h_count = 0
 
             # ---------- 2. Episode step loop -----------
             while (not done) and (step_id <= self.max_steps_per_episode):
@@ -558,7 +574,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
                 info = self.env.get_metrics()
 
-                if self.save_video:
+                if self.save_video or self.save_video_failures:
                     if info.get('top_down_map') is not None:
                         frame = observations_to_image({'rgb': np.asarray(save_raw_image)}, info)
                     else:
@@ -574,10 +590,18 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     observations, _, done, _ = self.env.step(action)
                     flag = True
                 else:
-                    observations, _, done, _ = self.env.step(action)
+                    observations, _, done, _step_info = self.env.step(action)
                     step_id += 1
                     messages = []
                     flag = False
+                    # track social metrics each non-pitch step
+                    _dth = (_step_info or {}).get('distance_to_human')
+                    if _dth:
+                        _min_d = min(v[0] for v in _dth.values())
+                        _sum_min_dist_h += _min_d
+                        _dist_h_count += 1
+                        if _min_d < 1.2:
+                            _psi_steps += 1
 
             # ---------- 3. End of episode -----------
             # collect the metric result of this episode and write progress to the output_path/progress.json
@@ -594,10 +618,22 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             if 'ndtw' in metrics:
                 ndtw.append(metrics["ndtw"])
 
+            # --- social metrics ---
+            _collision_count = 0
+            _cd = metrics.get('collisions_detail')
+            if isinstance(_cd, dict):
+                _collision_count = int(_cd.get('count', 0))
+            _psi_rate = _psi_steps / max(step_id, 1)
+            _avg_min_dist_h = _sum_min_dist_h / _dist_h_count if _dist_h_count > 0 else -1.0
+            collision_counts.append(float(_collision_count))
+            psi_rates.append(_psi_rate)
+
             print(
                 f"scene_episode {scene_id}_{episode_id:04d} success: {metrics['success']}, "
                 f"spl: {metrics['spl']}, os: {metrics['oracle_success']}, "
-                f"ne: {metrics['distance_to_goal']}"
+                f"ne: {metrics['distance_to_goal']}, "
+                f"collisions: {_collision_count}, psi_rate: {_psi_rate:.3f}, "
+                f"avg_min_dist_h: {_avg_min_dist_h:.2f}m"
             )
 
             # Write per-episode progress.json entry (still per-rank)
@@ -610,6 +646,10 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 "ne": metrics["distance_to_goal"],
                 "steps": step_id,
                 "episode_instruction": episode_instruction,
+                "collision_count": _collision_count,
+                "psi_steps": _psi_steps,
+                "psi_rate": round(_psi_rate, 4),
+                "avg_min_dist_to_human": round(_avg_min_dist_h, 4),
             }
             if 'ndtw' in metrics:
                 result['ndtw'] = metrics['ndtw']
@@ -619,8 +659,10 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             with open(os.path.join(self.output_path, 'progress.json'), 'a') as f:
                 f.write(json.dumps(result) + "\n")
 
-            # save video for all episodes
-            if self.save_video and len(vis_frames) > 0:
+            # save video: always if save_video=True; only failures if save_video_failures=True
+            _is_failure = metrics['success'] == 0.0
+            _should_save_video = (self.save_video or (self.save_video_failures and _is_failure))
+            if _should_save_video and len(vis_frames) > 0:
                 images_to_video(
                     vis_frames,
                     os.path.join(self.output_path, f'vis_{self.epoch}', f'{scene_id}'),
@@ -638,6 +680,8 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             torch.tensor(oss).to(self.device),
             torch.tensor(nes).to(self.device),
             torch.tensor(ndtw).to(self.device) if ndtw else None,
+            torch.tensor(collision_counts).to(self.device),
+            torch.tensor(psi_rates).to(self.device),
         )
 
     def _run_eval_system2(self) -> tuple:
@@ -645,6 +689,8 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
         # resume from previous results
         sucs, spls, oss, nes, ndtw = self.resume_from_output_path()
+        collision_counts: list = []
+        psi_rates: list = []
 
         # Episode loop is now driven by env.reset() + env.is_running
         process_bar = tqdm.tqdm(total=len(self.env.episodes), desc=f"Eval Epoch {self.epoch} Rank {self.rank}")
@@ -689,7 +735,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             vis_frames = []
             step_id = 0
 
-            if self.save_video:
+            if self.save_video or self.save_video_failures:
                 os.makedirs(os.path.join(self.output_path, f'vis_{self.epoch}', f'{scene_id}'), exist_ok=True)
             initial_height = self.env._env.sim.get_agent_state().position[1]
 
@@ -704,6 +750,11 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
             done = False
             flag = False
+
+            # social metric accumulators (reset per episode)
+            _psi_steps = 0
+            _sum_min_dist_h = 0.0
+            _dist_h_count = 0
 
             # ---------- 2. Episode step loop -----------
             while (not done) and (step_id <= self.max_steps_per_episode):
@@ -861,7 +912,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
                 info = self.env.get_metrics()
 
-                if self.save_video:
+                if self.save_video or self.save_video_failures:
                     if info.get('top_down_map') is not None:
                         frame = observations_to_image({'rgb': np.asarray(save_raw_image)}, info)
                     else:
@@ -877,10 +928,18 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     observations, _, done, _ = self.env.step(action)
                     flag = True
                 else:
-                    observations, _, done, _ = self.env.step(action)
+                    observations, _, done, _step_info = self.env.step(action)
                     step_id += 1
                     messages = []
                     flag = False
+                    # track social metrics each non-pitch step
+                    _dth = (_step_info or {}).get('distance_to_human')
+                    if _dth:
+                        _min_d = min(v[0] for v in _dth.values())
+                        _sum_min_dist_h += _min_d
+                        _dist_h_count += 1
+                        if _min_d < 1.2:
+                            _psi_steps += 1
 
             # ---------- 3. End of episode -----------
             # collect the metric result of this episode and write progress to the output_path/progress.json
@@ -897,10 +956,22 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             if 'ndtw' in metrics:
                 ndtw.append(metrics["ndtw"])
 
+            # --- social metrics ---
+            _collision_count = 0
+            _cd = metrics.get('collisions_detail')
+            if isinstance(_cd, dict):
+                _collision_count = int(_cd.get('count', 0))
+            _psi_rate = _psi_steps / max(step_id, 1)
+            _avg_min_dist_h = _sum_min_dist_h / _dist_h_count if _dist_h_count > 0 else -1.0
+            collision_counts.append(float(_collision_count))
+            psi_rates.append(_psi_rate)
+
             print(
                 f"scene_episode {scene_id}_{episode_id:04d} success: {metrics['success']}, "
                 f"spl: {metrics['spl']}, os: {metrics['oracle_success']}, "
-                f"ne: {metrics['distance_to_goal']}"
+                f"ne: {metrics['distance_to_goal']}, "
+                f"collisions: {_collision_count}, psi_rate: {_psi_rate:.3f}, "
+                f"avg_min_dist_h: {_avg_min_dist_h:.2f}m"
             )
 
             # Write per-episode result.json entry (still per-rank)
@@ -913,6 +984,10 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 "ne": metrics["distance_to_goal"],
                 "steps": step_id,
                 "episode_instruction": episode_instruction,
+                "collision_count": _collision_count,
+                "psi_steps": _psi_steps,
+                "psi_rate": round(_psi_rate, 4),
+                "avg_min_dist_to_human": round(_avg_min_dist_h, 4),
             }
             if 'ndtw' in metrics:
                 result['ndtw'] = metrics['ndtw']
@@ -920,7 +995,11 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             os.makedirs(self.output_path, exist_ok=True)
             with open(os.path.join(self.output_path, 'progress.json'), 'a') as f:
                 f.write(json.dumps(result) + "\n")
-            if self.save_video and len(vis_frames) > 0:
+
+            # save video: always if save_video=True; only failures if save_video_failures=True
+            _is_failure = metrics['success'] == 0.0
+            _should_save_video = (self.save_video or (self.save_video_failures and _is_failure))
+            if _should_save_video and len(vis_frames) > 0:
                 images_to_video(
                     vis_frames,
                     os.path.join(self.output_path, f'vis_{self.epoch}', f'{scene_id}'),
@@ -938,4 +1017,6 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             torch.tensor(oss).to(self.device),
             torch.tensor(nes).to(self.device),
             torch.tensor(ndtw).to(self.device) if ndtw else None,
+            torch.tensor(collision_counts).to(self.device),
+            torch.tensor(psi_rates).to(self.device),
         )

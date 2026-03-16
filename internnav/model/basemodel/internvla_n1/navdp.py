@@ -137,7 +137,9 @@ class NavDP_Policy_DPT_CriticSum_DAT(nn.Module):
             unmatched_model = [k for k in model_dict if k not in pretrained_dict]
 
             model_dict.update(matched_dict)
-            self.load_state_dict(model_dict)
+            # assign=True is required when the model was built on meta device (device_map)
+            # to replace placeholder tensors rather than attempting an in-place copy (no-op).
+            self.load_state_dict(model_dict, assign=True)
 
             rank0_print(f"Successfully loaded pretrained weights from {self.navdp_pretrained}")
             rank0_print(f"Loaded {len(matched_dict)}/{len(model_dict)} layers")

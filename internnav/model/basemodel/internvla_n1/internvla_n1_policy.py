@@ -1,10 +1,13 @@
+import base64
 import copy
+import io
 import itertools
 import re
 from collections import OrderedDict
 from typing import Union
 
 import numpy as np
+import requests as http_requests
 import torch
 from PIL import Image
 from transformers import AutoProcessor, AutoTokenizer, PreTrainedModel
@@ -58,6 +61,14 @@ class InternVLAN1Net(PreTrainedModel):
         self.conversation_history = []  # Multi-turn conversation exists when looking down
         self.llm_output = ""
 
+        self.s2_vllm_url = getattr(self.model_config, 's2_vllm_url', None)
+        self.s2_vllm_model = getattr(self.model_config, 's2_vllm_model', None)
+        if self.s2_vllm_url:
+            print(f"[InternVLAN1Net] S2 vLLM backend enabled: {self.s2_vllm_url}")
+            if self.s2_vllm_model is None:
+                self.s2_vllm_model = self._detect_vllm_model_name()
+                print(f"[InternVLAN1Net] Auto-detected vLLM model name: {self.s2_vllm_model}")
+
     def init_prompts(self):
         self.DEFAULT_IMAGE_TOKEN = "<image>"
         # For absolute pixel goal
@@ -84,6 +95,56 @@ class InternVLAN1Net(PreTrainedModel):
                 "↓": [5],
             }
         )
+
+    def _detect_vllm_model_name(self):
+        try:
+            resp = http_requests.get(f"{self.s2_vllm_url}/v1/models", timeout=5)
+            models = resp.json().get("data", [])
+            if models:
+                return models[0]["id"]
+        except Exception as e:
+            print(f"[InternVLAN1Net] Failed to detect vLLM model name: {e}")
+        return "default"
+
+    @staticmethod
+    def _pil_to_data_url(image: Image.Image) -> str:
+        buf = io.BytesIO()
+        image.save(buf, format="JPEG", quality=90)
+        b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+        return f"data:image/jpeg;base64,{b64}"
+
+    def _conversation_to_openai(self, conversation_history):
+        """Convert internal conversation format to OpenAI-compatible messages with base64 images."""
+        openai_msgs = []
+        for msg in conversation_history:
+            items = []
+            for part in msg["content"]:
+                if part["type"] == "text":
+                    items.append({"type": "text", "text": part["text"]})
+                elif part["type"] == "image":
+                    items.append({
+                        "type": "image_url",
+                        "image_url": {"url": self._pil_to_data_url(part["image"])}
+                    })
+            openai_msgs.append({"role": msg["role"], "content": items})
+        return openai_msgs
+
+    def _vllm_generate(self, conversation_history, max_new_tokens=128):
+        """Send request to vLLM OpenAI-compatible API and return generated text."""
+        openai_msgs = self._conversation_to_openai(conversation_history)
+        payload = {
+            "model": self.s2_vllm_model,
+            "messages": openai_msgs,
+            "max_tokens": max_new_tokens,
+            "temperature": 0.0,
+        }
+        resp = http_requests.post(
+            f"{self.s2_vllm_url}/v1/chat/completions",
+            json=payload,
+            timeout=120,
+        )
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"]
 
     def reset(self):
         self.rgb_list = []
@@ -164,19 +225,27 @@ class InternVLAN1Net(PreTrainedModel):
 
         inputs = self.processor(text=[text], images=self.input_images, return_tensors="pt").to(self.device)
 
-        # 3. Model inference
-        with torch.no_grad():
-            output_ids = self.model.generate(
-                **inputs,
-                max_new_tokens=128,
-                do_sample=False,
-                use_cache=True,
-                past_key_values=None,
-                return_dict_in_generate=True,
-            ).sequences
-        self.llm_output = self.processor.tokenizer.decode(
-            output_ids[0][inputs.input_ids.shape[1] :], skip_special_tokens=True
-        )
+        # 3. Model inference — vLLM or local HF
+        if self.s2_vllm_url:
+            self.llm_output = self._vllm_generate(self.conversation_history, max_new_tokens=128)
+            generated_ids = self.tokenizer.encode(self.llm_output, add_special_tokens=False)
+            output_ids = torch.cat([
+                inputs.input_ids,
+                torch.tensor([generated_ids], device=inputs.input_ids.device),
+            ], dim=1)
+        else:
+            with torch.no_grad():
+                output_ids = self.model.generate(
+                    **inputs,
+                    max_new_tokens=128,
+                    do_sample=False,
+                    use_cache=True,
+                    past_key_values=None,
+                    return_dict_in_generate=True,
+                ).sequences
+            self.llm_output = self.processor.tokenizer.decode(
+                output_ids[0][inputs.input_ids.shape[1] :], skip_special_tokens=True
+            )
         print(f"============ output {self.episode_idx}  {self.llm_output}")
         output = S2Output()
 
