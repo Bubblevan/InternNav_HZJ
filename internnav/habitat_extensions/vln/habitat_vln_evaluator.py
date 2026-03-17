@@ -1,4 +1,6 @@
 import argparse
+import base64
+import io
 import json
 import os
 import sys
@@ -15,6 +17,7 @@ import cv2
 import habitat
 import numpy as np
 import quaternion
+import requests as http_requests
 import torch
 import tqdm
 from depth_camera_filtering import filter_depth
@@ -163,6 +166,21 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
         self.num_history = self.model_args.num_history
 
+        self.s2_vllm_url = getattr(self.model_args, 's2_vllm_url', None)
+        self.s2_vllm_model = getattr(self.model_args, 's2_vllm_model', None)
+        if self.s2_vllm_url:
+            print(f"[HabitatVLNEvaluator] S2 vLLM backend enabled: {self.s2_vllm_url}")
+            if self.s2_vllm_model is None:
+                try:
+                    resp = http_requests.get(f"{self.s2_vllm_url}/v1/models", timeout=5)
+                    models = resp.json().get("data", [])
+                    if models:
+                        self.s2_vllm_model = models[0]["id"]
+                except Exception as e:
+                    print(f"[HabitatVLNEvaluator] Failed to detect vLLM model: {e}")
+                    self.s2_vllm_model = "default"
+            print(f"[HabitatVLNEvaluator] vLLM model: {self.s2_vllm_model}")
+
         self._camera_height = self.sim_sensors_config.rgb_sensor.position[1]
         self._min_depth = self.sim_sensors_config.depth_sensor.min_depth
         self._max_depth = self.sim_sensors_config.depth_sensor.max_depth
@@ -170,6 +188,36 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         camera_fov_rad = np.deg2rad(self.sim_sensors_config.depth_sensor.hfov)
         self._camera_fov = camera_fov_rad
         self._fx = self._fy = self.sim_sensors_config.depth_sensor.width / (2 * np.tan(camera_fov_rad / 2))
+
+    @staticmethod
+    def _pil_to_data_url(image):
+        buf = io.BytesIO()
+        image.save(buf, format="JPEG", quality=90)
+        return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
+
+    def _conversation_to_openai(self, messages):
+        out = []
+        for msg in messages:
+            items = []
+            for p in msg["content"]:
+                if p["type"] == "text":
+                    items.append({"type": "text", "text": p["text"]})
+                elif p["type"] == "image":
+                    items.append({"type": "image_url", "image_url": {"url": self._pil_to_data_url(p["image"])}})
+            out.append({"role": msg["role"], "content": items})
+        return out
+
+    def _vllm_generate(self, messages, max_new_tokens=128):
+        openai_msgs = self._conversation_to_openai(messages)
+        payload = {
+            "model": self.s2_vllm_model,
+            "messages": openai_msgs,
+            "max_tokens": max_new_tokens,
+            "temperature": 0.0,
+        }
+        resp = http_requests.post(f"{self.s2_vllm_url}/v1/chat/completions", json=payload, timeout=120)
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"]
 
     def _init_env_capabilities(self):
         lab_sensors = getattr(self.config.habitat.task, "lab_sensors", None)
@@ -279,8 +327,9 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
     def resume_from_output_path(self) -> None:
         sucs, spls, oss, nes, ndtw = [], [], [], [], []
+        done_episodes = set()
         if self.rank != 0:
-            return sucs, spls, oss, nes, ndtw
+            return sucs, spls, oss, nes, ndtw, done_episodes
 
         # resume from previous results
         if os.path.exists(os.path.join(self.output_path, 'progress.json')):
@@ -293,18 +342,22 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     nes.append(res['ne'])
                     if 'ndtw' in res:
                         ndtw.append(res['ndtw'])
-        return sucs, spls, oss, nes, ndtw
+                    done_episodes.add((res.get('scene_id', ''), res.get('episode_id', -1)))
+            if done_episodes:
+                print(f"[Resume] Loaded {len(done_episodes)} completed episodes from {self.output_path}/progress.json")
+        return sucs, spls, oss, nes, ndtw, done_episodes
 
     def _run_eval_dual_system(self) -> tuple:
         self.model.eval()
 
         # resume from previous results
-        sucs, spls, oss, nes, ndtw = self.resume_from_output_path()
+        sucs, spls, oss, nes, ndtw, done_episodes = self.resume_from_output_path()
         collision_counts: list = []
         psi_rates: list = []
 
         # Episode loop is now driven by env.reset() + env.is_running
         process_bar = tqdm.tqdm(total=len(self.env.episodes), desc=f"Eval Epoch {self.epoch} Rank {self.rank}")
+        _n_skipped = 0
 
         while self.env.is_running:
 
@@ -319,6 +372,18 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             scene_id = episode.scene_id.split('/')[-2]
             episode_id = int(episode.episode_id)
             episode_instruction = episode.instruction.instruction_text
+
+            if (scene_id, episode_id) in done_episodes:
+                self.env.step(0)
+                _n_skipped += 1
+                process_bar.update(1)
+                if _n_skipped <= 3 or _n_skipped % 100 == 0:
+                    process_bar.write(f"[Resume] Skipping {scene_id}_{episode_id:04d} ({_n_skipped}/{len(done_episodes)} done)")
+                continue
+
+            if _n_skipped > 0 and _n_skipped == len(done_episodes):
+                process_bar.write(f"[Resume] Skipped {_n_skipped} completed episodes, resuming from {scene_id}_{episode_id:04d}")
+
             print("episode start", episode_instruction)
 
             # save first frame per rank to validate sim quality
@@ -452,19 +517,27 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
                     inputs = self.processor(text=[text], images=input_images, return_tensors="pt").to(self.model.device)
 
-                    with torch.no_grad():
-                        output_ids = self.model.generate(
-                            **inputs,
-                            max_new_tokens=128,
-                            do_sample=False,
-                            use_cache=True,
-                            past_key_values=None,
-                            return_dict_in_generate=True,
-                        ).sequences
+                    if self.s2_vllm_url:
+                        llm_outputs = self._vllm_generate(messages, max_new_tokens=128)
+                        generated_ids = self.processor.tokenizer.encode(llm_outputs, add_special_tokens=False)
+                        output_ids = torch.cat([
+                            inputs.input_ids,
+                            torch.tensor([generated_ids], device=inputs.input_ids.device),
+                        ], dim=1)
+                    else:
+                        with torch.no_grad():
+                            output_ids = self.model.generate(
+                                **inputs,
+                                max_new_tokens=128,
+                                do_sample=False,
+                                use_cache=True,
+                                past_key_values=None,
+                                return_dict_in_generate=True,
+                            ).sequences
+                        llm_outputs = self.processor.tokenizer.decode(
+                            output_ids[0][inputs.input_ids.shape[1] :], skip_special_tokens=True
+                        )
 
-                    llm_outputs = self.processor.tokenizer.decode(
-                        output_ids[0][inputs.input_ids.shape[1] :], skip_special_tokens=True
-                    )
                     print('step_id:', step_id, 'output text:', llm_outputs)
 
                     if bool(re.search(r'\d', llm_outputs)):  # output pixel goal
@@ -688,12 +761,13 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         self.model.eval()
 
         # resume from previous results
-        sucs, spls, oss, nes, ndtw = self.resume_from_output_path()
+        sucs, spls, oss, nes, ndtw, done_episodes = self.resume_from_output_path()
         collision_counts: list = []
         psi_rates: list = []
 
         # Episode loop is now driven by env.reset() + env.is_running
         process_bar = tqdm.tqdm(total=len(self.env.episodes), desc=f"Eval Epoch {self.epoch} Rank {self.rank}")
+        _n_skipped = 0
 
         while self.env.is_running:
 
@@ -708,6 +782,18 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             scene_id = episode.scene_id.split('/')[-2]
             episode_id = int(episode.episode_id)
             episode_instruction = episode.instruction.instruction_text
+
+            if (scene_id, episode_id) in done_episodes:
+                self.env.step(0)
+                _n_skipped += 1
+                process_bar.update(1)
+                if _n_skipped <= 3 or _n_skipped % 100 == 0:
+                    process_bar.write(f"[Resume] Skipping {scene_id}_{episode_id:04d} ({_n_skipped}/{len(done_episodes)} done)")
+                continue
+
+            if _n_skipped > 0 and _n_skipped == len(done_episodes):
+                process_bar.write(f"[Resume] Skipped {_n_skipped} completed episodes, resuming from {scene_id}_{episode_id:04d}")
+
             print("episode start", episode_instruction)
 
             agent_state = self.env._env.sim.get_agent_state()
@@ -833,19 +919,27 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
                     inputs = self.processor(text=[text], images=input_images, return_tensors="pt").to(self.model.device)
 
-                    with torch.no_grad():
-                        output_ids = self.model.generate(
-                            **inputs,
-                            max_new_tokens=128,
-                            do_sample=False,
-                            use_cache=True,
-                            past_key_values=None,
-                            return_dict_in_generate=True,
-                        ).sequences
+                    if self.s2_vllm_url:
+                        llm_outputs = self._vllm_generate(messages, max_new_tokens=128)
+                        generated_ids = self.processor.tokenizer.encode(llm_outputs, add_special_tokens=False)
+                        output_ids = torch.cat([
+                            inputs.input_ids,
+                            torch.tensor([generated_ids], device=inputs.input_ids.device),
+                        ], dim=1)
+                    else:
+                        with torch.no_grad():
+                            output_ids = self.model.generate(
+                                **inputs,
+                                max_new_tokens=128,
+                                do_sample=False,
+                                use_cache=True,
+                                past_key_values=None,
+                                return_dict_in_generate=True,
+                            ).sequences
+                        llm_outputs = self.processor.tokenizer.decode(
+                            output_ids[0][inputs.input_ids.shape[1] :], skip_special_tokens=True
+                        )
 
-                    llm_outputs = self.processor.tokenizer.decode(
-                        output_ids[0][inputs.input_ids.shape[1] :], skip_special_tokens=True
-                    )
                     print('step_id:', step_id, 'output text:', llm_outputs)
 
                     if bool(re.search(r'\d', llm_outputs)):  # output pixel goal
