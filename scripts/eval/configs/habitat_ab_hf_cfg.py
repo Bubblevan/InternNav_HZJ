@@ -1,4 +1,4 @@
-"""A/B test — HF baseline (no vLLM). 8 episodes from R2R val_unseen."""
+"""A/B test — HF baseline (no vLLM). Fixed episode subset from R2R val_unseen."""
 from internnav.configs.agent import AgentCfg
 from internnav.configs.evaluator import EnvCfg, EvalCfg
 
@@ -20,7 +20,7 @@ eval_cfg = EvalCfg(
         env_type='habitat',
         env_settings={
             'config_path': 'scripts/eval/configs/vln_r2r.yaml',
-            'max_eval_episodes': 8,
+            'max_eval_episodes': 128,
         },
     ),
     eval_type='habitat_vln',
@@ -34,11 +34,11 @@ eval_cfg = EvalCfg(
         "dataset_split_override": None,
         "allowed_scene_ids": [],
         "allowed_episode_ids": [10, 11, 12, 16, 17, 18, 43, 44],
-        "max_eval_episodes": 8,
+        "max_eval_episodes": 128,
         "profile_runtime": True,
         "profile_modules": True,
         "export_replay_subset": True,
-        "replay_num_episodes": 8,
+        "replay_num_episodes": 128,
         "replay_seed": 0,
         "port": "2333",
         "dist_url": "env://",

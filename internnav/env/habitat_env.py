@@ -141,11 +141,15 @@ class HabitatEnv(base.Env):
             List[Any]: A list of episode objects for the current split.
         """
         all_episodes = []
-        allowed_scene_ids = self.config.habitat.dataset.get("allowed_scene_ids", None)
+        allowed_scene_ids = self.env_config.env_settings.get('allowed_scene_ids')
+        if allowed_scene_ids is None:
+            allowed_scene_ids = self.config.habitat.dataset.get("allowed_scene_ids", None)
         if allowed_scene_ids:
             allowed_scene_ids = set(allowed_scene_ids)
 
-        allowed_episode_ids = self.config.habitat.dataset.get("allowed_episode_ids", None)
+        allowed_episode_ids = self.env_config.env_settings.get('allowed_episode_ids')
+        if allowed_episode_ids is None:
+            allowed_episode_ids = self.config.habitat.dataset.get("allowed_episode_ids", None)
         if allowed_episode_ids:
             allowed_episode_ids = {str(ep_id) for ep_id in allowed_episode_ids}
 

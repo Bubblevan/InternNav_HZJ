@@ -80,6 +80,8 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         self.agent_config = get_agent_config(self.config.habitat.simulator)
         self.sim_sensors_config = self.config.habitat.simulator.agents.main_agent.sim_sensors
 
+        self._apply_dataset_overrides(cfg.eval_settings)
+
         with habitat.config.read_write(self.config):
             self.config.habitat.task.measurements.update(
                 {
@@ -103,6 +105,9 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             )
         cfg.env.env_settings['habitat_config'] = self.config
         cfg.env.env_settings['output_path'] = self.output_path
+        cfg.env.env_settings['allowed_scene_ids'] = cfg.eval_settings.get("allowed_scene_ids")
+        cfg.env.env_settings['allowed_episode_ids'] = cfg.eval_settings.get("allowed_episode_ids")
+        cfg.env.env_settings['max_eval_episodes'] = cfg.eval_settings.get("max_eval_episodes")
 
         # init agent and env
         super().__init__(cfg, init_agent=False)
@@ -188,6 +193,29 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         camera_fov_rad = np.deg2rad(self.sim_sensors_config.depth_sensor.hfov)
         self._camera_fov = camera_fov_rad
         self._fx = self._fy = self.sim_sensors_config.depth_sensor.width / (2 * np.tan(camera_fov_rad / 2))
+
+    def _apply_dataset_overrides(self, eval_settings):
+        dataset_cfg = self.config.habitat.dataset
+        dataset_path_override = eval_settings.get("dataset_path_override")
+        scenes_dir_override = eval_settings.get("scenes_dir_override")
+        dataset_split_override = eval_settings.get("dataset_split_override")
+        allowed_scene_ids = eval_settings.get("allowed_scene_ids")
+        allowed_episode_ids = eval_settings.get("allowed_episode_ids")
+        max_eval_episodes = eval_settings.get("max_eval_episodes")
+
+        with habitat.config.read_write(self.config):
+            if dataset_path_override:
+                dataset_cfg.data_path = dataset_path_override
+            if scenes_dir_override:
+                dataset_cfg.scenes_dir = scenes_dir_override
+            if dataset_split_override:
+                dataset_cfg.split = dataset_split_override
+            if allowed_scene_ids is not None and "allowed_scene_ids" in dataset_cfg:
+                dataset_cfg.allowed_scene_ids = list(allowed_scene_ids)
+            if allowed_episode_ids is not None and "allowed_episode_ids" in dataset_cfg:
+                dataset_cfg.allowed_episode_ids = [int(ep_id) for ep_id in allowed_episode_ids]
+            if max_eval_episodes is not None and "max_eval_episodes" in dataset_cfg:
+                dataset_cfg.max_eval_episodes = int(max_eval_episodes)
 
     @staticmethod
     def _pil_to_data_url(image):
