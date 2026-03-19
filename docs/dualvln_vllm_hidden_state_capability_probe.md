@@ -299,3 +299,56 @@ python scripts/eval/tools/probe_vllm_pooling_runtime.py \
 现阶段最靠谱的方向不是继续纠结 replay1 regenerate exact match，而是：
 
 > 把 replay1 导出的 `baseline_latent` 当作黄金参考，然后逐步验证 vLLM 的 pooling / token_embed 路线能否给出接近 `generate_latents()` 的 token 级表示。  
+
+---
+
+## 9. `prompt_embeds` 路线的最新阻塞
+
+为了进一步逼近 HF `generate_latents()` 的输入形式，又补了一个 probe：
+
+- [probe_vllm_prompt_embeds_runtime.py](/root/backup/InternNav/scripts/eval/tools/probe_vllm_prompt_embeds_runtime.py)
+
+这条 probe 做的事情是：
+
+1. 从 vLLM 内部模型拿到 `baseline_output_ids (+ 4 个 TRAJ_TOKEN)` 的 token embedding
+2. 重新以 `EmbedsPrompt(prompt_embeds=...)` 的方式送回 vLLM
+3. 观察：
+   - 请求长度能否严格保持
+   - 自定义最后 4 个 embedding 是否能影响最后 4 个输出
+
+这轮实验得到的不是数值偏差，而是一个非常明确的结构性 blocker：
+
+- worker 侧在初始化 Qwen2.5-VL 的 M-RoPE 位置时，会报  
+  `AssertionError: M-RoPE requires prompt_token_ids to be available.`
+
+这个错误和源码能完全对上：
+
+- [input_processor.py](/root/backup/vllm/vllm/v1/engine/input_processor.py#L246)
+  对 `type == "embeds"` 的请求，vLLM 会显式设定：
+  - `prompt_token_ids = None`
+  - `prompt_embeds = decoder_inputs["prompt_embeds"]`
+- [gpu_model_runner.py](/root/backup/vllm/vllm/v1/worker/gpu_model_runner.py#L1417)
+  Qwen2.5-VL 初始化 M-RoPE 时又硬要求：
+  - `req_state.prompt_token_ids is not None`
+
+因此当前公开 `EmbedsPrompt` 路线在 Qwen2.5-VL 上的结论可以明确写成：
+
+1. **模型 forward 本身并不排斥 `inputs_embeds`**
+2. **但公开 `EmbedsPrompt` 请求在进入 worker 前就丢掉了 `prompt_token_ids`**
+3. **M-RoPE 位置构造依赖 token ids**
+4. **所以这条路当前会在 worker 侧提前失败**
+
+这条结果很重要，因为它说明：
+
+> 当前 `prompt_embeds` 路线不是“完全没希望”，而是“已经精确收敛到一个可 patch 的源码问题”。
+
+最小源码 patch 方向现在已经比较清楚：
+
+1. 允许 embeds 请求可选地同时携带 `prompt_token_ids`
+2. 不要在 `input_processor` 中对 embeds 请求强制把 `prompt_token_ids` 设为 `None`
+3. worker 继续使用 `prompt_token_ids` 构造 M-RoPE 位置
+4. backbone 实际输入仍然走 `prompt_embeds`
+
+如果这一步打通，`prompt_embeds` 路线才有资格继续回答下一个核心问题：
+
+- 末尾 4 个位置的 custom embedding 注入，是否能够逼近 HF `latent_queries`

@@ -183,6 +183,24 @@
 2. **无法直接注入 `latent_queries` 这种 custom `inputs_embeds`**
    - 而这正是 HF `generate_latents()` 的关键
 
+最近补的 `prompt_embeds` probe 又把这个结论进一步收紧了：
+
+- 即便先不要求“严格冻结多模态 token 序列”
+- 单纯想让 vLLM 接受外部给定的 `prompt_embeds`
+- 在 Qwen2.5-VL 上也会先撞到 M-RoPE 初始化阶段的硬约束
+
+原因不是模型 `forward(inputs_embeds=...)` 不存在，而是当前公开路径的中间层逻辑：
+
+1. `EmbedsPrompt` 请求进入 engine 后，只保留 `prompt_embeds`
+2. `prompt_token_ids` 会被置为 `None`
+3. 但 worker 初始化 M-RoPE 时又硬要求 `prompt_token_ids` 必须存在
+
+所以目前公开 `prompt_embeds` 路线的更精确结论是：
+
+- **方向上是对的**
+- **当前实现不通**
+- **blocker 已经具体到可以通过源码 patch 解决**
+
 所以目前这条结论可以写得很明确：
 
 > 公开 vLLM API 可以提供“接近 hidden-state 提取”的能力，但还不足以原样承接 DualVLN 的 `generate_latents()`。
@@ -258,9 +276,10 @@
 从当前原理看，真正要补的能力可能包括：
 
 1. 支持“完全信任外部给定的 prompt_embeds / inputs_embeds”
-2. 支持跳过或部分绕过默认 multimodal processor
-3. 支持返回指定层、指定位置的 hidden states
-4. 最好还能保住现有 Qwen2.5-VL 的 position / rope / multimodal 对齐逻辑
+2. 支持 embeds 请求同时保留 `prompt_token_ids`，供 M-RoPE / position 构造使用
+3. 支持跳过或部分绕过默认 multimodal processor
+4. 支持返回指定层、指定位置的 hidden states
+5. 最好还能保住现有 Qwen2.5-VL 的 position / rope / multimodal 对齐逻辑
 
 所以这不是改一个 flag 就完事，更像是：
 
