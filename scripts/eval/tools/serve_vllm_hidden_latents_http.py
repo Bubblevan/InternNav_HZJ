@@ -1,6 +1,8 @@
 import argparse
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import traceback
+import sys
 
 import torch
 
@@ -82,11 +84,14 @@ class HiddenLatentsHandler(BaseHTTPRequestHandler):
                 },
             )
         except Exception as exc:
+            tb = traceback.format_exc()
+            print(tb, file=sys.stderr, flush=True)
             self._send_json(
                 500,
                 {
                     "error": type(exc).__name__,
                     "message": str(exc),
+                    "traceback": tb,
                 },
             )
 
