@@ -471,3 +471,54 @@
 1. 对比 visual blocks 的中间 hidden states
 2. 重点检查 `MMEncoderAttention` 与 HF visual attention 的差异
 3. 判断剩余 `0.84375` 的 visual output gap 是否会继续主导最终 `generate_latents()` latent gap
+
+## 2026-03-20: Visual Blocks First-Divergence Update
+
+本轮按照“不要无限深挖 visual kernel 细节”的原则，只额外做了一轮 **visual blocks 中间 hidden states** 定位，并且把结果显式绑定回：
+
+- `logs/habitat/vllm_generate_latents_hidden_states_probe_qwen25vl_with_mm_metadata_eager.json`
+  - `vLLM custom hidden last-4 vs HF baseline latent max_abs_diff = 0.75`
+
+新增脚本：
+
+- `scripts/eval/tools/export_vllm_visual_block_states.py`
+- `scripts/eval/tools/compare_hf_vllm_visual_block_states.py`
+
+核心结果：
+
+1. `patch_embed` 仍然 **完全一致**
+2. `pre_blocks`（进入 visual blocks 前的重排后 hidden states）也 **完全一致**
+3. 但 **第 0 个 visual block 就已经开始出现差异**
+   - block 0: `max_abs_diff = 0.125`
+   - block 1: `max_abs_diff = 0.125`
+   - block 2: `max_abs_diff = 0.25`
+4. 差异在前几层是小幅累积，不是“前几层完全对、最后突然炸”
+5. 到中后层开始明显放大：
+   - block 10: `max_abs_diff = 0.625`
+   - block 14: `max_abs_diff = 1.0`
+   - block 15（full attention）: `max_abs_diff = 11.0`
+   - block 17 之后出现更大数值分叉
+6. 最终 visual output 仍是：
+   - `max_abs_diff = 0.84375`
+7. 对应的最终端到端 latent 指标仍是：
+   - `vLLM custom hidden last-4 vs HF baseline latent max_abs_diff = 0.75`
+
+### 这轮能回答什么
+
+这轮已经足够回答用户最关心的那个结构性问题：
+
+> 不是“前几层都对，后面在 merger 才突然放大”，而是 **从第一个 visual block 就开始偏，只是前几层偏得很小，随后在 visual blocks 内逐层积累并放大。**
+
+### 这轮不再继续往下做什么
+
+按当前证据，如果继续往下查，最自然会落到：
+
+- `MMEncoderAttention`
+- visual attention backend
+- 更细粒度的视觉 block 内部 kernel 数值轨迹
+
+但如果只是把问题进一步定位到这些 backend 级实现，而**没有继续明显缩小最终 `last-4 latent diff`**，这就已经超出了当前轮次“为主目标服务”的范围。
+
+因此本轮建议在这里先停：
+
+> 已经可以合理判断，剩余 gap 不是来自 prompt/token/position/replacement 这些上游拼接问题，而是来自 visual blocks 本体的数值轨迹差异；下一步应回到“在当前 gap 水平下，是否足以推进只保留一个 vLLM server 的主目标”这个更高层决策。

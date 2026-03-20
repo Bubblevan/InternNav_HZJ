@@ -734,3 +734,39 @@ python scripts/eval/tools/probe_vllm_generate_latents_hidden_states.py \
 因此当前最合理的工程判断是：
 
 > `generate_latents()` 的 backbone 路线在技术上已经打通；剩余精度 gap 主要卡在 Qwen2.5-VL visual tower 的实现细节，而不是语言侧位置、token replacement 或 latent query 注入。
+
+## 2026-03-20: Visual Blocks Divergence Localization
+
+为了避免继续无限深挖 visual tower 的单个 kernel，本轮只做了一次 block 级 hidden-state 定位，并把它和最终 `generate_latents()` latent gap 放在同一个结论里看。
+
+使用脚本：
+
+- `scripts/eval/tools/export_vllm_visual_block_states.py`
+- `scripts/eval/tools/compare_hf_vllm_visual_block_states.py`
+
+与当前端到端 probe 的绑定指标：
+
+- `vLLM custom hidden last-4 vs HF baseline latent max_abs_diff = 0.75`
+
+block 级结果显示：
+
+- `patch_embed` 完全一致
+- `pre_blocks` 完全一致
+- **block 0 就开始有非零差异**
+  - block 0: `max_abs_diff = 0.125`
+  - block 5: `max_abs_diff = 0.5`
+  - block 10: `max_abs_diff = 0.625`
+  - block 15 (full): `max_abs_diff = 11.0`
+  - block 31 (full): `max_abs_diff = 1588.0`
+- final visual output 仍然是：
+  - `max_abs_diff = 0.84375`
+
+这说明：
+
+1. visual tower 的分叉不是在 merger 才突然出现
+2. 偏差是从 **第一个 visual block** 就开始，但前几层幅度小
+3. 后续更像是在 visual blocks 内逐层放大，尤其是更深层 / full-attention block 处更明显
+
+因此当前最合理的边界判断是：
+
+> 继续往下追，大概率只会把问题进一步定位到 `MMEncoderAttention` / backend 级实现；在没有显著缩小最终 `last-4 latent diff` 之前，这已经足够支持“先停在这里，回到是否能去掉第二份 DualVLN 的主目标”的决策。
