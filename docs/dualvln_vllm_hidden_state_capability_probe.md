@@ -302,7 +302,7 @@ python scripts/eval/tools/probe_vllm_pooling_runtime.py \
 
 ---
 
-## 9. `prompt_embeds` 路线的最新阻塞
+## 9. `prompt_embeds` 路线的两阶段阻塞
 
 为了进一步逼近 HF `generate_latents()` 的输入形式，又补了一个 probe：
 
@@ -316,7 +316,7 @@ python scripts/eval/tools/probe_vllm_pooling_runtime.py \
    - 请求长度能否严格保持
    - 自定义最后 4 个 embedding 是否能影响最后 4 个输出
 
-这轮实验得到的不是数值偏差，而是一个非常明确的结构性 blocker：
+第一轮实验得到的不是数值偏差，而是一个非常明确的结构性 blocker：
 
 - worker 侧在初始化 Qwen2.5-VL 的 M-RoPE 位置时，会报  
   `AssertionError: M-RoPE requires prompt_token_ids to be available.`
@@ -349,6 +349,388 @@ python scripts/eval/tools/probe_vllm_pooling_runtime.py \
 3. worker 继续使用 `prompt_token_ids` 构造 M-RoPE 位置
 4. backbone 实际输入仍然走 `prompt_embeds`
 
-如果这一步打通，`prompt_embeds` 路线才有资格继续回答下一个核心问题：
+在这个 patch 之后，又继续做了一轮 probe。第二轮结果是：
+
+- `success = true`
+- `requested_prompt_length = 2084`
+- `base_output.token_embed_shape = [2084, 3584]`
+- `custom_output.token_embed_shape = [2084, 3584]`
+- `shape_matches_requested_length = true`
+
+这说明：
+
+1. `prompt_embeds + prompt_token_ids` 这条路已经能穿过 Qwen2.5-VL 的 M-RoPE 初始化
+2. 长度也终于可以被严格保住，不再像 `TokensPrompt + multi_modal_data` 那样被重新展开
+
+但第二轮 probe 同时暴露了一个更核心的新 blocker：
+
+- `output_diff.max_abs_diff = 0.0`
+- `last_n_output_diff.max_abs_diff = 0.0`
+
+也就是说：
+
+- 即便我们显式修改了最后 4 个 prompt embedding
+- vLLM 返回的 token-level 输出仍然完全不变
+
+这通常不意味着“模型对输入完全不敏感”，而更可能意味着：
+
+- 当前 worker 在真正执行模型前，又把这些位置重新按 token id 做了一次 embedding lookup
+- 从而把外部提供的 `prompt_embeds` 覆盖回去了
+
+源码上也能对上这个判断：
+
+- [gpu_input_batch.py](/root/backup/vllm/vllm/v1/worker/gpu_input_batch.py)
+  当前只要 `prompt_token_ids` 存在，就会把 prompt 段标成 `is_token_ids=True`
+- [gpu_model_runner.py](/root/backup/vllm/vllm/v1/worker/gpu_model_runner.py)
+  在 `enable_prompt_embeds` 路径下，又会对这些 `is_token_ids=True` 的位置重新执行 `embed_input_ids(...)`
+
+因此目前 `prompt_embeds` 路线的真实状态是：
+
+1. **第一个 blocker 已解决**
+   - `prompt_token_ids` 能保留，M-RoPE 可以构造
+2. **第二个 blocker 已暴露**
+   - 自定义 prompt embeddings 还没有真正生效，仍会被 token-id embedding 覆盖
+
+这意味着下一步最小 patch 方向进一步收敛成：
+
+1. 保留 `prompt_token_ids` 给 M-RoPE / metadata 使用
+2. 但对已经提供了 `prompt_embeds` 的 prompt 位置，不再把它们标记为 `is_token_ids=True`
+3. 这样 worker 才不会在执行前把这些位置重新 embedding 一次
+
+如果这一步再打通，`prompt_embeds` 路线才有资格继续回答下一个核心问题：
 
 - 末尾 4 个位置的 custom embedding 注入，是否能够逼近 HF `latent_queries`
+
+在继续补上这层 patch 后，我们又加了一轮文件级 dump，把链路细化到：
+
+- `gpu_input_batch_add_request`
+- `gpu_model_runner_prepare_inputs`
+- `gpu_model_runner_pre_forward`
+- `gpu_model_runner_post_forward`
+- `gpu_model_runner_pooler_output`
+
+第三轮 probe 的结论比前两轮更明确：
+
+1. 在 `gpu_input_batch_add_request`，两次请求的 `prompt_embeds` 差异仍然存在
+2. 但一到 `gpu_model_runner_prepare_inputs`，`inputs_embeds_gpu` 就已经完全一致
+3. 后面的 `pooler_output` 因此继续完全一致
+
+这说明问题已经不在：
+
+- pooler 是否抹平了差异
+- 或 transformer forward 是否不敏感
+
+而在更前面的输入准备阶段。
+
+进一步对源码分支的定位表明，真正把差异覆盖掉的是 Qwen2.5-VL 的 multimodal 分支：
+
+1. 该模型 `supports_mm_inputs=True`
+2. `_preprocess()` 会优先走 multimodal 路线
+3. 该路线会调用 `self.model.embed_input_ids(...)`
+4. 然后把得到的 `inputs_embeds_scheduled` 整段 `copy_` 回 `self.inputs_embeds.gpu[:num_scheduled_tokens]`
+
+因此当前第三个 blocker 可以写得很具体：
+
+1. 第一个 blocker：embeds 请求需要同时保留 `prompt_token_ids`，否则 M-RoPE 过不去
+2. 第二个 blocker：worker 不能把这些位置重新当成 token ids 再 embedding 一次
+3. 第三个 blocker：**在 `supports_mm_inputs` 分支里，外部提供的 prompt embeddings 仍会被整段 multimodal embedding 覆盖**
+
+所以第三个 patch 的目标也就非常明确：
+
+- 不是继续改 pooler
+- 而是要在 `_preprocess()` 的 multimodal 分支里，保住外部提供的 prompt embeddings
+- 同时继续保留 `prompt_token_ids` 给 M-RoPE / position 使用
+
+在第三个 patch 打通之后，下一步 probe 就不应该继续停留在“测试向量”层面，而应该尽量逼近 HF `generate_latents()` 的真实输入形式。
+
+为此又补了一个更接近目标的脚本：
+
+- [probe_vllm_generate_latents_hidden_states.py](/root/backup/InternNav/scripts/eval/tools/probe_vllm_generate_latents_hidden_states.py)
+
+这条脚本会同时做两件事：
+
+1. 用更接近 HF `generate_latents()` 的方式构造 `prompt_embeds`
+   - 从 baseline sample 读取 `pixel_values` 和 `image_grid_thw`
+   - 用 vLLM 内部 Qwen2.5-VL model 计算视觉 embedding
+   - 替换 prompt 中的 image token 位置
+   - 再把末尾 4 个位置替换成真实 checkpoint 里的 `latent_queries`
+2. 自动开启 full-tensor dump，并比较
+   - `prepare_inputs.inputs_embeds_gpu`
+   - `post_forward.hidden_states`
+   - `pooler_output`
+
+推荐运行方式：
+
+```bash
+cd /root/backup/InternNav
+source /root/.venv/bin/activate
+python scripts/eval/tools/probe_vllm_generate_latents_hidden_states.py \
+  --model-path checkpoints/InternVLA-N1-DualVLN-qwen25vl-s2-view \
+  --hf-model-path checkpoints/InternVLA-N1-DualVLN \
+  --sample-pt logs/habitat/hf_generate_latents_baseline_replay1/samples/sample_0000_zsNo4HB9uLZ_0001_step_0003.pt \
+  --append-traj-tokens \
+  --output logs/habitat/vllm_generate_latents_hidden_states_probe_qwen25vl.json
+```
+
+这一步真正想回答的问题已经升级为：
+
+1. 真实 `latent_queries` 注入后，raw hidden states 的最后 4 个位置会不会变化
+2. 这些 vLLM hidden states，和 HF baseline latent 的差距大概有多大
+
+当前已经基于同一条 replay1 样本做了一轮实测：
+
+- sample: `sample_0000_zsNo4HB9uLZ_0001_step_0003.pt`
+- prompt length: `2084`
+- image token count: `1955`
+- visual embeddings count: `1955`
+
+在普通模式下，已经确认：
+
+1. 真实 `latent_queries` 注入后，`prepare_inputs.inputs_embeds_gpu` 的最后 4 个位置会明显变化
+2. `pooler_output` 的最后 4 个位置也会随之变化
+
+进一步在 `--enforce-eager` 模式下，为正式 pooling 请求路径补上 raw hidden-state dump 后，又拿到了更关键的一层：
+
+- `Input-embed last-4 max abs diff = 3.984375`
+- `Token-embed last-4 max abs diff = 0.215068`
+- `Hidden-state last-4 max abs diff = 24.437500`
+- `vLLM custom hidden last-4 vs HF baseline latent max abs diff = 19.500000`
+
+这组数字说明两件事：
+
+1. **第三个 patch 已经真正打通了“真实 latent_queries 注入 -> raw hidden states 改变”这条链路**
+2. **但当前 vLLM hidden states 还没有和 HF baseline latent 对齐，数值差距仍然明显**
+
+所以这一步的阶段性结论可以写得很清楚：
+
+> 现在已经不再是“vLLM 能不能承接 custom latent query inputs”的问题，而是“在这条已经打通的输入路径上，如何继续做 hidden-state 数值对齐”的问题。
+
+---
+
+## 10. 当前 gap 更像来自哪里
+
+结合现有源码比对和 probe 结果，当前最值得优先怀疑的不是同一个量纲里的小数值误差，而是输入语义层面的不一致。按优先级大致可以分成下面三类。
+
+### 10.1 最可疑：`EmbedsPrompt` 路线当前没有把 multimodal metadata 传进 M-RoPE
+
+这是当前最像主 gap 来源的一点。
+
+虽然 `EmbedsPrompt` 在 schema 上继承了 `_PromptOptions`，因此**可以声明**：
+
+- `multi_modal_data`
+- `mm_processor_kwargs`
+
+但当前实现里：
+
+- [base.py](/root/backup/vllm/vllm/renderers/base.py)
+  的 `_process_embeds()` 只返回
+  - `prompt_embeds`
+  - `prompt_token_ids`
+  - `cache_salt`
+- 它不会像 `_process_tokens()` 那样进入 `_process_multimodal(...)`
+- [input_processor.py](/root/backup/vllm/vllm/v1/engine/input_processor.py)
+  也只会在 `decoder_inputs["type"] == "multimodal"` 时构造 `mm_features`
+
+这意味着当前 prompt-embeds probe 的真实状态很可能是：
+
+1. 视觉 embedding 已经被我们手工正确替换到 prompt 中
+2. 但 worker 侧构造 M-RoPE 时，`req_state.mm_features` 仍然是空的
+3. 因此 `get_mrope_input_positions(...)` 很可能退化成“纯文本 1D 位置”
+4. 也就是：
+   - **embedding 是多模态的**
+   - **position 却还是文本的**
+
+如果这一点成立，它足以单独解释一大块 hidden-state gap。
+
+更重要的是，这里的问题更像是：
+
+- **M-RoPE 输入数据管线不一致**
+
+而不是：
+
+- **M-RoPE 数学公式本身有明显错误**
+
+### 10.2 次可疑：visual replacement 本身看起来更接近 HF，同构程度比之前高
+
+当前 probe 已经有几个正向信号：
+
+1. baseline sample 里的 image token 数是 `1955`
+2. vLLM 内部 `embed_multimodal(...)` 产出的 visual embedding 数也是 `1955`
+3. 当前脚本是直接拿 baseline sample 里的：
+   - `pixel_values`
+   - `image_grid_thw`
+   去构造 visual replacement
+4. 没有再经过 prompt text / fast processor 重新展开一遍
+
+因此和早期 `TokensPrompt + multi_modal_data` 路线不同，当前这条 probe 里：
+
+- `Qwen2VLImageProcessor fast/slow` 的 warning 已经不是最核心问题
+- visual replacement 这一步的结构同构性，实际上比之前高很多
+
+这并不等于我们已经证明：
+
+- HF visual tower 输出 tensor 和 vLLM visual tower 输出 tensor 数值 fully allclose
+
+但至少从当前证据看，**visual replacement 本身不像是最大 gap 来源**。
+
+### 10.3 较不可疑：我们抓到的 raw hidden states 定义与 HF `outputs.hidden_states[-1]` 更像是同义的
+
+这一点通过源码比对已经比较清楚：
+
+- HF 侧 [modeling_qwen2_5_vl.py](/root/miniforge3/envs/habitat/lib/python3.9/site-packages/transformers/models/qwen2_5_vl/modeling_qwen2_5_vl.py)
+  在 `Qwen2_5_VLModel.forward()` 里：
+  - 先跑所有 decoder layers
+  - 然后执行 `hidden_states = self.norm(hidden_states)`
+  - `output_hidden_states=True` 时，`all_hidden_states += (hidden_states,)`
+- 所以 HF 的 `outputs.hidden_states[-1]` 就是**最终 norm 之后的 last hidden states**
+
+而 vLLM 侧：
+
+- [qwen2.py](/root/backup/vllm/vllm/model_executor/models/qwen2.py)
+  的 `Qwen2Model.forward()` 最后也执行：
+  - `hidden_states, _ = self.norm(hidden_states, residual)`
+  - 然后直接返回 `hidden_states`
+- [qwen2_5_vl.py](/root/backup/vllm/vllm/model_executor/models/qwen2_5_vl.py)
+  的 `forward()` 也只是把这个 language model 的输出继续向上返回
+
+所以从张量定义上看，我们现在在正式 pooling 请求路径里 dump 到的 raw hidden states，更像是与 HF 的：
+
+- `outputs.last_hidden_state`
+- `outputs.hidden_states[-1]`
+
+处在同一个语义层级。
+
+因此这里更合理的判断是：
+
+- **raw hidden states 的“定义”本身大概率不是主 gap**
+- 真正的主 gap 更可能发生在：
+  - `position_ids / M-RoPE`
+  - 或更前面的 multimodal metadata 传递
+
+### 10.4 当前最值得优先做的下一步
+
+如果按“最可能快速缩小 gap”的优先级排，当前最值得先做的是：
+
+1. 让 `EmbedsPrompt` 路线也能保留并传递 `multi_modal_data -> mm_features`
+2. 让 worker 侧的 M-RoPE 构造真正看到这些图像项的 offset / grid 信息
+3. 再复跑同一条 hidden-state probe
+
+如果这一步之后 `vLLM custom hidden last-4 vs HF baseline latent` 明显收敛，
+那就基本可以确认：
+
+> 当前最大的 gap 主要不在 hidden-state 定义，也不在 visual replacement 本身，而在 M-RoPE 所需的 multimodal metadata 没有跟着 `EmbedsPrompt` 一起进入 engine。
+
+---
+
+## 11. 第四个 patch：让 `EmbedsPrompt` 也能携带 `mm_features`
+
+基于上面的判断，我们继续补了第四个 patch，目标不是再改 hidden-state 本身，而是把：
+
+- `EmbedsPrompt`
+- `prompt_token_ids`
+- multimodal placeholder / grid / hash 信息
+
+一起送进 engine。
+
+这次改动的核心点是：
+
+1. `EmbedsInputs` 允许携带：
+   - `mm_kwargs`
+   - `mm_hashes`
+   - `mm_placeholders`
+2. renderer 在处理 `EmbedsPrompt(multi_modal_data=...)` 时，会先走 `_process_multimodal(...)`
+3. `InputProcessor` 不再只在 `type == "multimodal"` 时构造 `mm_features`
+4. 对 `type == "embeds"` 且带有 `mm_*` 字段的请求，也会生成 `req_state.mm_features`
+
+这意味着现在 worker 侧构造 Qwen2.5-VL 的 M-RoPE 时，终于不再只是“看见 token ids”，而是也能看见：
+
+- 图像 placeholder offset
+- 每张图的 `image_grid_thw`
+- 每个 multimodal item 的位置元信息
+
+---
+
+## 12. 新实验：补上 mm metadata 后，HF gap 明显收缩
+
+对应实验结果文件：
+
+- [vllm_generate_latents_hidden_states_probe_qwen25vl_eager.json](/root/backup/InternNav/logs/habitat/vllm_generate_latents_hidden_states_probe_qwen25vl_eager.json)
+- [vllm_generate_latents_hidden_states_probe_qwen25vl_with_mm_metadata_eager.json](/root/backup/InternNav/logs/habitat/vllm_generate_latents_hidden_states_probe_qwen25vl_with_mm_metadata_eager.json)
+
+两版最关键的对比如下：
+
+| 指标 | 无 mm metadata | 有 mm metadata |
+|---|---:|---:|
+| token-embed last-4 max abs diff | `0.2151` | `0.3125` |
+| raw hidden-state last-4 max abs diff | `24.4375` | `44.4375` |
+| vLLM custom hidden last-4 vs HF baseline latent max abs diff | `19.5000` | `7.3438` |
+| vLLM custom hidden last-4 vs HF baseline latent mean abs diff | `0.8178` | `0.3997` |
+
+这组数里最重要的不是中间层彼此差多少，而是最后一列：
+
+- **和 HF baseline latent 的 `max_abs_diff` 从 `19.5` 降到了 `7.34`**
+- **和 HF baseline latent 的 `mean_abs_diff` 从 `0.818` 降到了 `0.400`**
+
+这说明：
+
+1. `EmbedsPrompt` 缺少 multimodal metadata 确实是一个实质性误差源
+2. 补上 `mm_features` 后，vLLM hidden-state 路线和 HF `generate_latents()` 的数值距离明显缩小
+3. 之前对 “主 gap 很可能在 M-RoPE / position metadata” 的判断，是被实验支持的
+
+同时也要保持准确：
+
+- 现在还没有 fully align
+- `max_abs_diff ≈ 7.34` 仍然不够拿去直接替换本地第二个 DualVLN
+- 但这一步已经把问题从“路径不通 / 定义不一致”推进到了“剩余数值偏差如何继续压缩”
+
+---
+
+## 13. 当前最可信的误差来源排序
+
+在补上 `mm metadata` 之后，三个候选误差源的优先级可以重新排序：
+
+1. **M-RoPE / multimodal position metadata**
+   - 仍然重要，但已经不是“完全缺失”，而是可能还有细节没完全同构
+2. **visual replacement 的细节差异**
+   - 现在比之前更值得查，因为主 metadata 缺口已经补上了
+3. **raw hidden-state 定义差异**
+   - 目前仍然不像主因，因为 HF 和 vLLM 两边都指向 post-final-norm 的最后层状态
+
+所以接下来的工作重点应该是：
+
+1. 继续比对 HF 与 vLLM 的：
+   - `position_ids / M-RoPE`
+   - `image_grid_thw`
+   - visual embedding 替换前后的关键张量
+2. 不再把主要精力放在 pooler / hidden-state 定义上
+
+一句话更新当前判断：
+
+> 第四个 patch 证明了 `EmbedsPrompt + prompt_token_ids + mm_features` 这条路是有效的，而且它显著缩小了和 HF `generate_latents()` 的差距；剩下的 gap 更像是 position / visual 细节级对齐问题，而不是“vLLM 根本不适合做这件事”。
+## 2026-03-19: Visual Tower Alignment Status
+
+在前面把 `prompt_embeds + prompt_token_ids + mm metadata` 打通之后，剩余 gap 继续被拆到了 visual tower。
+
+本轮新增两层验证：
+
+1. 直接比较 visual tower 最终输出
+2. 比较 visual tower 的关键中间量
+
+结论如下：
+
+- `patch_embed` 与 HF 完全一致
+- `window_index` 与 `cu_window_seqlens` 与 HF 完全一致
+- 但 final visual output 仍有稳定差异：
+  - `max_abs_diff = 0.84375`
+  - `mean_abs_diff ~= 0.0087`
+
+这说明：
+
+- 视觉 token 的顺序、数量、切片和 replacement 已经不是主要问题
+- 剩余差异更像是在 visual transformer block / attention 内部逐层积累出来的
+
+同时，HF `flash_attention_2 / sdpa / eager` 三种 backend 与 vLLM 的差异量级没有明显收敛，所以这不太像“只换一个 HF backend 就能消掉”的问题。
+
+因此当前最合理的工程判断是：
+
+> `generate_latents()` 的 backbone 路线在技术上已经打通；剩余精度 gap 主要卡在 Qwen2.5-VL visual tower 的实现细节，而不是语言侧位置、token replacement 或 latent query 注入。

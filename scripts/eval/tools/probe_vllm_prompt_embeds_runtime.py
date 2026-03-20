@@ -131,12 +131,12 @@ def main():
         custom_prompt_embeds = _make_custom_last_n(base_prompt_embeds, args.custom_last_n)
 
         base_output = llm.encode(
-            [EmbedsPrompt(prompt_embeds=base_prompt_embeds)],
+            [EmbedsPrompt(prompt_embeds=base_prompt_embeds, prompt_token_ids=prompt_token_ids)],
             pooling_task="token_embed",
             use_tqdm=False,
         )[0]
         custom_output = llm.encode(
-            [EmbedsPrompt(prompt_embeds=custom_prompt_embeds)],
+            [EmbedsPrompt(prompt_embeds=custom_prompt_embeds, prompt_token_ids=prompt_token_ids)],
             pooling_task="token_embed",
             use_tqdm=False,
         )[0]

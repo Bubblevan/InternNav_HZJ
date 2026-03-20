@@ -201,6 +201,110 @@
 - **当前实现不通**
 - **blocker 已经具体到可以通过源码 patch 解决**
 
+在补上“embeds 请求同时保留 `prompt_token_ids`”这个最小 patch 后，新的实验结果又进一步收敛了问题：
+
+- 请求可以成功执行
+- 输出长度也可以严格保持为 `2084`
+- 但即使显式修改最后 4 个 prompt embeddings，返回的 token-level 输出仍然完全不变
+
+这说明当前问题已经不再是：
+
+- “M-RoPE 过不去”
+
+而变成了：
+
+- “自定义 `prompt_embeds` 在 worker 执行前又被 token-id embedding 覆盖掉了”
+
+因此，当前公开 `prompt_embeds` 路线的完整阶段性判断应该是：
+
+1. **第一个 patch 已经打通 M-RoPE 所需的 token ids 保留**
+2. **第二个 patch 还需要阻止这些位置被重新当作 token ids 处理**
+3. **只有这样，外部给定的 custom embeddings 才可能真正影响输出**
+
+在继续补 patch 之后，我们又加了一轮文件级 debug dump，并把链路细化到了：
+
+- `gpu_input_batch_add_request`
+- `gpu_model_runner_prepare_inputs`
+- `gpu_model_runner_pre_forward`
+- `gpu_model_runner_post_forward`
+- `gpu_model_runner_pooler_output`
+
+这一轮的关键观察是：
+
+1. 在 `add_request` 阶段，两次请求的 `prompt_embeds` 最后 4 行差异是存在的
+2. 但到了 `prepare_inputs`，`inputs_embeds_gpu` 已经完全一致
+3. 后续 `pooler_output` 也因此继续保持完全一致
+
+这说明当前问题已经进一步收敛为：
+
+- 不是 pooler 抹平了差异
+- 也不是 model forward 抹平了差异
+- 而是 **在 `_preprocess()` 阶段，自定义 `prompt_embeds` 就已经被覆盖掉了**
+
+进一步对源码分支的定位表明，真正覆盖它们的是 Qwen2.5-VL 的多模态分支：
+
+- 只要 `supports_mm_inputs=True`
+- `_preprocess()` 就会优先走 multimodal path
+- 然后调用 `self.model.embed_input_ids(...)`
+- 并把结果整段 `copy_` 回 `self.inputs_embeds.gpu[:num_scheduled_tokens]`
+
+这会导致一个更具体的“第三个 blocker”：
+
+1. 第一个 patch：让 `EmbedsPrompt` 同时保留 `prompt_token_ids`，供 M-RoPE 使用
+2. 第二个 patch：阻止这些位置在通用 prompt-embed 路线上被重新当成 token ids
+3. **第三个 patch：在 `supports_mm_inputs` 分支里，继续保住外部给定的 prompt embeddings，不要被整段 multimodal embedding 覆盖**
+
+在第三个 patch 之后，我们又进一步把 probe 升级成了：
+
+- 用真实 replay1 sample 的 `pixel_values / image_grid_thw`
+- 用真实 checkpoint 里的 `latent_queries`
+- 在正式 pooling 请求路径里直接抓 raw hidden states
+
+这一步带来的阶段性变化非常关键：
+
+1. **“custom latent_queries 是否真的进入 backbone”这个问题已经可以回答为：是**
+2. **新的主问题已经从“路径能否打通”转成了“hidden-state 如何继续数值对齐”**
+
+基于当前单样本实测（`sample_0000_zsNo4HB9uLZ_0001_step_0003.pt`）：
+
+- `prepare_inputs` 最后 4 个位置差异：明显非零
+- `token_embed` 最后 4 个位置差异：明显非零
+- `raw hidden_states` 最后 4 个位置差异：明显非零
+- 但 `vLLM custom hidden last-4` 与 HF baseline latent 的 `max_abs_diff` 仍约为 `19.5`
+
+所以最新结论应该更新为：
+
+> 目前已经证明 vLLM 源码改造后可以承接 DualVLN 风格的“真实 latent_queries 注入”，并且这会真实影响 raw hidden states；但它与 HF `generate_latents()` 的数值等价性还没有建立，接下来需要继续做 hidden-state 级别的精度对齐。
+
+在这之后，我们又补了一个更关键的“第四个 patch”：
+
+1. `EmbedsInputs` / `EmbedsPrompt` 允许一路携带：
+   - `mm_kwargs`
+   - `mm_hashes`
+   - `mm_placeholders`
+2. `InputProcessor` 对 `type == "embeds"` 且带有这些字段的请求，也会构造 `mm_features`
+3. probe 侧用 replay1 manifest 重建真实输入图像，把 multimodal metadata 真正带回 engine
+
+这一步的核心目的，是让 worker 在构造 Qwen2.5-VL 的 M-RoPE / position 时，不再处于“只有 token ids、没有 multimodal item metadata”的状态。
+
+补完以后，同一条 eager hidden-state probe 的结果更新为：
+
+- `vLLM custom hidden last-4 vs HF baseline latent max_abs_diff`
+  - 从 `19.5`
+  - 降到 `7.34375`
+- `mean_abs_diff`
+  - 从 `0.8178`
+  - 降到 `0.3997`
+
+这说明：
+
+1. `EmbedsPrompt` 缺失 multimodal metadata，确实是之前的一个主要误差源
+2. “主 gap 很大一部分来自 M-RoPE / multimodal metadata 不同构” 这个判断，被实验明显支持了
+3. 当前问题已经进一步收敛成：
+   - 剩余的 M-RoPE / position 细节
+   - visual replacement 是否完全同构
+   - 而不再是“这条路根本不成立”
+
 所以目前这条结论可以写得很明确：
 
 > 公开 vLLM API 可以提供“接近 hidden-state 提取”的能力，但还不足以原样承接 DualVLN 的 `generate_latents()`。
@@ -228,9 +332,7 @@
 
 ---
 
-## 7. 那能不能改 vLLM 源码、从源码安装？
-
-可以，而且从当前进展看，这已经不是“可选项”，而是 **非常现实的下一步候选**。
+## 7. 改 vLLM 源码、从源码安装
 
 ### 7.1 为什么可以
 
@@ -277,9 +379,11 @@
 
 1. 支持“完全信任外部给定的 prompt_embeds / inputs_embeds”
 2. 支持 embeds 请求同时保留 `prompt_token_ids`，供 M-RoPE / position 构造使用
-3. 支持跳过或部分绕过默认 multimodal processor
-4. 支持返回指定层、指定位置的 hidden states
-5. 最好还能保住现有 Qwen2.5-VL 的 position / rope / multimodal 对齐逻辑
+3. 支持对“已由 prompt_embeds 提供的 prompt 位置”跳过 token-id re-embedding
+4. 支持 embeds 请求携带完整的 multimodal metadata，构造 `mm_features`
+5. 支持跳过或部分绕过默认 multimodal processor
+6. 支持返回指定层、指定位置的 hidden states
+7. 最好还能保住现有 Qwen2.5-VL 的 position / rope / multimodal 对齐逻辑
 
 所以这不是改一个 flag 就完事，更像是：
 
@@ -300,6 +404,10 @@
 
 > 不是“能不能拿 hidden states”，而是“能不能在 vLLM 中以正确方式注入 DualVLN 所需的 custom input embeddings，并返回指定位置的 hidden states”。
 
+并且现在还能再加一句更具体的：
+
+> 当前 gap 已经被压缩了一大截，接下来优先该查的不是 hidden-state 定义，而是 M-RoPE / position 与 visual replacement 的剩余细节对齐。
+
 ---
 
 ## 9. 一句话总结
@@ -314,3 +422,52 @@
 所以当前最现实的路线已经逐渐收敛为：
 
 > **改 vLLM 源码，并从源码安装，做一条面向 DualVLN `generate_latents()` 的专用 hidden-state / input-embed 路线。**
+## 2026-03-19: Visual Gap Narrowing Update
+
+本轮把剩余 gap 继续拆到了 visual tower 内部，新增了几组专门的对齐脚本：
+
+- `scripts/eval/tools/export_vllm_visual_embeddings.py`
+- `scripts/eval/tools/compare_hf_vllm_visual_embeddings.py`
+- `scripts/eval/tools/export_vllm_visual_stages.py`
+- `scripts/eval/tools/compare_hf_vllm_visual_stages.py`
+
+当前最关键的新结论：
+
+1. `generate_latents()` 剩余 gap 的主来源，已经进一步收敛到 visual tower 本身。
+2. `patch_embed` 已经和 HF **完全一致**。
+3. visual token 的 `window_index` 与 `cu_window_seqlens` 也已经和 HF **完全一致**。
+4. 但 final visual output 仍存在稳定差异：
+   - `HF vs vLLM visual embeddings max_abs_diff = 0.84375`
+   - 平均绝对误差约 `0.0087`
+5. 这个差异不是单纯 HF backend 选择造成的：
+   - HF `flash_attention_2` / `sdpa` / `eager` 对 vLLM 的差异量级都接近
+   - 因此它更像是 vLLM visual blocks / `MMEncoderAttention` 这条实现路径的数值差异，而不是简单的 HF kernel 选择问题
+
+### 已验证不再是主嫌疑的点
+
+- `M-RoPE / language-model positions`
+  - 之前已经做到与 HF 完全一致
+- `text token embeddings`
+  - 已经做到与 HF 完全一致
+- `latent_queries` 注入
+  - 已经做到与 HF 完全一致
+- visual replacement 的 token 对齐顺序
+  - image token 数、replacement 顺序、window 索引都已经对上
+
+### 当前更像主嫌疑的点
+
+- `Qwen2.5-VL visual blocks`
+- `MMEncoderAttention` / visual attention backend
+- visual rotary 在 attention kernel 内部的实际应用方式
+
+### 研究判断
+
+这意味着当前问题已经从“序列/位置/替换错了”进一步收缩成：
+
+> visual tower 前处理已经高度对齐，但 vLLM 与 HF 在视觉 transformer 主体里的数值轨迹仍未完全同构。
+
+换句话说，接下来最值得继续做的，不是再反复调 prompt 或 image placeholder，而是：
+
+1. 对比 visual blocks 的中间 hidden states
+2. 重点检查 `MMEncoderAttention` 与 HF visual attention 的差异
+3. 判断剩余 `0.84375` 的 visual output gap 是否会继续主导最终 `generate_latents()` latent gap
