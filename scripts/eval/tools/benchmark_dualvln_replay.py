@@ -15,6 +15,10 @@ from transformers import AutoProcessor
 
 from internnav.habitat_extensions.vln.utils import preprocess_depth_image_v2
 from internnav.model.basemodel.internvla_n1.internvla_n1 import InternVLAN1ForCausalLM
+from internnav.model.utils.vllm_hidden_latents import (
+    VLLMHiddenLatentsHTTPClient,
+    VLLMHiddenLatentsRunner,
+)
 from internnav.model.utils.vln_utils import split_and_clean, traj_to_actions
 
 
@@ -86,6 +90,50 @@ def parse_args():
         help="Ignore saved history_frame_indices in the manifest and rebuild history from --num-history",
     )
     parser.add_argument("--max-steps", type=int, default=None, help="Optional cap on replay steps")
+    parser.add_argument(
+        "--latent-backend",
+        choices=["hf", "vllm_hidden"],
+        default="hf",
+        help="Backend used for generate_latents() in pixel-goal steps.",
+    )
+    parser.add_argument(
+        "--latent-vllm-model-path",
+        default=None,
+        help="Patched Qwen2.5-VL vLLM view path, required when --latent-backend=vllm_hidden",
+    )
+    parser.add_argument(
+        "--latent-vllm-url",
+        default=None,
+        help="Optional HTTP service URL for the vLLM hidden-latents server. Overrides local import mode.",
+    )
+    parser.add_argument(
+        "--latent-vllm-dump-dir",
+        default="./logs/habitat/vllm_generate_latents_benchmark_dump",
+        help="Dump directory used by the patched vLLM hidden-state path.",
+    )
+    parser.add_argument(
+        "--latent-vllm-gpu-memory-utilization",
+        type=float,
+        default=0.45,
+        help="GPU memory utilization for the local vLLM hidden-state runner.",
+    )
+    parser.add_argument(
+        "--latent-vllm-limit-mm-per-prompt-image",
+        type=int,
+        default=16,
+        help="limit_mm_per_prompt['image'] for the local vLLM hidden-state runner.",
+    )
+    parser.add_argument(
+        "--compare-hf-reference",
+        action="store_true",
+        help="When using vllm_hidden, also compute the HF latent and compare latent / generate_traj outputs.",
+    )
+    parser.add_argument(
+        "--traj-seed",
+        type=int,
+        default=1234,
+        help="Seed reused before each generate_traj call when comparing HF and vLLM-hidden latents.",
+    )
     parser.add_argument("--output", required=True, help="Summary json output path")
     parser.add_argument(
         "--details-output",
@@ -146,6 +194,14 @@ def count_image_tokens(image_grid_thw):
         tensor = thw if isinstance(thw, torch.Tensor) else torch.as_tensor(thw)
         total += int(torch.prod(tensor.to(torch.int64)).item())
     return total
+
+
+def tensor_diff(a, b):
+    diff = (a.float() - b.float()).abs()
+    return {
+        "max_abs_diff": float(diff.max().item()),
+        "mean_abs_diff": float(diff.mean().item()),
+    }
 
 
 def load_manifest(path, base_path=None):
@@ -254,6 +310,24 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
 
+    latent_runner = None
+    if args.latent_backend == "vllm_hidden":
+        if args.latent_vllm_url:
+            latent_runner = VLLMHiddenLatentsHTTPClient(args.latent_vllm_url)
+        else:
+            if args.latent_vllm_model_path is None:
+                raise ValueError(
+                    "Either --latent-vllm-url or --latent-vllm-model-path is required "
+                    "when --latent-backend=vllm_hidden"
+                )
+            latent_runner = VLLMHiddenLatentsRunner(
+                model_path=args.latent_vllm_model_path,
+                dump_dir=args.latent_vllm_dump_dir,
+                gpu_memory_utilization=args.latent_vllm_gpu_memory_utilization,
+                limit_mm_per_prompt_image=args.latent_vllm_limit_mm_per_prompt_image,
+                enforce_eager=True,
+            )
+
     total_latencies = []
     s2_generate_latencies = []
     s2_latent_latencies = []
@@ -279,6 +353,10 @@ def main():
     text_exact_total = 0
     pixel_goal_l1_errors = []
     pixel_goal_l2_errors = []
+    latent_last4_diffs = []
+    traj_output_diffs = []
+    traj_first_action_matches = 0
+    traj_first_action_total = 0
     records = []
 
     with open(details_output, "w", encoding="utf-8") as detail_f:
@@ -353,10 +431,33 @@ def main():
                     image_grid_thw = torch.cat([thw.unsqueeze(0) for thw in inputs.image_grid_thw], dim=0)
 
                     latent_start = time.perf_counter()
-                    with torch.no_grad():
-                        traj_latents = model.generate_latents(output_ids, pixel_values, image_grid_thw)
+                    hf_traj_latents = None
+                    if args.latent_backend == "hf" or args.compare_hf_reference:
+                        with torch.no_grad():
+                            hf_traj_latents = model.generate_latents(output_ids, pixel_values, image_grid_thw)
+
+                    if args.latent_backend == "hf":
+                        traj_latents = hf_traj_latents
+                    else:
+                        latent_queries = model.get_model().latent_queries[0].detach().cpu()
+                        traj_latents = latent_runner.generate_latents(
+                            output_ids=output_ids,
+                            pixel_values=pixel_values,
+                            image_grid_thw=image_grid_thw,
+                            input_images=input_images,
+                            latent_queries=latent_queries,
+                            traj_token_index=151667,
+                            n_query=model.get_n_query(),
+                            target_device=model.device,
+                            target_dtype=model.dtype if hasattr(model, "dtype") else torch.bfloat16,
+                        )
                     s2_latent_seconds = time.perf_counter() - latent_start
                     s2_latent_latencies.append(s2_latent_seconds)
+
+                    latent_diff_report = None
+                    if hf_traj_latents is not None and args.latent_backend == "vllm_hidden":
+                        latent_diff_report = tensor_diff(traj_latents[0], hf_traj_latents[0])
+                        latent_last4_diffs.append(latent_diff_report)
 
                     image_dp = torch.tensor(np.array(lookdown_rgb.resize((224, 224)))).to(torch.bfloat16) / 255
                     images_dp = torch.stack([image_dp, image_dp]).unsqueeze(0).to(model.device)
@@ -365,15 +466,33 @@ def main():
 
                     s1_start = time.perf_counter()
                     with torch.no_grad():
+                        torch.manual_seed(args.traj_seed)
                         dp_actions = model.generate_traj(traj_latents, images_dp, depths_dp)
                     s1_generate_seconds = time.perf_counter() - s1_start
                     s1_generate_latencies.append(s1_generate_seconds)
 
                     action_list = traj_to_actions(dp_actions)
                     predicted_action = int(action_list[0]) if action_list else int(action_code.STOP)
+
+                    traj_diff_report = None
+                    hf_traj_first_action = None
+                    if hf_traj_latents is not None and args.latent_backend == "vllm_hidden":
+                        with torch.no_grad():
+                            torch.manual_seed(args.traj_seed)
+                            hf_dp_actions = model.generate_traj(hf_traj_latents, images_dp, depths_dp)
+                        traj_diff_report = tensor_diff(dp_actions, hf_dp_actions)
+                        traj_output_diffs.append(traj_diff_report)
+                        hf_action_list = traj_to_actions(hf_dp_actions)
+                        hf_traj_first_action = int(hf_action_list[0]) if hf_action_list else int(action_code.STOP)
+                        traj_first_action_total += 1
+                        if hf_traj_first_action == predicted_action:
+                            traj_first_action_matches += 1
                 else:
                     actions = parse_actions(output_text)
                     predicted_action = int(actions[0]) if actions else int(action_code.STOP)
+                    latent_diff_report = None
+                    traj_diff_report = None
+                    hf_traj_first_action = None
 
                 total_step_seconds = time.perf_counter() - step_start
                 total_latencies.append(total_step_seconds)
@@ -435,6 +554,10 @@ def main():
                     "baseline_action": baseline_action,
                     "predicted_pixel_goal": predicted_pixel_goal,
                     "baseline_pixel_goal": baseline["pixel_goal"],
+                    "latent_backend": args.latent_backend,
+                    "latent_last4_diff": latent_diff_report,
+                    "traj_output_diff": traj_diff_report,
+                    "hf_traj_first_action": hf_traj_first_action,
                 }
                 records.append(record)
                 detail_f.write(json.dumps(record) + "\n")
@@ -456,6 +579,10 @@ def main():
             "model_path": args.model_path,
             "device": args.device,
             "attn_backend": args.attn_backend,
+            "latent_backend": args.latent_backend,
+            "latent_vllm_model_path": args.latent_vllm_model_path,
+            "latent_vllm_url": args.latent_vllm_url,
+            "compare_hf_reference": bool(args.compare_hf_reference),
             "processor_use_fast": args.processor_use_fast,
             "num_history": args.num_history,
             "prompt_variant": args.prompt_variant,
@@ -514,7 +641,34 @@ def main():
             "steps_pixel_goal": pixel_action_total,
             "steps_output_kind_match": output_kind_matches,
         },
+        "latent_compare": None,
+        "traj_compare": None,
     }
+    if args.latent_backend == "vllm_hidden" and args.compare_hf_reference:
+        summary["latent_compare"] = {
+            "count": len(latent_last4_diffs),
+            "last4_max_abs_diff_mean": float(np.mean([x["max_abs_diff"] for x in latent_last4_diffs]))
+            if latent_last4_diffs
+            else 0.0,
+            "last4_mean_abs_diff_mean": float(np.mean([x["mean_abs_diff"] for x in latent_last4_diffs]))
+            if latent_last4_diffs
+            else 0.0,
+            "last4_max_abs_diff_max": max([x["max_abs_diff"] for x in latent_last4_diffs], default=0.0),
+        }
+        summary["traj_compare"] = {
+            "count": len(traj_output_diffs),
+            "traj_max_abs_diff_mean": float(np.mean([x["max_abs_diff"] for x in traj_output_diffs]))
+            if traj_output_diffs
+            else 0.0,
+            "traj_mean_abs_diff_mean": float(np.mean([x["mean_abs_diff"] for x in traj_output_diffs]))
+            if traj_output_diffs
+            else 0.0,
+            "traj_first_action_match_rate": (
+                float(traj_first_action_matches) / float(traj_first_action_total)
+                if traj_first_action_total
+                else 0.0
+            ),
+        }
     with open(args.output, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
 

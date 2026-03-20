@@ -16,6 +16,7 @@ from internnav.configs.model.base_encoders import ModelCfg
 from internnav.model.basemodel.internvla_n1.internvla_n1 import (
     InternVLAN1ForCausalLM,
     InternVLAN1ModelConfig,
+    TRAJ_TOKEN_INDEX,
 )
 from internnav.model.utils.vln_utils import (
     S1Output,
@@ -23,6 +24,10 @@ from internnav.model.utils.vln_utils import (
     chunk_token,
     split_and_clean,
     traj_to_actions,
+)
+from internnav.model.utils.vllm_hidden_latents import (
+    VLLMHiddenLatentsHTTPClient,
+    VLLMHiddenLatentsRunner,
 )
 
 
@@ -68,6 +73,96 @@ class InternVLAN1Net(PreTrainedModel):
             if self.s2_vllm_model is None:
                 self.s2_vllm_model = self._detect_vllm_model_name()
                 print(f"[InternVLAN1Net] Auto-detected vLLM model name: {self.s2_vllm_model}")
+
+        self.generate_latents_backend = getattr(self.model_config, "generate_latents_backend", "hf")
+        self.generate_latents_vllm_model_path = getattr(
+            self.model_config,
+            "generate_latents_vllm_model_path",
+            None,
+        )
+        self.generate_latents_vllm_url = getattr(
+            self.model_config,
+            "generate_latents_vllm_url",
+            None,
+        )
+        self.generate_latents_vllm_dump_dir = getattr(
+            self.model_config,
+            "generate_latents_vllm_dump_dir",
+            "./logs/habitat/vllm_generate_latents_runtime_dump",
+        )
+        self.generate_latents_vllm_max_model_len = getattr(
+            self.model_config,
+            "generate_latents_vllm_max_model_len",
+            4096,
+        )
+        self.generate_latents_vllm_gpu_memory_utilization = getattr(
+            self.model_config,
+            "generate_latents_vllm_gpu_memory_utilization",
+            0.45,
+        )
+        self.generate_latents_vllm_limit_mm_per_prompt_image = getattr(
+            self.model_config,
+            "generate_latents_vllm_limit_mm_per_prompt_image",
+            16,
+        )
+        self.generate_latents_vllm_dtype = getattr(
+            self.model_config,
+            "generate_latents_vllm_dtype",
+            "auto",
+        )
+        self.generate_latents_vllm_enforce_eager = getattr(
+            self.model_config,
+            "generate_latents_vllm_enforce_eager",
+            True,
+        )
+        self._generate_latents_runner = None
+        if self.generate_latents_backend == "vllm_hidden":
+            if self.generate_latents_vllm_url:
+                self._generate_latents_runner = VLLMHiddenLatentsHTTPClient(
+                    self.generate_latents_vllm_url
+                )
+                print(
+                    "[InternVLAN1Net] generate_latents vLLM hidden-state HTTP backend enabled: "
+                    f"{self.generate_latents_vllm_url}"
+                )
+            else:
+                if self.generate_latents_vllm_model_path is None:
+                    raise ValueError(
+                        "generate_latents_backend='vllm_hidden' requires either "
+                        "generate_latents_vllm_url or generate_latents_vllm_model_path"
+                    )
+                self._generate_latents_runner = VLLMHiddenLatentsRunner(
+                    model_path=self.generate_latents_vllm_model_path,
+                    dump_dir=self.generate_latents_vllm_dump_dir,
+                    max_model_len=self.generate_latents_vllm_max_model_len,
+                    gpu_memory_utilization=self.generate_latents_vllm_gpu_memory_utilization,
+                    limit_mm_per_prompt_image=self.generate_latents_vllm_limit_mm_per_prompt_image,
+                    dtype=self.generate_latents_vllm_dtype,
+                    enforce_eager=self.generate_latents_vllm_enforce_eager,
+                )
+                print(
+                    "[InternVLAN1Net] generate_latents vLLM hidden-state backend enabled: "
+                    f"{self.generate_latents_vllm_model_path}"
+                )
+
+    def _generate_latents(self, output_ids, pixel_values, image_grid_thw):
+        if self.generate_latents_backend == "hf":
+            with torch.no_grad():
+                return self.model.generate_latents(output_ids, pixel_values, image_grid_thw)
+        if self.generate_latents_backend == "vllm_hidden":
+            latent_queries = self.model.get_model().latent_queries[0].detach().cpu()
+            return self._generate_latents_runner.generate_latents(
+                output_ids=output_ids,
+                pixel_values=pixel_values,
+                image_grid_thw=image_grid_thw,
+                input_images=self.input_images,
+                latent_queries=latent_queries,
+                traj_token_index=TRAJ_TOKEN_INDEX,
+                n_query=self.model.get_n_query(),
+                target_device=self.model.device,
+                target_dtype=self.model.dtype if hasattr(self.model, "dtype") else torch.bfloat16,
+            )
+        raise ValueError(f"Unsupported generate_latents backend: {self.generate_latents_backend}")
 
     def init_prompts(self):
         self.DEFAULT_IMAGE_TOKEN = "<image>"
@@ -256,8 +351,7 @@ class InternVLAN1Net(PreTrainedModel):
             output.output_pixel = np.array(pixel_goal)
 
             image_grid_thw = torch.cat([thw.unsqueeze(0) for thw in inputs.image_grid_thw], dim=0)
-            with torch.no_grad():
-                traj_latents = self.model.generate_latents(output_ids, inputs.pixel_values, image_grid_thw)
+            traj_latents = self._generate_latents(output_ids, inputs.pixel_values, image_grid_thw)
             output.output_latent = traj_latents
 
         else:  # Output action
