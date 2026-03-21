@@ -1,6 +1,7 @@
 import argparse
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import time
 import traceback
 import sys
 
@@ -56,6 +57,7 @@ class HiddenLatentsHandler(BaseHTTPRequestHandler):
             return
 
         try:
+            start_time = time.perf_counter()
             length = int(self.headers.get("Content-Length", "0"))
             raw = self.rfile.read(length)
             payload = json.loads(raw.decode("utf-8"))
@@ -65,6 +67,16 @@ class HiddenLatentsHandler(BaseHTTPRequestHandler):
             image_grid_thw = decode_tensor_from_b64(payload["image_grid_thw"])
             latent_queries = decode_tensor_from_b64(payload["latent_queries"])
             input_images = [decode_pil_image_from_b64(x) for x in payload.get("input_images", [])]
+
+            print(
+                "[HiddenLatents] POST /generate_latents "
+                f"output_ids={tuple(output_ids.shape)} "
+                f"pixel_values={tuple(pixel_values.shape)} "
+                f"image_grid_thw={tuple(image_grid_thw.shape)} "
+                f"latent_queries={tuple(latent_queries.shape)} "
+                f"input_images={len(input_images)}",
+                flush=True,
+            )
 
             latents = self.runner.generate_latents(
                 output_ids=output_ids,
@@ -82,6 +94,12 @@ class HiddenLatentsHandler(BaseHTTPRequestHandler):
                     "latents": encode_tensor_to_b64(latents),
                     "shape": list(latents.shape),
                 },
+            )
+            print(
+                "[HiddenLatents] completed "
+                f"latents={tuple(latents.shape)} "
+                f"elapsed_s={time.perf_counter() - start_time:.3f}",
+                flush=True,
             )
         except Exception as exc:
             tb = traceback.format_exc()

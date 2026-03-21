@@ -42,7 +42,20 @@ from internnav.habitat_extensions.vln.utils import (
     preprocess_depth_image_v2,
     xyz_yaw_pitch_to_tf_matrix,
 )
-from internnav.model.basemodel.internvla_n1.internvla_n1 import InternVLAN1ForCausalLM
+from internnav.model.basemodel.internvla_n1.internvla_n1 import (
+    InternVLAN1ForCausalLM,
+    TRAJ_TOKEN_INDEX,
+)
+from internnav.model.basemodel.internvla_n1.system1_runner import (
+    InternVLAN1System1Runner,
+)
+from internnav.model.utils.dualvln_single_vllm import (
+    DualVLNSingleVLLMHTTPClient,
+)
+from internnav.model.utils.vllm_hidden_latents import (
+    VLLMHiddenLatentsHTTPClient,
+    VLLMHiddenLatentsRunner,
+)
 from internnav.model.utils.vln_utils import split_and_clean, traj_to_actions
 
 # Import for Habitat registry side effects — do not remove
@@ -115,19 +128,39 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         # ------------------------------------- model ------------------------------------------
         self.model_args = argparse.Namespace(**cfg.agent.model_settings)
         self._init_env_capabilities()
-
-        processor = AutoProcessor.from_pretrained(self.model_args.model_path)
-        processor.tokenizer.padding_side = 'left'
+        self.dualvln_single_vllm_url = getattr(self.model_args, "dualvln_single_vllm_url", None)
+        self.dualvln_single_vllm_timeout = float(getattr(self.model_args, "dualvln_single_vllm_timeout", 300.0))
+        self._dualvln_single_vllm_client = None
 
         device = torch.device(f"cuda:{self.local_rank}")
         if self.model_args.mode == 'dual_system':
-            model = InternVLAN1ForCausalLM.from_pretrained(
-                self.model_args.model_path,
-                torch_dtype=torch.bfloat16,
-                attn_implementation="flash_attention_2",
-                device_map={"": device},
-            )
+            if self.dualvln_single_vllm_url:
+                model = InternVLAN1System1Runner.from_pretrained(
+                    self.model_args.model_path,
+                    torch_dtype=torch.bfloat16,
+                    device=device,
+                )
+                self._dualvln_single_vllm_client = DualVLNSingleVLLMHTTPClient(
+                    self.dualvln_single_vllm_url,
+                    timeout=self.dualvln_single_vllm_timeout,
+                )
+                processor = None
+                print(
+                    "[HabitatVLNEvaluator] Single-engine DualVLN vLLM backend enabled: "
+                    f"{self.dualvln_single_vllm_url}"
+                )
+            else:
+                processor = AutoProcessor.from_pretrained(self.model_args.model_path)
+                processor.tokenizer.padding_side = 'left'
+                model = InternVLAN1ForCausalLM.from_pretrained(
+                    self.model_args.model_path,
+                    torch_dtype=torch.bfloat16,
+                    attn_implementation="flash_attention_2",
+                    device_map={"": device},
+                )
         elif self.model_args.mode == 'system2':
+            processor = AutoProcessor.from_pretrained(self.model_args.model_path)
+            processor.tokenizer.padding_side = 'left'
             model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
                 self.model_args.model_path,
                 torch_dtype=torch.bfloat16,
@@ -173,7 +206,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
         self.s2_vllm_url = getattr(self.model_args, 's2_vllm_url', None)
         self.s2_vllm_model = getattr(self.model_args, 's2_vllm_model', None)
-        if self.s2_vllm_url:
+        if self.s2_vllm_url and not self.dualvln_single_vllm_url:
             print(f"[HabitatVLNEvaluator] S2 vLLM backend enabled: {self.s2_vllm_url}")
             if self.s2_vllm_model is None:
                 try:
@@ -185,6 +218,81 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     print(f"[HabitatVLNEvaluator] Failed to detect vLLM model: {e}")
                     self.s2_vllm_model = "default"
             print(f"[HabitatVLNEvaluator] vLLM model: {self.s2_vllm_model}")
+
+        self.generate_latents_backend = getattr(self.model_args, "generate_latents_backend", "hf")
+        self.generate_latents_vllm_model_path = getattr(
+            self.model_args,
+            "generate_latents_vllm_model_path",
+            None,
+        )
+        self.generate_latents_vllm_url = getattr(
+            self.model_args,
+            "generate_latents_vllm_url",
+            None,
+        )
+        self.generate_latents_vllm_dump_dir = getattr(
+            self.model_args,
+            "generate_latents_vllm_dump_dir",
+            "./logs/habitat/vllm_generate_latents_runtime_dump",
+        )
+        self.generate_latents_vllm_max_model_len = getattr(
+            self.model_args,
+            "generate_latents_vllm_max_model_len",
+            4096,
+        )
+        self.generate_latents_vllm_gpu_memory_utilization = getattr(
+            self.model_args,
+            "generate_latents_vllm_gpu_memory_utilization",
+            0.45,
+        )
+        self.generate_latents_vllm_limit_mm_per_prompt_image = getattr(
+            self.model_args,
+            "generate_latents_vllm_limit_mm_per_prompt_image",
+            16,
+        )
+        self.generate_latents_vllm_dtype = getattr(
+            self.model_args,
+            "generate_latents_vllm_dtype",
+            "auto",
+        )
+        self.generate_latents_vllm_enforce_eager = getattr(
+            self.model_args,
+            "generate_latents_vllm_enforce_eager",
+            True,
+        )
+        self._generate_latents_runner = None
+        if (
+            self.model_args.mode == 'dual_system'
+            and self.generate_latents_backend == "vllm_hidden"
+            and not self.dualvln_single_vllm_url
+        ):
+            if self.generate_latents_vllm_url:
+                self._generate_latents_runner = VLLMHiddenLatentsHTTPClient(
+                    self.generate_latents_vllm_url
+                )
+                print(
+                    "[HabitatVLNEvaluator] generate_latents vLLM hidden-state HTTP backend enabled: "
+                    f"{self.generate_latents_vllm_url}"
+                )
+            else:
+                if self.generate_latents_vllm_model_path is None:
+                    raise ValueError(
+                        "generate_latents_backend='vllm_hidden' requires either "
+                        "generate_latents_vllm_url or generate_latents_vllm_model_path"
+                    )
+                self._generate_latents_runner = VLLMHiddenLatentsRunner(
+                    model_path=self.generate_latents_vllm_model_path,
+                    dump_dir=self.generate_latents_vllm_dump_dir,
+                    max_model_len=self.generate_latents_vllm_max_model_len,
+                    gpu_memory_utilization=self.generate_latents_vllm_gpu_memory_utilization,
+                    limit_mm_per_prompt_image=self.generate_latents_vllm_limit_mm_per_prompt_image,
+                    dtype=self.generate_latents_vllm_dtype,
+                    enforce_eager=self.generate_latents_vllm_enforce_eager,
+                )
+                print(
+                    "[HabitatVLNEvaluator] generate_latents vLLM hidden-state backend enabled: "
+                    f"{self.generate_latents_vllm_model_path}"
+                )
 
         self._camera_height = self.sim_sensors_config.rgb_sensor.position[1]
         self._min_depth = self.sim_sensors_config.depth_sensor.min_depth
@@ -246,6 +354,41 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         resp = http_requests.post(f"{self.s2_vllm_url}/v1/chat/completions", json=payload, timeout=120)
         resp.raise_for_status()
         return resp.json()["choices"][0]["message"]["content"]
+
+    def _single_vllm_step_s2(self, messages, max_new_tokens=128):
+        if self._dualvln_single_vllm_client is None:
+            raise RuntimeError("Single-engine DualVLN vLLM client is not initialized")
+        return self._dualvln_single_vllm_client.step_s2(
+            messages,
+            max_new_tokens=max_new_tokens,
+            target_device=self.device,
+            target_dtype=torch.bfloat16,
+        )
+
+    def _generate_latents(self, output_ids, pixel_values, image_grid_thw, input_images):
+        if self.dualvln_single_vllm_url:
+            raise RuntimeError("generate_latents should come from the single-engine vLLM backend in this mode")
+        if self.generate_latents_backend == "hf":
+            with torch.no_grad():
+                return self.model.generate_latents(output_ids, pixel_values, image_grid_thw)
+        if self.generate_latents_backend == "vllm_hidden":
+            latent_queries = self.model.get_model().latent_queries[0].detach().cpu()
+            return self._generate_latents_runner.generate_latents(
+                output_ids=output_ids,
+                pixel_values=pixel_values,
+                image_grid_thw=image_grid_thw,
+                input_images=input_images,
+                latent_queries=latent_queries,
+                traj_token_index=TRAJ_TOKEN_INDEX,
+                n_query=self.model.get_n_query(),
+                target_device=self.device,
+                target_dtype=self.model.dtype if hasattr(self.model, "dtype") else torch.bfloat16,
+            )
+        raise ValueError(f"Unsupported generate_latents backend: {self.generate_latents_backend}")
+
+    def _generate_traj(self, traj_latents, images_dp, depths_dp):
+        with torch.no_grad():
+            return self.model.generate_traj(traj_latents, images_dp, depths_dp)
 
     def _init_env_capabilities(self):
         lab_sensors = getattr(self.config.habitat.task, "lab_sensors", None)
@@ -540,39 +683,46 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             content.append({"type": "text", "text": parts[i]})
 
                     messages.append({'role': 'user', 'content': content})
-
-                    text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-
-                    inputs = self.processor(text=[text], images=input_images, return_tensors="pt").to(self.model.device)
-
-                    if self.s2_vllm_url:
-                        llm_outputs = self._vllm_generate(messages, max_new_tokens=128)
-                        generated_ids = self.processor.tokenizer.encode(llm_outputs, add_special_tokens=False)
-                        output_ids = torch.cat([
-                            inputs.input_ids,
-                            torch.tensor([generated_ids], device=inputs.input_ids.device),
-                        ], dim=1)
+                    inputs = None
+                    traj_latents = None
+                    if self.dualvln_single_vllm_url:
+                        single_vllm_result = self._single_vllm_step_s2(messages, max_new_tokens=128)
+                        llm_outputs = single_vllm_result["llm_output"]
+                        pixel_goal = single_vllm_result["pixel_goal"]
+                        traj_latents = single_vllm_result["latents"]
+                        output_ids = None
                     else:
-                        with torch.no_grad():
-                            output_ids = self.model.generate(
-                                **inputs,
-                                max_new_tokens=128,
-                                do_sample=False,
-                                use_cache=True,
-                                past_key_values=None,
-                                return_dict_in_generate=True,
-                            ).sequences
-                        llm_outputs = self.processor.tokenizer.decode(
-                            output_ids[0][inputs.input_ids.shape[1] :], skip_special_tokens=True
-                        )
+                        text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                        inputs = self.processor(text=[text], images=input_images, return_tensors="pt").to(self.device)
+
+                        if self.s2_vllm_url:
+                            llm_outputs = self._vllm_generate(messages, max_new_tokens=128)
+                            generated_ids = self.processor.tokenizer.encode(llm_outputs, add_special_tokens=False)
+                            output_ids = torch.cat([
+                                inputs.input_ids,
+                                torch.tensor([generated_ids], device=inputs.input_ids.device),
+                            ], dim=1)
+                        else:
+                            with torch.no_grad():
+                                output_ids = self.model.generate(
+                                    **inputs,
+                                    max_new_tokens=128,
+                                    do_sample=False,
+                                    use_cache=True,
+                                    past_key_values=None,
+                                    return_dict_in_generate=True,
+                                ).sequences
+                            llm_outputs = self.processor.tokenizer.decode(
+                                output_ids[0][inputs.input_ids.shape[1] :], skip_special_tokens=True
+                            )
 
                     print('step_id:', step_id, 'output text:', llm_outputs)
 
                     if bool(re.search(r'\d', llm_outputs)):  # output pixel goal
                         forward_action = 0
-                        coord = [int(c) for c in re.findall(r'\d+', llm_outputs)]
-
-                        pixel_goal = [int(coord[1]), int(coord[0])]
+                        if pixel_goal is None:
+                            coord = [int(c) for c in re.findall(r'\d+', llm_outputs)]
+                            pixel_goal = [int(coord[1]), int(coord[0])]
 
                         if not self.use_system1_local_policy:
                             action_seq = [self._pixel_goal_to_discrete_action(pixel_goal, rgb.shape[1])]
@@ -585,11 +735,15 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             self.env.step(action_code.LOOKUP)
 
                             local_actions = []
-                            pixel_values = inputs.pixel_values
-                            image_grid_thw = torch.cat([thw.unsqueeze(0) for thw in inputs.image_grid_thw], dim=0)
-
-                            with torch.no_grad():
-                                traj_latents = self.model.generate_latents(output_ids, pixel_values, image_grid_thw)
+                            if traj_latents is None:
+                                pixel_values = inputs.pixel_values
+                                image_grid_thw = torch.cat([thw.unsqueeze(0) for thw in inputs.image_grid_thw], dim=0)
+                                traj_latents = self._generate_latents(
+                                    output_ids,
+                                    pixel_values,
+                                    image_grid_thw,
+                                    input_images,
+                                )
 
                             # prepocess align with navdp
                             image_dp = torch.tensor(np.array(look_down_image.resize((224, 224)))).to(torch.bfloat16) / 255
@@ -599,8 +753,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             pix_goal_depth = copy.copy(depth_dp)
                             depths_dp = torch.stack([pix_goal_depth, depth_dp]).unsqueeze(0).to(self.device)
 
-                            with torch.no_grad():
-                                dp_actions = self.model.generate_traj(traj_latents, images_dp, depths_dp)
+                            dp_actions = self._generate_traj(traj_latents, images_dp, depths_dp)
 
                             action_list = traj_to_actions(dp_actions)
                             if len(action_list) < MAX_STEPS:
@@ -638,8 +791,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         depth_dp = look_down_depth.unsqueeze(-1).to(torch.bfloat16)
 
                         depths_dp = torch.stack([pix_goal_depth, depth_dp]).unsqueeze(0).to(self.device)
-                        with torch.no_grad():
-                            dp_actions = self.model.generate_traj(traj_latents, images_dp, depths_dp)
+                        dp_actions = self._generate_traj(traj_latents, images_dp, depths_dp)
 
                         action_list = traj_to_actions(dp_actions)
                         if len(action_list) < MAX_STEPS:
@@ -945,7 +1097,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
                     text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
 
-                    inputs = self.processor(text=[text], images=input_images, return_tensors="pt").to(self.model.device)
+                    inputs = self.processor(text=[text], images=input_images, return_tensors="pt").to(self.device)
 
                     if self.s2_vllm_url:
                         llm_outputs = self._vllm_generate(messages, max_new_tokens=128)
