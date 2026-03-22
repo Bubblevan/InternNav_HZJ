@@ -25,6 +25,35 @@ class InternVLAN1ModelConfig(Qwen2_5_VLConfig):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.model_cfg = kwargs.get('model_cfg', None)
+        self._sync_text_config_aliases(kwargs)
+
+    def _sync_text_config_aliases(self, raw_kwargs):
+        # Qwen2.5-VL stores language-model shape metadata under text_config,
+        # while this codebase reads them from the top-level config.
+        text_config = getattr(self, "text_config", None)
+        alias_keys = (
+            "hidden_size",
+            "intermediate_size",
+            "num_attention_heads",
+            "num_hidden_layers",
+            "num_key_value_heads",
+            "vocab_size",
+            "hidden_act",
+            "max_position_embeddings",
+            "rms_norm_eps",
+            "rope_theta",
+            "sliding_window",
+            "max_window_layers",
+            "use_sliding_window",
+        )
+        for key in alias_keys:
+            if hasattr(self, key):
+                continue
+            if key in raw_kwargs:
+                setattr(self, key, raw_kwargs[key])
+                continue
+            if text_config is not None and hasattr(text_config, key):
+                setattr(self, key, getattr(text_config, key))
 
 
 class InternVLAN1Model(InternVLAN1MetaModel, Qwen2_5_VLModel):
@@ -45,6 +74,13 @@ class InternVLAN1Model(InternVLAN1MetaModel, Qwen2_5_VLModel):
 
 class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1MetaForCausalLM):
     config_class = InternVLAN1ModelConfig
+    _keys_to_ignore_on_load_unexpected = [
+        r"model\.(action_decoder|action_encoder|cond_projector|memory_encoder|rgb_model|rgb_resampler|traj_dit)(\.|$)",
+    ]
+    _checkpoint_conversion_mapping = {
+        "^visual": "model.visual",
+        r"^model\.(?!(language_model|visual|action_decoder|action_encoder|cond_projector|latent_queries|memory_encoder|rgb_model|rgb_resampler|traj_dit)\b)": "model.language_model.",
+    }
 
     def __init__(self, config):
         Qwen2_5_VLForConditionalGeneration.__init__(self, config)
@@ -61,6 +97,50 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
 
     def get_model(self):
         return self.model
+
+    def _build_mm_token_type_ids(self, input_ids: torch.LongTensor) -> torch.IntTensor:
+        mm_token_type_ids = torch.zeros_like(input_ids, dtype=torch.int)
+        mm_token_type_ids = mm_token_type_ids.masked_fill(input_ids == self.config.image_token_id, 1)
+        mm_token_type_ids = mm_token_type_ids.masked_fill(input_ids == self.config.video_token_id, 2)
+        return mm_token_type_ids
+
+    def _embed_tokens(self, input_ids: torch.LongTensor) -> torch.Tensor:
+        return self.get_input_embeddings()(input_ids)
+
+    def _get_visual(self):
+        if hasattr(self, "visual"):
+            return self.visual
+        return self.get_model().visual
+
+    @staticmethod
+    def _extract_visual_features(visual_outputs):
+        if hasattr(visual_outputs, "pooler_output"):
+            visual_outputs = visual_outputs.pooler_output
+        if isinstance(visual_outputs, (list, tuple)):
+            visual_outputs = torch.cat(list(visual_outputs), dim=0)
+        return visual_outputs
+
+    def get_rope_index(
+        self,
+        input_ids: torch.LongTensor,
+        image_grid_thw: Optional[torch.LongTensor] = None,
+        video_grid_thw: Optional[torch.LongTensor] = None,
+        second_per_grid_ts: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        mm_token_type_ids: Optional[torch.IntTensor] = None,
+        **kwargs,
+    ):
+        if mm_token_type_ids is None:
+            mm_token_type_ids = self._build_mm_token_type_ids(input_ids)
+        return self.model.get_rope_index(
+            input_ids=input_ids,
+            mm_token_type_ids=mm_token_type_ids,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
+            second_per_grid_ts=second_per_grid_ts,
+            attention_mask=attention_mask,
+            **kwargs,
+        )
 
     def forward(
         self,
@@ -133,10 +213,11 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         if inputs_embeds is None:
-            inputs_embeds = self.model.embed_tokens(input_ids)
+            inputs_embeds = self._embed_tokens(input_ids)
             if pixel_values is not None:
-                pixel_values = pixel_values.type(self.visual.dtype)
-                image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+                visual = self._get_visual()
+                pixel_values = pixel_values.type(visual.dtype)
+                image_embeds = self._extract_visual_features(visual(pixel_values, grid_thw=image_grid_thw))
                 n_image_tokens = (input_ids == self.config.image_token_id).sum().item()
                 n_image_features = image_embeds.shape[0]
                 if n_image_tokens != n_image_features:
@@ -153,8 +234,9 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
                 inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
             if pixel_values_videos is not None:
-                pixel_values_videos = pixel_values_videos.type(self.visual.dtype)
-                video_embeds = self.visual(pixel_values_videos, grid_thw=video_grid_thw)
+                visual = self._get_visual()
+                pixel_values_videos = pixel_values_videos.type(visual.dtype)
+                video_embeds = self._extract_visual_features(visual(pixel_values_videos, grid_thw=video_grid_thw))
                 n_video_tokens = (input_ids == self.config.video_token_id).sum().item()
                 n_video_features = video_embeds.shape[0]
                 if n_video_tokens != n_video_features:
@@ -327,14 +409,15 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
     def generate_latents(self, input_ids, pixel_values, image_grid_thw):
         input_ids.to(self.get_model().device)
         with torch.no_grad():
-            text_embeds = self.get_model().embed_tokens(input_ids)
+            text_embeds = self._embed_tokens(input_ids)
         latent_queries = self.get_model().latent_queries.repeat(text_embeds.shape[0], 1, 1)
         image_idx = input_ids == IMAGE_TOKEN_INDEX
         N_QUERY = self.get_n_query()
         input_ids = torch.cat([input_ids, torch.tensor([[TRAJ_TOKEN_INDEX] * N_QUERY]).to(input_ids.device)], dim=1)
 
-        pixel_values = pixel_values.type(self.visual.dtype)
-        image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw).unsqueeze(0)
+        visual = self._get_visual()
+        pixel_values = pixel_values.type(visual.dtype)
+        image_embeds = self._extract_visual_features(visual(pixel_values, grid_thw=image_grid_thw)).unsqueeze(0)
 
         text_embeds[image_idx] = image_embeds.to(text_embeds.device)[: image_idx.sum(), :]
 
