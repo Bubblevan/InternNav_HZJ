@@ -198,6 +198,94 @@ def _generate_latents_from_vllm_model(
         return hidden_states[-n_query:, :].unsqueeze(0).cpu()
 
 
+def _inspect_transformers_backend_model_tree(model) -> dict:
+    wrapper_type = type(model).__name__
+    wrapped = getattr(model, "model", None)
+    wrapped_type = type(wrapped).__name__ if wrapped is not None else None
+    inner = getattr(wrapped, "model", None)
+    inner_type = type(inner).__name__ if inner is not None else None
+
+    return {
+        "wrapper_type": wrapper_type,
+        "wrapped_type": wrapped_type,
+        "inner_type": inner_type,
+        "wrapper_has_generate_latents": hasattr(model, "generate_latents"),
+        "wrapped_has_generate_latents": hasattr(wrapped, "generate_latents") if wrapped is not None else False,
+        "wrapped_has_get_rope_index": hasattr(wrapped, "get_rope_index") if wrapped is not None else False,
+        "wrapped_has_visual": hasattr(wrapped, "visual") if wrapped is not None else False,
+        "wrapped_has_latent_queries": hasattr(wrapped, "latent_queries") if wrapped is not None else False,
+        "inner_has_latent_queries": hasattr(inner, "latent_queries") if inner is not None else False,
+    }
+
+
+def _generate_latents_via_transformers_backend_apply_model(
+    model,
+    full_output_ids_cpu,
+    pixel_values_cpu,
+    image_grid_thw_cpu,
+):
+    from internnav.model.basemodel.internvla_n1.internvla_n1 import InternVLAN1ForCausalLM
+
+    wrapped = getattr(model, "model", None)
+    if wrapped is None:
+        raise RuntimeError(f"Transformers backend wrapper has no .model attribute: {type(model)}")
+
+    if hasattr(wrapped, "generate_latents"):
+        target = wrapped
+        return target.generate_latents(
+            full_output_ids_cpu.to(next(target.parameters()).device),
+            pixel_values_cpu.to(next(target.parameters()).device),
+            image_grid_thw_cpu.to(next(target.parameters()).device),
+        ).detach().cpu()
+
+    class _GenerateLatentsAdapter:
+        class _ModelProxy:
+            def __init__(self, wrapped_model, wrapper_model):
+                self._wrapped_model = wrapped_model
+                self._wrapper_model = wrapper_model
+                self.embed_tokens = wrapped_model.language_model.get_input_embeddings()
+                self.latent_queries = wrapped_model.latent_queries
+                self.config = wrapped_model.config
+                self.device = next(wrapped_model.parameters()).device
+
+            def __call__(self, *args, **kwargs):
+                kwargs.setdefault("attention_instances", self._wrapper_model.attention_instances)
+                return self._wrapped_model(*args, **kwargs)
+
+            def get_rope_index(self, *args, **kwargs):
+                return self._wrapped_model.get_rope_index(*args, **kwargs)
+
+        def __init__(self, wrapped_model):
+            self.model = self._ModelProxy(wrapped_model, model)
+            self.visual = wrapped_model.visual
+
+        def get_model(self):
+            return self.model
+
+        def get_n_query(self):
+            return int(self.model.config.n_query)
+
+        def get_rope_index(self, *args, **kwargs):
+            return self.model.get_rope_index(*args, **kwargs)
+
+    adapter = _GenerateLatentsAdapter(wrapped)
+    device = next(wrapped.parameters()).device
+    try:
+        return InternVLAN1ForCausalLM.generate_latents(
+            adapter,
+            full_output_ids_cpu.to(device),
+            pixel_values_cpu.to(device),
+            image_grid_thw_cpu.to(device),
+        ).detach().cpu()
+    except Exception as exc:
+        raise RuntimeError(
+            "transformers_backend_apply_model reached HF generate_latents logic, "
+            "but the vLLM-backed forward still failed inside attention execution. "
+            "This indicates apply_model is not yet supplying the full forward "
+            "context / attention metadata expected by the transformers backend."
+        ) from exc
+
+
 def encode_tensor_to_b64(tensor: torch.Tensor) -> str:
     buf = io.BytesIO()
     torch.save(tensor.detach().cpu(), buf)
@@ -285,6 +373,8 @@ class DualVLNSingleVLLMRunner:
         gpu_memory_utilization: float = 0.45,
         limit_mm_per_prompt_image: int = 16,
         tensor_parallel_size: int = 1,
+        model_impl: str = "auto",
+        latent_backend: Optional[str] = None,
         trust_remote_code: bool = False,
         enforce_eager: bool = True,
         seed: int = 0,
@@ -298,6 +388,10 @@ class DualVLNSingleVLLMRunner:
         self.latent_queries = _load_latent_queries_tensor(self.hf_model_path)
         self.n_query = int(self.latent_queries.shape[0])
         self.traj_token_index = TRAJ_TOKEN_INDEX
+        self.model_impl = model_impl
+        self.latent_backend = latent_backend or (
+            "transformers_backend_apply_model" if model_impl == "transformers" else "legacy_custom_forward"
+        )
         self.sampling_params = SamplingParams(max_tokens=128, temperature=0.0)
         self.llm = LLM(
             model=model_path,
@@ -306,6 +400,7 @@ class DualVLNSingleVLLMRunner:
             max_model_len=max_model_len,
             gpu_memory_utilization=gpu_memory_utilization,
             limit_mm_per_prompt={"image": limit_mm_per_prompt_image},
+            model_impl=model_impl,
             trust_remote_code=trust_remote_code,
             enforce_eager=enforce_eager,
             seed=seed,
@@ -353,17 +448,29 @@ class DualVLNSingleVLLMRunner:
             ],
             dim=1,
         )
-        latents = self.llm.apply_model(
-            functools.partial(
-                _generate_latents_from_vllm_model,
-                prompt_token_ids=full_output_ids[0].tolist(),
-                pixel_values_cpu=hf_inputs.pixel_values.detach().cpu(),
-                image_grid_thw_cpu=hf_inputs.image_grid_thw.detach().cpu(),
-                latent_queries_cpu=self.latent_queries,
-                traj_token_index=self.traj_token_index,
-                n_query=self.n_query,
-            )
-        )[0]
+        if self.latent_backend == "transformers_backend_apply_model":
+            latents = self.llm.apply_model(
+                functools.partial(
+                    _generate_latents_via_transformers_backend_apply_model,
+                    full_output_ids_cpu=full_output_ids.detach().cpu(),
+                    pixel_values_cpu=hf_inputs.pixel_values.detach().cpu(),
+                    image_grid_thw_cpu=hf_inputs.image_grid_thw.detach().cpu(),
+                )
+            )[0]
+        elif self.latent_backend == "legacy_custom_forward":
+            latents = self.llm.apply_model(
+                functools.partial(
+                    _generate_latents_from_vllm_model,
+                    prompt_token_ids=full_output_ids[0].tolist(),
+                    pixel_values_cpu=hf_inputs.pixel_values.detach().cpu(),
+                    image_grid_thw_cpu=hf_inputs.image_grid_thw.detach().cpu(),
+                    latent_queries_cpu=self.latent_queries,
+                    traj_token_index=self.traj_token_index,
+                    n_query=self.n_query,
+                )
+            )[0]
+        else:
+            raise ValueError(f"Unsupported latent_backend: {self.latent_backend}")
 
         result["pixel_goal"] = [int(coord[1]), int(coord[0])]
         result["latents"] = latents

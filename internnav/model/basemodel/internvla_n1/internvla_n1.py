@@ -4,8 +4,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
-from diffusers.utils.torch_utils import randn_tensor
 from transformers import (
     Qwen2_5_VLConfig,
     Qwen2_5_VLForConditionalGeneration,
@@ -31,6 +29,15 @@ class InternVLAN1ModelConfig(Qwen2_5_VLConfig):
 
 class InternVLAN1Model(InternVLAN1MetaModel, Qwen2_5_VLModel):
     config_class = InternVLAN1ModelConfig
+    _vllm_ignore_unexpected_prefixes = [
+        "model.action_decoder.",
+        "model.action_encoder.",
+        "model.cond_projector.",
+        "model.memory_encoder.",
+        "model.rgb_model.",
+        "model.rgb_resampler.",
+        "model.traj_dit.",
+    ]
 
     def __init__(self, config: Qwen2_5_VLConfig):
         super(InternVLAN1Model, self).__init__(config)
@@ -357,6 +364,9 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
         num_sample_trajs: int = 32,
     ):
         if 'nextdit' in self.get_system1_type():
+            from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
+            from diffusers.utils.torch_utils import randn_tensor
+
             scheduler = FlowMatchEulerDiscreteScheduler()
             device = traj_latents.device
             dtype = traj_latents.dtype

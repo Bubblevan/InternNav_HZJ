@@ -71,6 +71,12 @@ def parse_args():
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.45)
     parser.add_argument("--limit-mm-per-prompt-image", type=int, default=16)
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
+    parser.add_argument("--model-impl", default="auto")
+    parser.add_argument(
+        "--latent-backend",
+        default=None,
+        help="Latent extraction backend. Defaults to transformers_backend_apply_model when --model-impl=transformers, otherwise legacy_custom_forward.",
+    )
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
@@ -88,6 +94,8 @@ if __name__ == "__main__":
         gpu_memory_utilization=args.gpu_memory_utilization,
         limit_mm_per_prompt_image=args.limit_mm_per_prompt_image,
         tensor_parallel_size=args.tensor_parallel_size,
+        model_impl=args.model_impl,
+        latent_backend=args.latent_backend,
         trust_remote_code=args.trust_remote_code,
         enforce_eager=args.enforce_eager,
         seed=args.seed,
@@ -96,6 +104,8 @@ if __name__ == "__main__":
         "[DualVLN Single vLLM] ready "
         f"model={args.model_path} "
         f"hf_model_path={args.hf_model_path or args.model_path} "
+        f"model_impl={args.model_impl} "
+        f"latent_backend={args.latent_backend or ('transformers_backend_apply_model' if args.model_impl == 'transformers' else 'legacy_custom_forward')} "
         f"served_model_name={served_model_name} "
         f"port={args.port}",
         flush=True,

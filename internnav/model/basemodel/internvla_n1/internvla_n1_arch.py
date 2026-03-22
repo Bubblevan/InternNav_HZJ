@@ -123,26 +123,33 @@ class InternVLAN1MetaModel:
         super(InternVLAN1MetaModel, self).__init__(config)
         if hasattr(config, "system1"):
             self.latent_queries = nn.Parameter(torch.randn(1, config.n_query, config.hidden_size))
+            try:
+                if 'nextdit' in config.system1:
+                    self.traj_dit, self.noise_scheduler = build_traj_dit(config)
+                    self.action_encoder = nn.Linear(3, 384, bias=True)
+                    self.pos_encoding = SinusoidalPositionalEncoding(384)
+                    self.action_decoder = nn.Linear(384, 3, bias=True)
+                    self.cond_projector = nn.Sequential(
+                        nn.Linear(3584, LatentEmbSize),
+                        nn.GELU(approximate="tanh"),
+                        nn.Linear(LatentEmbSize, LatentEmbSize),
+                    )
 
-            if 'nextdit' in config.system1:
-                self.traj_dit, self.noise_scheduler = build_traj_dit(config)
-                self.action_encoder = nn.Linear(3, 384, bias=True)
-                self.pos_encoding = SinusoidalPositionalEncoding(384)
-                self.action_decoder = nn.Linear(384, 3, bias=True)
-                self.cond_projector = nn.Sequential(
-                    nn.Linear(3584, LatentEmbSize), nn.GELU(approximate="tanh"), nn.Linear(LatentEmbSize, LatentEmbSize)
-                )
+                    if 'async' in config.system1:
+                        self.rgb_model = build_depthanythingv2(config)
+                        self.memory_encoder = MemoryEncoder()
+                        self.rgb_resampler = QFormer()
 
-                if 'async' in config.system1:
-                    self.rgb_model = build_depthanythingv2(config)
-                    self.memory_encoder = MemoryEncoder()
-                    self.rgb_resampler = QFormer()
-
-            elif 'navdp' in config.system1:
-                if 'async' in config.system1:
-                    self.navdp = build_navdp(config, memory_size=2)
-            else:
-                raise NotImplementedError
+                elif 'navdp' in config.system1:
+                    if 'async' in config.system1:
+                        self.navdp = build_navdp(config, memory_size=2)
+                else:
+                    raise NotImplementedError
+            except ModuleNotFoundError as exc:
+                # Allow S2-only / generate_latents-only runtimes to import the model
+                # without S1 dependencies like diffusers.
+                if exc.name != "diffusers":
+                    raise
 
         # 从 checkpoint 加载时 config 可能无 system1，但 forward 仍需要 latent_queries，故在此兜底创建
         if getattr(self, "latent_queries", None) is None:
