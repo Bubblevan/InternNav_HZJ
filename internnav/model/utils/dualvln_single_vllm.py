@@ -292,9 +292,9 @@ class DualVLNSingleVLLMRunner:
         from vllm import LLM, SamplingParams
 
         self.model_path = model_path
-        self.processor = AutoProcessor.from_pretrained(model_path)
-        self.processor.tokenizer.padding_side = "left"
         self.hf_model_path = hf_model_path or model_path
+        self.processor = AutoProcessor.from_pretrained(self.hf_model_path)
+        self.processor.tokenizer.padding_side = "left"
         self.latent_queries = _load_latent_queries_tensor(self.hf_model_path)
         self.n_query = int(self.latent_queries.shape[0])
         self.traj_token_index = TRAJ_TOKEN_INDEX
@@ -345,10 +345,18 @@ class DualVLNSingleVLLMRunner:
         input_images = extract_images_from_messages(messages)
         text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         hf_inputs = self.processor(text=[text], images=input_images, return_tensors="pt")
+        hf_generated_ids = self.processor.tokenizer.encode(llm_output, add_special_tokens=False)
+        full_output_ids = torch.cat(
+            [
+                hf_inputs.input_ids,
+                torch.tensor([hf_generated_ids], dtype=torch.long),
+            ],
+            dim=1,
+        )
         latents = self.llm.apply_model(
             functools.partial(
                 _generate_latents_from_vllm_model,
-                prompt_token_ids=prompt_token_ids + generated_token_ids,
+                prompt_token_ids=full_output_ids[0].tolist(),
                 pixel_values_cpu=hf_inputs.pixel_values.detach().cpu(),
                 image_grid_thw_cpu=hf_inputs.image_grid_thw.detach().cpu(),
                 latent_queries_cpu=self.latent_queries,
