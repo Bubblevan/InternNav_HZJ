@@ -1,0 +1,139 @@
+from __future__ import annotations
+
+from collections import defaultdict
+from dataclasses import dataclass
+from typing import Any
+
+import torch
+
+
+@dataclass
+class LatentsRequestBundle:
+    prompt_token_ids: list[int]
+    generated_token_ids: list[int]
+    full_output_token_ids: list[int]
+    full_output_ids: torch.Tensor
+    pixel_values: torch.Tensor
+    image_grid_thw: torch.Tensor
+    input_images: list[Any]
+    latent_queries: torch.Tensor
+    traj_token_index: int
+    n_query: int
+    prompt_embeds: torch.Tensor | None = None
+    mm_kwargs: Any | None = None
+    mm_hashes: Any | None = None
+    mm_placeholders: Any | None = None
+
+    @property
+    def prefill_token_ids(self) -> list[int]:
+        return self.full_output_token_ids + [self.traj_token_index] * self.n_query
+
+
+def build_latents_request_bundle(
+    *,
+    processor,
+    messages,
+    prompt_token_ids: list[int],
+    generated_token_ids: list[int],
+    input_images,
+    latent_queries: torch.Tensor,
+    traj_token_index: int,
+    n_query: int,
+) -> LatentsRequestBundle:
+    prompt_token_ids = list(prompt_token_ids)
+    generated_token_ids = list(generated_token_ids)
+    full_output_token_ids = prompt_token_ids + generated_token_ids
+    full_output_ids = torch.tensor([full_output_token_ids], dtype=torch.long)
+
+    text = processor.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    hf_inputs = processor(
+        text=[text],
+        images=input_images if input_images else None,
+        return_tensors="pt",
+    )
+
+    return LatentsRequestBundle(
+        prompt_token_ids=prompt_token_ids,
+        generated_token_ids=generated_token_ids,
+        full_output_token_ids=full_output_token_ids,
+        full_output_ids=full_output_ids,
+        pixel_values=hf_inputs.pixel_values.detach().cpu(),
+        image_grid_thw=hf_inputs.image_grid_thw.detach().cpu(),
+        input_images=list(input_images or []),
+        latent_queries=latent_queries.detach().cpu(),
+        traj_token_index=int(traj_token_index),
+        n_query=int(n_query),
+    )
+
+
+def build_latents_request_bundle_from_tensors(
+    *,
+    output_ids: torch.Tensor,
+    pixel_values: torch.Tensor,
+    image_grid_thw: torch.Tensor,
+    input_images,
+    latent_queries: torch.Tensor,
+    traj_token_index: int,
+    n_query: int,
+) -> LatentsRequestBundle:
+    if output_ids.ndim != 2 or output_ids.shape[0] != 1:
+        raise ValueError(f"Only batch size 1 is supported, got shape={tuple(output_ids.shape)}")
+
+    full_output_token_ids = output_ids[0].detach().cpu().tolist()
+    return LatentsRequestBundle(
+        prompt_token_ids=list(full_output_token_ids),
+        generated_token_ids=[],
+        full_output_token_ids=full_output_token_ids,
+        full_output_ids=output_ids.detach().cpu(),
+        pixel_values=pixel_values.detach().cpu(),
+        image_grid_thw=image_grid_thw.detach().cpu(),
+        input_images=list(input_images or []),
+        latent_queries=latent_queries.detach().cpu(),
+        traj_token_index=int(traj_token_index),
+        n_query=int(n_query),
+    )
+
+
+def attach_explicit_mm_metadata(bundle: LatentsRequestBundle, llm) -> LatentsRequestBundle:
+    if not bundle.input_images:
+        bundle.mm_kwargs = None
+        bundle.mm_hashes = None
+        bundle.mm_placeholders = None
+        return bundle
+
+    from vllm.pooling_params import PoolingParams
+
+    prompt = {
+        "prompt_token_ids": bundle.prefill_token_ids,
+        "multi_modal_data": {"image": bundle.input_images},
+    }
+    engine_request = llm.input_processor.process_inputs(
+        request_id="internnav-generate-latents-prefill",
+        prompt=prompt,
+        params=PoolingParams(task="token_embed"),
+        supported_tasks=llm.supported_tasks,
+    )
+
+    processed_prompt_token_ids = list(engine_request.prompt_token_ids or [])
+    if processed_prompt_token_ids != bundle.prefill_token_ids:
+        raise RuntimeError(
+            "vLLM preprocessor changed the canonical prefill token ids for generate_latents. "
+            "This breaks the strict HF-aligned latent contract."
+        )
+
+    mm_kwargs: dict[str, list[Any]] = defaultdict(list)
+    mm_hashes: dict[str, list[str]] = defaultdict(list)
+    mm_placeholders: dict[str, list[Any]] = defaultdict(list)
+    for mm_feature in engine_request.mm_features or []:
+        mm_kwargs[mm_feature.modality].append(mm_feature.data)
+        mm_hashes[mm_feature.modality].append(mm_feature.mm_hash)
+        mm_placeholders[mm_feature.modality].append(mm_feature.mm_position)
+
+    bundle.mm_kwargs = dict(mm_kwargs) if mm_kwargs else None
+    bundle.mm_hashes = dict(mm_hashes) if mm_hashes else None
+    bundle.mm_placeholders = dict(mm_placeholders) if mm_placeholders else None
+    return bundle

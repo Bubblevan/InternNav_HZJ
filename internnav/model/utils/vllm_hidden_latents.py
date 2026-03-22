@@ -10,6 +10,11 @@ import torch
 import requests as http_requests
 from PIL import Image
 
+from internnav.model.utils.latents_request import (
+    attach_explicit_mm_metadata,
+    build_latents_request_bundle_from_tensors,
+)
+
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
 
@@ -99,7 +104,7 @@ class VLLMHiddenLatentsRunner:
     def __init__(
         self,
         model_path: str,
-        dump_dir: str,
+        dump_dir: str | None = None,
         *,
         max_model_len: int = 4096,
         gpu_memory_utilization: float = 0.45,
@@ -110,8 +115,9 @@ class VLLMHiddenLatentsRunner:
         enforce_eager: bool = True,
     ):
         self.model_path = model_path
-        self.dump_dir = Path(dump_dir)
-        self.dump_dir.mkdir(parents=True, exist_ok=True)
+        self.dump_dir = None if dump_dir is None else Path(dump_dir)
+        if self.dump_dir is not None:
+            self.dump_dir.mkdir(parents=True, exist_ok=True)
         self.max_model_len = max_model_len
         self.gpu_memory_utilization = gpu_memory_utilization
         self.limit_mm_per_prompt_image = limit_mm_per_prompt_image
@@ -126,7 +132,8 @@ class VLLMHiddenLatentsRunner:
     def _ensure_llm(self):
         if self._llm is not None:
             return self._llm
-        _set_dump_env(self.dump_dir, self.dump_prefix)
+        if self.dump_dir is not None:
+            _set_dump_env(self.dump_dir, self.dump_prefix)
         from vllm import LLM
 
         self._llm = LLM(
@@ -145,6 +152,92 @@ class VLLMHiddenLatentsRunner:
         )
         return self._llm
 
+    def _load_hidden_states_from_dump(
+        self,
+        *,
+        start_ts: int,
+        end_ts: int,
+    ) -> torch.Tensor:
+        if self.dump_dir is None:
+            raise RuntimeError(
+                "vLLM did not return PoolingOutput.hidden_states and no dump_dir fallback "
+                "is configured for generate_latents."
+            )
+
+        records_post = _load_dump_records(
+            self.dump_dir,
+            self.dump_prefix,
+            "gpu_model_runner_actual_post_forward",
+        )
+        post_records = _window_records(records_post, start_ts, end_ts, "hidden_states")
+        post_agg = _aggregate_records(post_records, "hidden_states")
+        if post_agg is None:
+            raise RuntimeError(
+                "Failed to collect vLLM hidden states from either the official pooling "
+                "output or the debug dump fallback. Check patched vLLM hidden-state "
+                "return plumbing and dump_dir configuration."
+            )
+        return post_agg
+
+    def generate_latents_from_bundle(
+        self,
+        bundle,
+        *,
+        target_device=None,
+        target_dtype=None,
+    ):
+        with self._lock:
+            llm = self._ensure_llm()
+            attach_explicit_mm_metadata(bundle, llm)
+
+            prompt_embeds = llm.apply_model(
+                functools.partial(
+                    _build_hf_like_prompt_embeds,
+                    prompt_token_ids=bundle.prefill_token_ids,
+                    pixel_values_cpu=bundle.pixel_values,
+                    image_grid_thw_cpu=bundle.image_grid_thw,
+                    latent_queries_cpu=bundle.latent_queries,
+                )
+            )[0]
+            bundle.prompt_embeds = prompt_embeds
+
+            from vllm.inputs.data import EmbedsPrompt
+            from vllm.pooling_params import PoolingParams
+
+            prompt = EmbedsPrompt(
+                prompt_embeds=prompt_embeds,
+                prompt_token_ids=bundle.prefill_token_ids,
+                mm_kwargs=bundle.mm_kwargs,
+                mm_hashes=bundle.mm_hashes,
+                mm_placeholders=bundle.mm_placeholders,
+            )
+
+            start_ts = time.time_ns()
+            outputs = llm.encode(
+                [prompt],
+                pooling_params=PoolingParams(
+                    task="token_embed",
+                    return_raw_hidden_states=True,
+                ),
+                pooling_task="token_embed",
+                use_tqdm=False,
+            )
+            end_ts = time.time_ns()
+
+            hidden_states = getattr(outputs[0].outputs, "hidden_states", None)
+            if hidden_states is None:
+                hidden_states = self._load_hidden_states_from_dump(
+                    start_ts=start_ts,
+                    end_ts=end_ts,
+                )
+
+            latents = hidden_states[-bundle.n_query :, :]
+            if target_dtype is not None:
+                latents = latents.to(dtype=target_dtype)
+            if target_device is not None:
+                latents = latents.to(device=target_device)
+            return latents.unsqueeze(0)
+
     def generate_latents(
         self,
         *,
@@ -158,54 +251,20 @@ class VLLMHiddenLatentsRunner:
         target_device=None,
         target_dtype=None,
     ):
-        with self._lock:
-            if output_ids.ndim != 2 or output_ids.shape[0] != 1:
-                raise ValueError(f"Only batch size 1 is supported, got shape={tuple(output_ids.shape)}")
-
-            prompt_token_ids = output_ids[0].detach().cpu().tolist() + [traj_token_index] * n_query
-
-            llm = self._ensure_llm()
-            prompt_embeds = llm.apply_model(
-                functools.partial(
-                    _build_hf_like_prompt_embeds,
-                    prompt_token_ids=prompt_token_ids,
-                    pixel_values_cpu=pixel_values.detach().cpu(),
-                    image_grid_thw_cpu=image_grid_thw.detach().cpu(),
-                    latent_queries_cpu=latent_queries.detach().cpu(),
-                )
-            )[0]
-
-            from vllm.inputs.data import EmbedsPrompt
-
-            start_ts = time.time_ns()
-            llm.encode(
-                [
-                    EmbedsPrompt(
-                        prompt_embeds=prompt_embeds,
-                        prompt_token_ids=prompt_token_ids,
-                        multi_modal_data={"image": input_images} if input_images is not None else None,
-                    )
-                ],
-                pooling_task="token_embed",
-                use_tqdm=False,
-            )
-            end_ts = time.time_ns()
-
-            records_post = _load_dump_records(self.dump_dir, self.dump_prefix, "gpu_model_runner_actual_post_forward")
-            post_records = _window_records(records_post, start_ts, end_ts, "hidden_states")
-            post_agg = _aggregate_records(post_records, "hidden_states")
-            if post_agg is None:
-                raise RuntimeError(
-                    "Failed to collect vLLM hidden states from debug dump. "
-                    "Check patched vLLM dump hooks, dump_dir, and fixed runner dump_prefix lifecycle."
-                )
-
-            latents = post_agg[-n_query:, :]
-            if target_dtype is not None:
-                latents = latents.to(dtype=target_dtype)
-            if target_device is not None:
-                latents = latents.to(device=target_device)
-            return latents.unsqueeze(0)
+        bundle = build_latents_request_bundle_from_tensors(
+            output_ids=output_ids,
+            pixel_values=pixel_values,
+            image_grid_thw=image_grid_thw,
+            input_images=input_images,
+            latent_queries=latent_queries,
+            traj_token_index=traj_token_index,
+            n_query=n_query,
+        )
+        return self.generate_latents_from_bundle(
+            bundle,
+            target_device=target_device,
+            target_dtype=target_dtype,
+        )
 
 
 def encode_tensor_to_b64(tensor: torch.Tensor) -> str:

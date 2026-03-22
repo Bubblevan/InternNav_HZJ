@@ -13,6 +13,9 @@ from PIL import Image
 from safetensors.torch import load_file
 from transformers import AutoProcessor
 
+from internnav.model.utils.latents_request import build_latents_request_bundle
+from internnav.model.utils.vllm_hidden_latents import VLLMHiddenLatentsRunner
+
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
 
@@ -389,9 +392,18 @@ class DualVLNSingleVLLMRunner:
         self.n_query = int(self.latent_queries.shape[0])
         self.traj_token_index = TRAJ_TOKEN_INDEX
         self.model_impl = model_impl
-        self.latent_backend = latent_backend or (
-            "transformers_backend_apply_model" if model_impl == "transformers" else "legacy_custom_forward"
-        )
+        self.latent_backend = latent_backend or "vllm_hidden"
+        self._hidden_latents_runner = None
+        self._hidden_latents_runner_kwargs = {
+            "model_path": model_path,
+            "max_model_len": max_model_len,
+            "gpu_memory_utilization": gpu_memory_utilization,
+            "limit_mm_per_prompt_image": limit_mm_per_prompt_image,
+            "dtype": dtype,
+            "tensor_parallel_size": tensor_parallel_size,
+            "trust_remote_code": trust_remote_code,
+            "enforce_eager": enforce_eager,
+        }
         self.sampling_params = SamplingParams(max_tokens=128, temperature=0.0)
         self.llm = LLM(
             model=model_path,
@@ -406,6 +418,13 @@ class DualVLNSingleVLLMRunner:
             seed=seed,
             disable_log_stats=True,
         )
+
+    def _ensure_hidden_latents_runner(self):
+        if self._hidden_latents_runner is None:
+            self._hidden_latents_runner = VLLMHiddenLatentsRunner(
+                **self._hidden_latents_runner_kwargs,
+            )
+        return self._hidden_latents_runner
 
     def step_s2(self, messages, *, max_new_tokens: int = 128):
         from vllm import SamplingParams
@@ -438,37 +457,39 @@ class DualVLNSingleVLLMRunner:
             return result
 
         input_images = extract_images_from_messages(messages)
-        text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        hf_inputs = self.processor(text=[text], images=input_images, return_tensors="pt")
-        hf_generated_ids = self.processor.tokenizer.encode(llm_output, add_special_tokens=False)
-        full_output_ids = torch.cat(
-            [
-                hf_inputs.input_ids,
-                torch.tensor([hf_generated_ids], dtype=torch.long),
-            ],
-            dim=1,
+        bundle = build_latents_request_bundle(
+            processor=self.processor,
+            messages=messages,
+            prompt_token_ids=prompt_token_ids,
+            generated_token_ids=generated_token_ids,
+            input_images=input_images,
+            latent_queries=self.latent_queries,
+            traj_token_index=self.traj_token_index,
+            n_query=self.n_query,
         )
         if self.latent_backend == "transformers_backend_apply_model":
             latents = self.llm.apply_model(
                 functools.partial(
                     _generate_latents_via_transformers_backend_apply_model,
-                    full_output_ids_cpu=full_output_ids.detach().cpu(),
-                    pixel_values_cpu=hf_inputs.pixel_values.detach().cpu(),
-                    image_grid_thw_cpu=hf_inputs.image_grid_thw.detach().cpu(),
+                    full_output_ids_cpu=bundle.full_output_ids,
+                    pixel_values_cpu=bundle.pixel_values,
+                    image_grid_thw_cpu=bundle.image_grid_thw,
                 )
             )[0]
         elif self.latent_backend == "legacy_custom_forward":
             latents = self.llm.apply_model(
                 functools.partial(
                     _generate_latents_from_vllm_model,
-                    prompt_token_ids=full_output_ids[0].tolist(),
-                    pixel_values_cpu=hf_inputs.pixel_values.detach().cpu(),
-                    image_grid_thw_cpu=hf_inputs.image_grid_thw.detach().cpu(),
-                    latent_queries_cpu=self.latent_queries,
+                    prompt_token_ids=bundle.full_output_token_ids,
+                    pixel_values_cpu=bundle.pixel_values,
+                    image_grid_thw_cpu=bundle.image_grid_thw,
+                    latent_queries_cpu=bundle.latent_queries,
                     traj_token_index=self.traj_token_index,
                     n_query=self.n_query,
                 )
             )[0]
+        elif self.latent_backend == "vllm_hidden":
+            latents = self._ensure_hidden_latents_runner().generate_latents_from_bundle(bundle)
         else:
             raise ValueError(f"Unsupported latent_backend: {self.latent_backend}")
 

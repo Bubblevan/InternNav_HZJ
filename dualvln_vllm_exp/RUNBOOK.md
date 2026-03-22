@@ -5,6 +5,7 @@ This document records the code changes and the current execution status for:
 - `01_export_hf_prompt_embeds_bundle.py`
 - `02_vllm_prompt_embeds_smoketest.py`
 - `03_vllm_extract_hidden_states_from_prompt_embeds.py`
+- `05_compare_pooling_tasks.py`
 
 ## Goal
 
@@ -277,3 +278,105 @@ Interpretation:
 - vLLM successfully exported one requested hidden-state layer
   (`layer_id = 27`) for every prompt token.
 - The output format is `[num_tokens, num_selected_layers, hidden_size]`.
+
+## 05 Compare Pooling Tasks
+
+### Goal
+
+Use the local vLLM API exactly as exposed by this checkout and answer three
+questions with the smallest possible experiment surface:
+
+1. Does this version support `runner="pooling"`?
+2. Does this version support `prompt_embeds + LLM.encode(...)`?
+3. Which route actually returns token-wise tensors:
+   `pooling_task="token_embed"`, `pooling_task="embed"`, or `LLM.reward(...)`?
+
+### Local API probe
+
+From `dualvln_vllm_exp/00_probe_local_vllm_api.py`:
+
+- `LLM(...)` supports `runner="pooling"`.
+- `LLM.encode(...)` exists and accepts `pooling_task=...`.
+- Valid `pooling_task` values include `token_embed` and `embed`.
+- `LLM.reward(...)` exists as a method.
+- Constructor-side `convert=` only supports:
+  `auto`, `none`, `embed`, `classify`.
+
+Interpretation:
+
+- `reward` must be tested through `LLM.reward(...)`, not via
+  `convert="reward"`.
+- The cleanest pooling probe is:
+  `runner="pooling", convert="embed", enable_prompt_embeds=True`
+  plus prompt payload:
+  `prompt + prompt_token_ids + prompt_embeds`.
+
+### Code changes
+
+In `dualvln_vllm_exp/05_compare_pooling_tasks.py`:
+
+- Resolved the reference latent tensor from the bundle using:
+  `traj_latents`, `ref_traj_latents`, or `manual_traj_latents`.
+- Switched the probe matrix to three routes only:
+  `token_embed_encode`, `embed_encode`, `reward_call`.
+- Aligned the constructor with the probed signature:
+  `runner="pooling", convert="embed", enable_prompt_embeds=True`.
+- Tested reward through `LLM.reward(...)` instead of unsupported
+  constructor-side `convert="reward"`.
+- Added summary fields that directly answer whether pooling runner works,
+  whether `prompt_embeds + encode` works, and which routes are token-wise
+  versus vector-only.
+
+### Verified result
+
+Command:
+
+```bash
+python /root/backup/InternNav/dualvln_vllm_exp/05_compare_pooling_tasks.py \
+  --model-path /root/backup/InternNav/checkpoints/InternVLA-N1-DualVLN \
+  --bundle /root/backup/InternNav/logs/habitat/prompt_embeds_bundle_sample_0000.pt \
+  --out-json /root/backup/InternNav/logs/habitat/pooling_compare_sample_0000.json \
+  --dtype bfloat16 \
+  --max-model-len 4096 \
+  --trust-remote-code \
+  --enforce-eager
+```
+
+Output:
+
+- `logs/habitat/pooling_compare_sample_0000.json`
+
+Observed values:
+
+- `pooling_runner_supported = true`
+- `prompt_embeds_encode_supported = true`
+- `token_embed_returns_tokenwise = true`
+- `embed_returns_tokenwise = false`
+- `reward_supported = false`
+- `token_wise_routes = ["token_embed_encode"]`
+- `vector_routes = ["embed_encode"]`
+- `unsupported_routes = ["reward_call"]`
+
+Route details:
+
+- `token_embed_encode`
+  - `tensor_shape = [2077, 3584]`
+  - `tail_vs_ref.cosine = 0.7981945276260376`
+  - `best_window_vs_ref.start = 2073`
+  - `tail_is_best_window = true`
+- `embed_encode`
+  - `tensor_shape = [3584]`
+  - sequence-level vector, not token-wise
+- `reward_call`
+  - failed with:
+    `Unsupported task: 'token_classify' Supported tasks: ['token_embed', 'embed']`
+
+Interpretation:
+
+- Pooling runner is supported in this checkout.
+- `prompt_embeds + encode(...)` is supported.
+- The practical token-wise pooling route is `pooling_task="token_embed"`.
+- This route already outperforms the hidden-state layer sweep baseline
+  (`0.7982` vs `0.3297` cosine on the trajectory-token tail), so further
+  minimal validation should continue from pooling rather than blind layer
+  scanning.
