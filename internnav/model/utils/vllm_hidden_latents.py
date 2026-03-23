@@ -15,6 +15,9 @@ from internnav.model.utils.latents_request import (
     attach_explicit_mm_metadata,
     build_latents_request_bundle_from_tensors,
 )
+from internnav.model.utils.vllm_latents_alignment import (
+    build_prompt_embeds_with_mm_features,
+)
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
@@ -26,32 +29,41 @@ def _build_hf_like_prompt_embeds(
     pixel_values_cpu,
     image_grid_thw_cpu,
     latent_queries_cpu,
+    mm_features=None,
 ):
     device = next(model.parameters()).device
     input_ids = torch.tensor(prompt_token_ids, device=device, dtype=torch.long)
 
     with torch.inference_mode():
-        embeds = model.embed_input_ids(input_ids).clone()
-
-        if pixel_values_cpu is not None and image_grid_thw_cpu is not None:
-            pixel_values = pixel_values_cpu.to(device=device, dtype=model.visual.dtype)
-            image_grid_thw = image_grid_thw_cpu.to(device=device)
-            multimodal_embeddings = model.embed_multimodal(
-                pixel_values=pixel_values,
-                image_grid_thw=image_grid_thw,
+        if mm_features:
+            embeds = build_prompt_embeds_with_mm_features(
+                model=model,
+                input_ids=input_ids,
+                latent_queries=latent_queries_cpu,
+                mm_features=mm_features,
             )
-            flat_mm_embeddings = (
-                torch.cat(list(multimodal_embeddings), dim=0)
-                if multimodal_embeddings
-                else None
-            )
-            if flat_mm_embeddings is not None:
-                image_idx = input_ids == model.config.image_token_id
-                image_token_count = int(image_idx.sum().item())
-                embeds[image_idx] = flat_mm_embeddings[:image_token_count].to(embeds.dtype)
+        else:
+            embeds = model.embed_input_ids(input_ids).clone()
 
-        latent_queries = latent_queries_cpu.to(device=device, dtype=embeds.dtype)
-        embeds[-latent_queries.shape[0] :] = latent_queries
+            if pixel_values_cpu is not None and image_grid_thw_cpu is not None:
+                pixel_values = pixel_values_cpu.to(device=device, dtype=model.visual.dtype)
+                image_grid_thw = image_grid_thw_cpu.to(device=device)
+                multimodal_embeddings = model.embed_multimodal(
+                    pixel_values=pixel_values,
+                    image_grid_thw=image_grid_thw,
+                )
+                flat_mm_embeddings = (
+                    torch.cat(list(multimodal_embeddings), dim=0)
+                    if multimodal_embeddings
+                    else None
+                )
+                if flat_mm_embeddings is not None:
+                    image_idx = input_ids == model.config.image_token_id
+                    image_token_count = int(image_idx.sum().item())
+                    embeds[image_idx] = flat_mm_embeddings[:image_token_count].to(embeds.dtype)
+
+            latent_queries = latent_queries_cpu.to(device=device, dtype=embeds.dtype)
+            embeds[-latent_queries.shape[0] :] = latent_queries
 
     return embeds.cpu()
 
@@ -198,6 +210,7 @@ class VLLMHiddenLatentsRunner:
                     pixel_values_cpu=bundle.pixel_values,
                     image_grid_thw_cpu=bundle.image_grid_thw,
                     latent_queries_cpu=bundle.latent_queries,
+                    mm_features=bundle.mm_features,
                 )
             )[0]
             bundle.prompt_embeds = prompt_embeds
@@ -281,7 +294,7 @@ def decode_tensor_from_b64(payload: str) -> torch.Tensor:
 
 def encode_pil_image_to_b64(image: Image.Image) -> str:
     buf = io.BytesIO()
-    image.save(buf, format="JPEG", quality=90)
+    image.save(buf, format="PNG")
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 

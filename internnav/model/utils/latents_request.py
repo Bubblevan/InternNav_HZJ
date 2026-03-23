@@ -21,6 +21,7 @@ class LatentsRequestBundle:
     mm_kwargs: Optional[Any] = None
     mm_hashes: Optional[Any] = None
     mm_placeholders: Optional[Any] = None
+    mm_features: Optional[Any] = None
 
     @property
     def prefill_token_ids(self) -> List[int]:
@@ -101,6 +102,7 @@ def attach_explicit_mm_metadata(bundle: LatentsRequestBundle, llm) -> LatentsReq
         bundle.mm_kwargs = None
         bundle.mm_hashes = None
         bundle.mm_placeholders = None
+        bundle.mm_features = None
         return bundle
 
     from vllm.pooling_params import PoolingParams
@@ -134,4 +136,5 @@ def attach_explicit_mm_metadata(bundle: LatentsRequestBundle, llm) -> LatentsReq
     bundle.mm_kwargs = dict(mm_kwargs) if mm_kwargs else None
     bundle.mm_hashes = dict(mm_hashes) if mm_hashes else None
     bundle.mm_placeholders = dict(mm_placeholders) if mm_placeholders else None
+    bundle.mm_features = list(engine_request.mm_features or []) or None
     return bundle

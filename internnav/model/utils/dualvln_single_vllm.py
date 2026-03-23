@@ -13,7 +13,14 @@ from PIL import Image
 from safetensors.torch import load_file
 from transformers import AutoProcessor
 
-from internnav.model.utils.latents_request import build_latents_request_bundle
+from internnav.model.utils.latents_request import (
+    attach_explicit_mm_metadata,
+    build_latents_request_bundle,
+)
+from internnav.model.utils.vllm_latents_alignment import (
+    build_prompt_embeds_with_mm_features,
+    compute_mrope_positions_from_mm_features,
+)
 from internnav.model.utils.vllm_hidden_latents import VLLMHiddenLatentsRunner
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
@@ -156,6 +163,7 @@ def _generate_latents_from_vllm_model(
     latent_queries_cpu,
     traj_token_index,
     n_query,
+    mm_features=None,
 ):
     from vllm.config import set_current_vllm_config
     from vllm.forward_context import set_forward_context
@@ -170,32 +178,49 @@ def _generate_latents_from_vllm_model(
         vllm_config=vllm_config,
         num_tokens=input_ids.shape[1],
     ), torch.inference_mode():
-        embeds = model.embed_input_ids(input_ids[0]).clone()
+        if mm_features:
+            embeds = build_prompt_embeds_with_mm_features(
+                model=model,
+                input_ids=input_ids[0],
+                latent_queries=latent_queries_cpu,
+                mm_features=mm_features,
+            )
+        else:
+            embeds = model.embed_input_ids(input_ids[0]).clone()
 
-        if pixel_values_cpu is not None and image_grid_thw_cpu is not None:
-            pixel_values = pixel_values_cpu.to(device=device, dtype=model.visual.dtype)
-            image_grid_thw = image_grid_thw_cpu.to(device=device)
-            multimodal_embeddings = model.embed_multimodal(
-                pixel_values=pixel_values,
+            if pixel_values_cpu is not None and image_grid_thw_cpu is not None:
+                pixel_values = pixel_values_cpu.to(device=device, dtype=model.visual.dtype)
+                image_grid_thw = image_grid_thw_cpu.to(device=device)
+                multimodal_embeddings = model.embed_multimodal(
+                    pixel_values=pixel_values,
+                    image_grid_thw=image_grid_thw,
+                )
+                flat_mm_embeddings = torch.cat(list(multimodal_embeddings), dim=0) if multimodal_embeddings else None
+                if flat_mm_embeddings is not None:
+                    image_idx = input_ids[0] == model.config.image_token_id
+                    image_token_count = int(image_idx.sum().item())
+                    embeds[image_idx] = flat_mm_embeddings[:image_token_count].to(embeds.dtype)
+
+            latent_queries = latent_queries_cpu.to(device=device, dtype=embeds.dtype)
+            embeds[-latent_queries.shape[0] :] = latent_queries
+
+        position_ids = compute_mrope_positions_from_mm_features(
+            model=model,
+            prompt_token_ids=full_prompt_token_ids,
+            mm_features=mm_features,
+            device=device,
+        )
+        if position_ids is None:
+            image_grid_thw = image_grid_thw_cpu.to(device=device) if image_grid_thw_cpu is not None else None
+            position_ids, _ = _compute_qwen2_5_vl_rope_index(
+                input_ids,
+                config=model.config,
                 image_grid_thw=image_grid_thw,
             )
-            flat_mm_embeddings = torch.cat(list(multimodal_embeddings), dim=0) if multimodal_embeddings else None
-            if flat_mm_embeddings is not None:
-                image_idx = input_ids[0] == model.config.image_token_id
-                image_token_count = int(image_idx.sum().item())
-                embeds[image_idx] = flat_mm_embeddings[:image_token_count].to(embeds.dtype)
-
-        latent_queries = latent_queries_cpu.to(device=device, dtype=embeds.dtype)
-        embeds[-latent_queries.shape[0] :] = latent_queries
-
-        position_ids, _ = _compute_qwen2_5_vl_rope_index(
-            input_ids,
-            config=model.config,
-            image_grid_thw=image_grid_thw_cpu.to(device=device) if image_grid_thw_cpu is not None else None,
-        )
+            position_ids = position_ids[:, 0, :]
         hidden_states = model.forward(
             input_ids=None,
-            positions=position_ids[:, 0, :],
+            positions=position_ids,
             inputs_embeds=embeds,
         )
         return hidden_states[-n_query:, :].unsqueeze(0).cpu()
@@ -423,6 +448,7 @@ class DualVLNSingleVLLMRunner:
         )
 
     def _generate_latents_via_shared_engine(self, bundle):
+        attach_explicit_mm_metadata(bundle, self.llm)
         return self.llm.apply_model(
             functools.partial(
                 _generate_latents_from_vllm_model,
@@ -432,6 +458,7 @@ class DualVLNSingleVLLMRunner:
                 latent_queries_cpu=bundle.latent_queries,
                 traj_token_index=self.traj_token_index,
                 n_query=self.n_query,
+                mm_features=bundle.mm_features,
             )
         )[0]
 
