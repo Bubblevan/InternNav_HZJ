@@ -131,6 +131,7 @@ class InternVLAN1System1Runner(nn.Module):
         guidance_scale: float = 1.0,
         num_inference_steps: int = 10,
         num_sample_trajs: int = 32,
+        generator: Optional[torch.Generator] = None,
     ):
         if "nextdit" not in self.config.system1:
             raise NotImplementedError(f"Unsupported system1 type: {self.config.system1}")
@@ -164,7 +165,7 @@ class InternVLAN1System1Runner(nn.Module):
 
         latents = randn_tensor(
             shape=(batch_size * num_sample_trajs, latent_size, latent_channels),
-            generator=None,
+            generator=generator,
             device=device,
             dtype=dtype,
         )

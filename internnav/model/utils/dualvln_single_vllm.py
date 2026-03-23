@@ -302,7 +302,7 @@ def decode_tensor_from_b64(payload: str) -> torch.Tensor:
 
 def encode_pil_image_to_b64(image: Image.Image) -> str:
     buf = io.BytesIO()
-    image.save(buf, format="JPEG", quality=90)
+    image.save(buf, format="PNG")
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 

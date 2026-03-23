@@ -35,7 +35,7 @@ eval_cfg = EvalCfg(
     eval_type="habitat_vln",
     eval_settings={
         "output_path": "./logs/habitat/test_dual_system_vllm_server_smoke",
-        "save_video": False,
+        "save_video": True,
         "epoch": 0,
         "max_steps_per_episode": 500,
 

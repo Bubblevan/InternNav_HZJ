@@ -1,5 +1,6 @@
 import argparse
 import base64
+import hashlib
 import io
 import json
 import os
@@ -11,7 +12,7 @@ import copy
 import itertools
 import random
 import re
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 
 import cv2
 import habitat
@@ -127,6 +128,24 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
         # ------------------------------------- model ------------------------------------------
         self.model_args = argparse.Namespace(**cfg.agent.model_settings)
+        self.deterministic_seed = getattr(self.model_args, "deterministic_seed", None)
+        if self.deterministic_seed is not None:
+            random.seed(int(self.deterministic_seed))
+            np.random.seed(int(self.deterministic_seed))
+            torch.manual_seed(int(self.deterministic_seed))
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(int(self.deterministic_seed))
+        self.deterministic_conjunction_index = getattr(self.model_args, "deterministic_conjunction_index", None)
+        if self.deterministic_seed is not None and self.deterministic_conjunction_index is None:
+            self.deterministic_conjunction_index = 0
+        self.shadow_diff_enabled = bool(getattr(self.model_args, "shadow_diff_enabled", False))
+        self.shadow_diff_reference = getattr(self.model_args, "shadow_diff_reference", "hf")
+        self.shadow_diff_max_new_tokens = int(getattr(self.model_args, "shadow_diff_max_new_tokens", 128))
+        self._shadow_diff_model = None
+        self._shadow_diff_processor = None
+        self._shadow_diff_stage_counts = defaultdict(int)
+        self._shadow_diff_first_divergence = {}
+        self._shadow_diff_records = 0
         self._init_env_capabilities()
         self.dualvln_single_vllm_url = getattr(self.model_args, "dualvln_single_vllm_url", None)
         if self.dualvln_single_vllm_url is not None:
@@ -195,6 +214,50 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     "dualvln_single_vllm_url should disable local HF System-2 initialization. "
                     "Refusing to continue with an ambiguous fallback path."
                 )
+        if self.shadow_diff_enabled:
+            if not self.dualvln_single_vllm_url:
+                raise RuntimeError(
+                    "shadow_diff_enabled currently expects single-vLLM to be the primary online path. "
+                    "Set dualvln_single_vllm_url and keep HF as the shadow reference."
+                )
+            if self.shadow_diff_reference != "hf":
+                raise RuntimeError(
+                    f"Unsupported shadow_diff_reference={self.shadow_diff_reference!r}; only 'hf' is supported."
+                )
+            shadow_model_path = getattr(self.model_args, "shadow_diff_hf_model_path", self.model_args.model_path)
+            shadow_attn_backend = getattr(self.model_args, "shadow_diff_hf_attn_backend", "flash_attention_2")
+            shadow_processor_use_fast = getattr(self.model_args, "shadow_diff_hf_processor_use_fast", "auto")
+            shadow_processor_kwargs = {}
+            if shadow_processor_use_fast != "auto":
+                shadow_processor_kwargs["use_fast"] = shadow_processor_use_fast == "true"
+            self._shadow_diff_processor = AutoProcessor.from_pretrained(
+                shadow_model_path,
+                **shadow_processor_kwargs,
+            )
+            self._shadow_diff_processor.tokenizer.padding_side = 'left'
+            self._shadow_diff_model = InternVLAN1ForCausalLM.from_pretrained(
+                shadow_model_path,
+                torch_dtype=torch.bfloat16,
+                attn_implementation=shadow_attn_backend,
+                device_map={"": device},
+            )
+            self._shadow_diff_model.eval()
+            os.makedirs(self.output_path, exist_ok=True)
+            self._shadow_diff_details_path = os.path.join(
+                self.output_path,
+                f"shadow_diff_decisions_rank{self.local_rank}.jsonl",
+            )
+            self._shadow_diff_summary_path = os.path.join(
+                self.output_path,
+                f"shadow_diff_summary_rank{self.local_rank}.json",
+            )
+            for path in (self._shadow_diff_details_path, self._shadow_diff_summary_path):
+                if os.path.exists(path):
+                    os.remove(path)
+            print(
+                "[HabitatVLNEvaluator] Shadow diff enabled: "
+                f"primary=single-vLLM shadow=HF({shadow_model_path})"
+            )
 
         # refactor: this part used in three places
         prompt = "You are an autonomous navigation assistant. Your task is to <instruction>. Where should you go next to stay on track? Please output the next waypoint\'s coordinates in the image. Please output STOP when you have successfully completed the task."
@@ -345,11 +408,249 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             if max_eval_episodes is not None and "max_eval_episodes" in dataset_cfg:
                 dataset_cfg.max_eval_episodes = int(max_eval_episodes)
 
+    def _choose_conjunction(self):
+        if self.deterministic_conjunction_index is None:
+            return random.choice(self.conjunctions)
+        index = int(self.deterministic_conjunction_index) % len(self.conjunctions)
+        return self.conjunctions[index]
+
+    def _make_step_seed(self, scene_id, episode_id, step_id, salt):
+        if self.deterministic_seed is None:
+            return None
+        payload = f"{int(self.deterministic_seed)}:{scene_id}:{int(episode_id)}:{int(step_id)}:{int(salt)}"
+        return int(hashlib.sha256(payload.encode("utf-8")).hexdigest()[:8], 16)
+
+    def _make_system1_generator(self, scene_id, episode_id, step_id, salt):
+        seed = self._make_step_seed(scene_id, episode_id, step_id, salt)
+        if seed is None:
+            return None, None
+        generator = torch.Generator(device=self.device.type)
+        generator.manual_seed(int(seed))
+        return generator, int(seed)
+
+    @staticmethod
+    def _tensor_norm(tensor):
+        return float(tensor.detach().float().norm().item())
+
+    def _tensor_diff_report(self, lhs, rhs):
+        lhs_cpu = lhs.detach().float().cpu()
+        rhs_cpu = rhs.detach().float().cpu()
+        diff = (lhs_cpu - rhs_cpu).abs()
+        cosine = None
+        if lhs_cpu.numel() > 0 and rhs_cpu.numel() > 0:
+            cosine = float(torch.nn.functional.cosine_similarity(lhs_cpu.reshape(1, -1), rhs_cpu.reshape(1, -1)).item())
+        return {
+            "lhs_norm": self._tensor_norm(lhs_cpu),
+            "rhs_norm": self._tensor_norm(rhs_cpu),
+            "max_abs_diff": float(diff.max().item()) if diff.numel() else 0.0,
+            "mean_abs_diff": float(diff.mean().item()) if diff.numel() else 0.0,
+            "cosine_similarity": cosine,
+        }
+
+    @staticmethod
+    def _serialize_shadow_messages(messages):
+        serialized = []
+        for message in messages:
+            content = []
+            for item in message["content"]:
+                if item["type"] == "text":
+                    content.append({"type": "text", "text": item["text"]})
+                    continue
+                image = item["image"]
+                buf = io.BytesIO()
+                image.save(buf, format="PNG")
+                raw = buf.getvalue()
+                content.append(
+                    {
+                        "type": "image",
+                        "size": [int(image.width), int(image.height)],
+                        "sha256": hashlib.sha256(raw).hexdigest(),
+                    }
+                )
+            serialized.append({"role": message["role"], "content": content})
+        return serialized
+
+    @staticmethod
+    def _parse_pixel_goal_from_text(output_text):
+        if not bool(re.search(r"\d", output_text)):
+            return None
+        coord = [int(c) for c in re.findall(r"\d+", output_text)]
+        if len(coord) < 2:
+            return None
+        return [int(coord[1]), int(coord[0])]
+
+    def _plan_local_actions_prefix(
+        self,
+        traj_latents,
+        look_down_image,
+        look_down_depth,
+        scene_id,
+        episode_id,
+        step_id,
+        *,
+        salt=17,
+    ):
+        image_dp = torch.tensor(np.array(look_down_image.resize((224, 224)))).to(torch.bfloat16) / 255
+        images_dp = torch.stack([image_dp, image_dp]).unsqueeze(0).to(self.device)
+        depth_dp = look_down_depth.unsqueeze(-1).to(torch.bfloat16)
+        depths_dp = torch.stack([depth_dp, depth_dp]).unsqueeze(0).to(self.device)
+        generator, seed = self._make_system1_generator(scene_id, episode_id, step_id, salt)
+
+        with torch.no_grad():
+            dp_actions = self.model.generate_traj(
+                traj_latents,
+                images_dp,
+                depths_dp,
+                generator=generator,
+            )
+
+        action_list = traj_to_actions(dp_actions)
+        if len(action_list) < MAX_STEPS:
+            action_list = list(action_list) + [0] * (MAX_STEPS - len(action_list))
+        return {
+            "seed": seed,
+            "action_prefix": [int(action) for action in action_list[:MAX_LOCAL_STEPS]],
+            "dp_actions_shape": list(dp_actions.shape),
+        }
+
+    def _run_shadow_hf_reference(self, messages):
+        if self._shadow_diff_model is None or self._shadow_diff_processor is None:
+            return None
+        text = self._shadow_diff_processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        input_images = []
+        for message in messages:
+            for item in message["content"]:
+                if item["type"] == "image":
+                    input_images.append(item["image"])
+        inputs = self._shadow_diff_processor(text=[text], images=input_images, return_tensors="pt").to(self.device)
+        with torch.no_grad():
+            output_ids = self._shadow_diff_model.generate(
+                **inputs,
+                max_new_tokens=self.shadow_diff_max_new_tokens,
+                do_sample=False,
+                use_cache=True,
+                past_key_values=None,
+                return_dict_in_generate=True,
+            ).sequences
+        output_text = self._shadow_diff_processor.tokenizer.decode(
+            output_ids[0][inputs.input_ids.shape[1] :],
+            skip_special_tokens=True,
+        )
+        pixel_goal = self._parse_pixel_goal_from_text(output_text)
+        traj_latents = None
+        if pixel_goal is not None:
+            image_grid_thw = torch.cat([thw.unsqueeze(0) for thw in inputs.image_grid_thw], dim=0)
+            with torch.no_grad():
+                traj_latents = self._shadow_diff_model.generate_latents(
+                    output_ids,
+                    inputs.pixel_values,
+                    image_grid_thw,
+                )
+        return {
+            "prompt_text": text,
+            "prompt_token_ids": inputs.input_ids[0].detach().cpu().tolist(),
+            "generated_token_ids": output_ids[0][inputs.input_ids.shape[1] :].detach().cpu().tolist(),
+            "output_ids": output_ids[0].detach().cpu().tolist(),
+            "llm_output": output_text,
+            "pixel_goal": pixel_goal,
+            "traj_latents": traj_latents,
+        }
+
+    def _classify_shadow_diff_stage(self, primary_record, reference_record, latent_diff, primary_local_plan, reference_local_plan):
+        if primary_record["prompt_token_ids"] != reference_record["prompt_token_ids"]:
+            return "prompt_token_ids"
+        if primary_record["generated_token_ids"] != reference_record["generated_token_ids"]:
+            return "generated_token_ids"
+        if primary_record["llm_output"] != reference_record["llm_output"]:
+            return "s2_text"
+        if primary_record["pixel_goal"] != reference_record["pixel_goal"]:
+            return "pixel_goal"
+        if latent_diff is not None:
+            cosine = latent_diff.get("cosine_similarity")
+            if latent_diff["max_abs_diff"] > 1e-4 or (cosine is not None and cosine < 0.9999):
+                return "latent"
+        primary_actions = None if primary_local_plan is None else primary_local_plan["action_prefix"]
+        reference_actions = None if reference_local_plan is None else reference_local_plan["action_prefix"]
+        if primary_actions is not None and reference_actions is not None and primary_actions != reference_actions:
+            return "system1_rollout"
+        return "match"
+
+    def _record_shadow_diff(
+        self,
+        *,
+        scene_id,
+        episode_id,
+        step_id,
+        messages,
+        history_indices,
+        is_lookdown_followup,
+        primary_record,
+        reference_record,
+        latent_diff,
+        primary_local_plan,
+        reference_local_plan,
+    ):
+        if not self.shadow_diff_enabled:
+            return
+        stage = self._classify_shadow_diff_stage(
+            primary_record,
+            reference_record,
+            latent_diff,
+            primary_local_plan,
+            reference_local_plan,
+        )
+        record = {
+            "scene_id": scene_id,
+            "episode_id": int(episode_id),
+            "step_id": int(step_id),
+            "history_frame_indices": list(history_indices),
+            "is_lookdown_followup": bool(is_lookdown_followup),
+            "messages": self._serialize_shadow_messages(messages),
+            "primary_backend": "single_vllm",
+            "reference_backend": "hf",
+            "primary": primary_record,
+            "reference": reference_record,
+            "latent_diff": latent_diff,
+            "primary_local_plan": primary_local_plan,
+            "reference_local_plan": reference_local_plan,
+            "earliest_divergence_stage": stage,
+        }
+        episode_key = f"{scene_id}:{int(episode_id)}"
+        if stage != "match" and episode_key not in self._shadow_diff_first_divergence:
+            self._shadow_diff_first_divergence[episode_key] = {
+                "scene_id": scene_id,
+                "episode_id": int(episode_id),
+                "step_id": int(step_id),
+                "stage": stage,
+                "primary_output": primary_record["llm_output"],
+                "reference_output": reference_record["llm_output"],
+            }
+        self._shadow_diff_stage_counts[stage] += 1
+        self._shadow_diff_records += 1
+        with open(self._shadow_diff_details_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def _write_shadow_diff_summary(self):
+        if not self.shadow_diff_enabled:
+            return
+        summary = {
+            "metadata": {
+                "primary_backend": "single_vllm",
+                "reference_backend": "hf",
+                "records": int(self._shadow_diff_records),
+                "details_path": self._shadow_diff_details_path,
+            },
+            "stage_counts": dict(self._shadow_diff_stage_counts),
+            "first_divergence": self._shadow_diff_first_divergence,
+        }
+        with open(self._shadow_diff_summary_path, "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2, ensure_ascii=False)
+
     @staticmethod
     def _pil_to_data_url(image):
         buf = io.BytesIO()
-        image.save(buf, format="JPEG", quality=90)
-        return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()
+        image.save(buf, format="PNG")
+        return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
 
     def _conversation_to_openai(self, messages):
         out = []
@@ -406,9 +707,12 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             )
         raise ValueError(f"Unsupported generate_latents backend: {self.generate_latents_backend}")
 
-    def _generate_traj(self, traj_latents, images_dp, depths_dp):
+    def _generate_traj(self, traj_latents, images_dp, depths_dp, scene_id=None, episode_id=None, step_id=None, salt=17):
+        generator = None
+        if scene_id is not None and episode_id is not None and step_id is not None:
+            generator, _ = self._make_system1_generator(scene_id, episode_id, step_id, salt)
         with torch.no_grad():
-            return self.model.generate_traj(traj_latents, images_dp, depths_dp)
+            return self.model.generate_traj(traj_latents, images_dp, depths_dp, generator=generator)
 
     def _init_env_capabilities(self):
         lab_sensors = getattr(self.config.habitat.task, "lab_sensors", None)
@@ -662,7 +966,14 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         self.env.step(action_code.LOOKUP)
 
                 if len(action_seq) == 0 and pixel_goal is None:
-                    if self.has_pitch_actions and action == action_code.LOOKDOWN:
+                    is_lookdown_followup = bool(self.has_pitch_actions and action == action_code.LOOKDOWN)
+                    history_id = []
+                    single_vllm_result = None
+                    primary_local_plan = None
+                    reference_local_plan = None
+                    reference_record = None
+                    latent_diff = None
+                    if is_lookdown_followup:
                         # last action is look down
                         sources = [{"from": "human", "value": ""}, {"from": "gpt", "value": ""}]
                         input_images += [look_down_image]
@@ -689,7 +1000,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         input_images = [rgb_list[i] for i in history_id] + cur_images
                         input_img_id = 0
 
-                    prompt = random.choice(self.conjunctions) + DEFAULT_IMAGE_TOKEN
+                    prompt = self._choose_conjunction() + DEFAULT_IMAGE_TOKEN
                     sources[0]["value"] += f" {prompt}."
                     prompt_instruction = copy.deepcopy(sources[0]["value"])
                     parts = split_and_clean(prompt_instruction)
@@ -773,7 +1084,14 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             pix_goal_depth = copy.copy(depth_dp)
                             depths_dp = torch.stack([pix_goal_depth, depth_dp]).unsqueeze(0).to(self.device)
 
-                            dp_actions = self._generate_traj(traj_latents, images_dp, depths_dp)
+                            dp_actions = self._generate_traj(
+                                traj_latents,
+                                images_dp,
+                                depths_dp,
+                                scene_id=scene_id,
+                                episode_id=episode_id,
+                                step_id=step_id,
+                            )
 
                             action_list = traj_to_actions(dp_actions)
                             if len(action_list) < MAX_STEPS:
@@ -782,6 +1100,11 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             local_actions = action_list
                             if len(local_actions) >= MAX_LOCAL_STEPS:
                                 local_actions = local_actions[:MAX_LOCAL_STEPS]
+                            primary_local_plan = {
+                                "seed": self._make_step_seed(scene_id, episode_id, step_id, 17),
+                                "action_prefix": [int(a) for a in local_actions],
+                                "dp_actions_shape": list(dp_actions.shape),
+                            }
 
                             action = local_actions[0]
                             if action == action_code.STOP:
@@ -798,6 +1121,50 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         action_seq = self.parse_actions(llm_outputs)
                         print('actions', action_seq, flush=True)
 
+                    if self.shadow_diff_enabled and single_vllm_result is not None:
+                        reference_record = self._run_shadow_hf_reference(messages)
+                        if reference_record is not None and reference_record.get("traj_latents") is not None:
+                            reference_local_plan = self._plan_local_actions_prefix(
+                                reference_record["traj_latents"],
+                                look_down_image,
+                                look_down_depth,
+                                scene_id,
+                                episode_id,
+                                step_id,
+                            )
+                        if traj_latents is not None and reference_record is not None and reference_record.get("traj_latents") is not None:
+                            latent_diff = self._tensor_diff_report(
+                                traj_latents[0],
+                                reference_record["traj_latents"][0],
+                            )
+                        primary_record = {
+                            "prompt_token_ids": list(single_vllm_result.get("prompt_token_ids") or []),
+                            "generated_token_ids": list(single_vllm_result.get("generated_token_ids") or []),
+                            "output_ids": list(single_vllm_result.get("prompt_token_ids") or []) + list(single_vllm_result.get("generated_token_ids") or []),
+                            "llm_output": llm_outputs,
+                            "pixel_goal": single_vllm_result.get("pixel_goal"),
+                        }
+                        reference_payload = {
+                            "prompt_token_ids": reference_record["prompt_token_ids"],
+                            "generated_token_ids": reference_record["generated_token_ids"],
+                            "output_ids": reference_record["output_ids"],
+                            "llm_output": reference_record["llm_output"],
+                            "pixel_goal": reference_record["pixel_goal"],
+                        }
+                        self._record_shadow_diff(
+                            scene_id=scene_id,
+                            episode_id=episode_id,
+                            step_id=step_id,
+                            messages=messages,
+                            history_indices=history_id,
+                            is_lookdown_followup=is_lookdown_followup,
+                            primary_record=primary_record,
+                            reference_record=reference_payload,
+                            latent_diff=latent_diff,
+                            primary_local_plan=primary_local_plan,
+                            reference_local_plan=reference_local_plan,
+                        )
+
                 if len(action_seq) != 0:
                     action = action_seq[0]
                     action_seq.pop(0)
@@ -811,7 +1178,14 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         depth_dp = look_down_depth.unsqueeze(-1).to(torch.bfloat16)
 
                         depths_dp = torch.stack([pix_goal_depth, depth_dp]).unsqueeze(0).to(self.device)
-                        dp_actions = self._generate_traj(traj_latents, images_dp, depths_dp)
+                        dp_actions = self._generate_traj(
+                            traj_latents,
+                            images_dp,
+                            depths_dp,
+                            scene_id=scene_id,
+                            episode_id=episode_id,
+                            step_id=step_id,
+                        )
 
                         action_list = traj_to_actions(dp_actions)
                         if len(action_list) < MAX_STEPS:
@@ -946,6 +1320,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             vis_frames.clear()
 
         self.env.close()
+        self._write_shadow_diff_summary()
 
         return (
             torch.tensor(sucs).to(self.device),
@@ -1100,7 +1475,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         input_images = [rgb_list[i] for i in history_id] + cur_images
                         input_img_id = 0
 
-                    prompt = random.choice(self.conjunctions) + DEFAULT_IMAGE_TOKEN
+                    prompt = self._choose_conjunction() + DEFAULT_IMAGE_TOKEN
                     sources[0]["value"] += f" {prompt}."
                     prompt_instruction = copy.deepcopy(sources[0]["value"])
                     parts = split_and_clean(prompt_instruction)

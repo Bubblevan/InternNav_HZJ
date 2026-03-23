@@ -71,6 +71,10 @@ class InternVLAN1Model(InternVLAN1MetaModel, Qwen2_5_VLModel):
     def __init__(self, config: Qwen2_5_VLConfig):
         super(InternVLAN1Model, self).__init__(config)
 
+    if hasattr(Qwen2_5_VLModel, "get_rope_index"):
+        def get_rope_index(self, *args, **kwargs):
+            return super().get_rope_index(*args, **kwargs)
+
 
 class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1MetaForCausalLM):
     config_class = InternVLAN1ModelConfig
@@ -130,16 +134,26 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
         mm_token_type_ids: Optional[torch.IntTensor] = None,
         **kwargs,
     ):
-        if mm_token_type_ids is None:
-            mm_token_type_ids = self._build_mm_token_type_ids(input_ids)
-        return self.model.get_rope_index(
+        model_get_rope_index = getattr(self.model, "get_rope_index", None)
+        if callable(model_get_rope_index):
+            if mm_token_type_ids is None:
+                mm_token_type_ids = self._build_mm_token_type_ids(input_ids)
+            return model_get_rope_index(
+                input_ids=input_ids,
+                mm_token_type_ids=mm_token_type_ids,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                second_per_grid_ts=second_per_grid_ts,
+                attention_mask=attention_mask,
+                **kwargs,
+            )
+        return Qwen2_5_VLForConditionalGeneration.get_rope_index(
+            self,
             input_ids=input_ids,
-            mm_token_type_ids=mm_token_type_ids,
             image_grid_thw=image_grid_thw,
             video_grid_thw=video_grid_thw,
             second_per_grid_ts=second_per_grid_ts,
             attention_mask=attention_mask,
-            **kwargs,
         )
 
     def forward(
@@ -445,6 +459,7 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
         guidance_scale: float = 1.0,
         num_inference_steps: int = 10,
         num_sample_trajs: int = 32,
+        generator: Optional[torch.Generator] = None,
     ):
         if 'nextdit' in self.get_system1_type():
             from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
@@ -481,7 +496,7 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
 
             latents = randn_tensor(
                 shape=(batch_size * num_sample_trajs, latent_size, latent_channels),
-                generator=None,
+                generator=generator,
                 device=device,
                 dtype=dtype,
             )
