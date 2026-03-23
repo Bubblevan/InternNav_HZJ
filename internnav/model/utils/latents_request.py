@@ -28,6 +28,60 @@ class LatentsRequestBundle:
         return self.full_output_token_ids + [self.traj_token_index] * self.n_query
 
 
+def attach_explicit_mm_metadata_from_processed_inputs(
+    bundle: LatentsRequestBundle,
+    processed_inputs,
+) -> LatentsRequestBundle:
+    if not bundle.input_images:
+        bundle.mm_kwargs = None
+        bundle.mm_hashes = None
+        bundle.mm_placeholders = None
+        bundle.mm_features = None
+        return bundle
+
+    if processed_inputs.get("type") != "multimodal":
+        raise RuntimeError(
+            "Expected vLLM chat preprocessing to return multimodal inputs, "
+            f"got type={processed_inputs.get('type')!r}."
+        )
+
+    processed_prompt_token_ids = list(processed_inputs.get("prompt_token_ids") or [])
+    if processed_prompt_token_ids != bundle.prompt_token_ids:
+        raise RuntimeError(
+            "vLLM chat preprocessing prompt_token_ids do not match the canonical "
+            "request_output.prompt_token_ids used by single-vLLM."
+        )
+
+    bundle.mm_kwargs = processed_inputs.get("mm_kwargs")
+    bundle.mm_hashes = processed_inputs.get("mm_hashes")
+    bundle.mm_placeholders = processed_inputs.get("mm_placeholders")
+
+    from vllm.multimodal.inputs import MultiModalFeatureSpec
+    from vllm.multimodal.utils import argsort_mm_positions
+
+    mm_features = []
+    mm_kwargs = bundle.mm_kwargs or {}
+    mm_hashes = bundle.mm_hashes or {}
+    mm_placeholders = bundle.mm_placeholders or {}
+    for modality, idx in argsort_mm_positions(mm_placeholders):
+        item_hash = mm_hashes[modality][idx]
+        item_data = mm_kwargs[modality][idx]
+        if item_data is None:
+            bundle.mm_features = None
+            return bundle
+        mm_features.append(
+            MultiModalFeatureSpec(
+                data=item_data,
+                modality=modality,
+                identifier=item_hash,
+                mm_position=mm_placeholders[modality][idx],
+                mm_hash=item_hash,
+            )
+        )
+    bundle.mm_features = mm_features or None
+    return bundle
+
+
 def build_latents_request_bundle(
     *,
     processor,
@@ -98,6 +152,14 @@ def build_latents_request_bundle_from_tensors(
 
 
 def attach_explicit_mm_metadata(bundle: LatentsRequestBundle, llm) -> LatentsRequestBundle:
+    if (
+        bundle.mm_kwargs is not None
+        and bundle.mm_hashes is not None
+        and bundle.mm_placeholders is not None
+        and bundle.mm_features is not None
+    ):
+        return bundle
+
     if not bundle.input_images:
         bundle.mm_kwargs = None
         bundle.mm_hashes = None

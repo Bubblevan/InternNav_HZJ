@@ -14,7 +14,7 @@ from safetensors.torch import load_file
 from transformers import AutoProcessor
 
 from internnav.model.utils.latents_request import (
-    attach_explicit_mm_metadata,
+    attach_explicit_mm_metadata_from_processed_inputs,
     build_latents_request_bundle,
 )
 from internnav.model.utils.vllm_latents_alignment import (
@@ -448,7 +448,6 @@ class DualVLNSingleVLLMRunner:
         )
 
     def _generate_latents_via_shared_engine(self, bundle):
-        attach_explicit_mm_metadata(bundle, self.llm)
         return self.llm.apply_model(
             functools.partial(
                 _generate_latents_from_vllm_model,
@@ -471,11 +470,15 @@ class DualVLNSingleVLLMRunner:
 
     def step_s2(self, messages, *, max_new_tokens: int = 128):
         from vllm import SamplingParams
+        from vllm.outputs import RequestOutput
 
         vllm_messages = to_vllm_chat_messages(messages)
-        outputs = self.llm.chat(
-            vllm_messages,
-            SamplingParams(max_tokens=max_new_tokens, temperature=0.0),
+        processed_prompt = self.llm._preprocess_chat_one(vllm_messages)
+        sampling_params = SamplingParams(max_tokens=max_new_tokens, temperature=0.0)
+        outputs = self.llm._render_and_run_requests(
+            prompts=(processed_prompt,),
+            params=[sampling_params],
+            output_type=RequestOutput,
             use_tqdm=False,
         )
         request_output = outputs[0]
@@ -510,6 +513,7 @@ class DualVLNSingleVLLMRunner:
             traj_token_index=self.traj_token_index,
             n_query=self.n_query,
         )
+        attach_explicit_mm_metadata_from_processed_inputs(bundle, processed_prompt)
         if self.latent_backend == "transformers_backend_apply_model":
             latents = self.llm.apply_model(
                 functools.partial(
