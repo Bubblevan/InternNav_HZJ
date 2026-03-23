@@ -1,31 +1,29 @@
-from __future__ import annotations
-
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Dict, List, Optional
 
 import torch
 
 
 @dataclass
 class LatentsRequestBundle:
-    prompt_token_ids: list[int]
-    generated_token_ids: list[int]
-    full_output_token_ids: list[int]
+    prompt_token_ids: List[int]
+    generated_token_ids: List[int]
+    full_output_token_ids: List[int]
     full_output_ids: torch.Tensor
     pixel_values: torch.Tensor
     image_grid_thw: torch.Tensor
-    input_images: list[Any]
+    input_images: List[Any]
     latent_queries: torch.Tensor
     traj_token_index: int
     n_query: int
-    prompt_embeds: torch.Tensor | None = None
-    mm_kwargs: Any | None = None
-    mm_hashes: Any | None = None
-    mm_placeholders: Any | None = None
+    prompt_embeds: Optional[torch.Tensor] = None
+    mm_kwargs: Optional[Any] = None
+    mm_hashes: Optional[Any] = None
+    mm_placeholders: Optional[Any] = None
 
     @property
-    def prefill_token_ids(self) -> list[int]:
+    def prefill_token_ids(self) -> List[int]:
         return self.full_output_token_ids + [self.traj_token_index] * self.n_query
 
 
@@ -33,8 +31,8 @@ def build_latents_request_bundle(
     *,
     processor,
     messages,
-    prompt_token_ids: list[int],
-    generated_token_ids: list[int],
+    prompt_token_ids: List[int],
+    generated_token_ids: List[int],
     input_images,
     latent_queries: torch.Tensor,
     traj_token_index: int,
@@ -125,9 +123,9 @@ def attach_explicit_mm_metadata(bundle: LatentsRequestBundle, llm) -> LatentsReq
             "This breaks the strict HF-aligned latent contract."
         )
 
-    mm_kwargs: dict[str, list[Any]] = defaultdict(list)
-    mm_hashes: dict[str, list[str]] = defaultdict(list)
-    mm_placeholders: dict[str, list[Any]] = defaultdict(list)
+    mm_kwargs: Dict[str, List[Any]] = defaultdict(list)
+    mm_hashes: Dict[str, List[str]] = defaultdict(list)
+    mm_placeholders: Dict[str, List[Any]] = defaultdict(list)
     for mm_feature in engine_request.mm_features or []:
         mm_kwargs[mm_feature.modality].append(mm_feature.data)
         mm_hashes[mm_feature.modality].append(mm_feature.mm_hash)

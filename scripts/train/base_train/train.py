@@ -12,6 +12,7 @@ import torch.distributed as dist
 import tyro
 from pydantic import BaseModel
 from transformers import TrainerCallback, TrainingArguments
+from typing import Optional
 
 from internnav.dataset.cma_lerobot_dataset import CMALerobotDataset, cma_collate_fn
 from internnav.dataset.navdp_lerobot_dataset import NavDP_Base_Datset, navdp_collate_fn
@@ -45,7 +46,7 @@ class CheckpointFormatCallback(TrainerCallback):
     - metadata.json
     """
 
-    def __init__(self, run_name: str, exp_cfg_dir: Path | None = None):
+    def __init__(self, run_name: str, exp_cfg_dir: Optional[Path] = None):
         """
         Args:
             run_name: Name of the experiment run

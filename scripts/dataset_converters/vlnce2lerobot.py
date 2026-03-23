@@ -6,7 +6,7 @@ import os
 import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Dict, Iterator, Tuple
+from typing import Any, Dict, Iterator, Tuple, Optional, Union
 
 import cv2
 import datasets
@@ -179,13 +179,13 @@ class NavDataset(LeRobotDataset):
         repo_id: str,
         fps: int,
         features: dict,
-        root: str | Path | None = None,
-        robot_type: str | None = None,
+        root: Optional[Union[str, Path]] = None,
+        robot_type: Optional[str] = None,
         use_videos: bool = True,
         tolerance_s: float = 1e-4,
         image_writer_processes: int = 0,
         image_writer_threads: int = 0,
-        video_backend: str | None = None,
+        video_backend: Optional[str] = None,
     ) -> "NavDataset":
         obj = cls.__new__(cls)
         obj.meta = NavDatasetMetadata.create(
@@ -215,7 +215,7 @@ class NavDataset(LeRobotDataset):
         obj.video_backend = video_backend if video_backend is not None else get_safe_default_codec()
         return obj
 
-    def add_frame(self, frame: dict, task: str, timestamp: float | None = None) -> None:
+    def add_frame(self, frame: dict, task: str, timestamp: Optional[float] = None) -> None:
 
         # Convert torch to numpy if needed
         for name in frame:
@@ -499,7 +499,7 @@ def process_dataset(
     push_to_hub: bool,
     num_threads: int = 10,
     start_idx: int = 0,
-    end_idx: int | None = None,
+    end_idx: Optional[int] = None,
 ) -> Tuple[int, int]:
     """
     process the entire dataset
@@ -570,7 +570,7 @@ def process_dataset(
 def main(
     data_dir: str,
     repo_name: str = "nav_S1",
-    output_dir: str | None = None,
+    output_dir: Optional[str] = None,
     push_to_hub: bool = False,
     # img_height: int = 224,
     # img_width: int = 224,

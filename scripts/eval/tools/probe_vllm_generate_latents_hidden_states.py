@@ -5,6 +5,7 @@ import os
 import time
 from collections import defaultdict
 from pathlib import Path
+from typing import Optional
 
 import torch
 from PIL import Image
@@ -67,7 +68,7 @@ def _load_model_config_dict(model_path: str) -> dict:
 
 def _compute_hf_like_position_ids(
     prompt_token_ids: list[int],
-    image_grid_thw: torch.Tensor | None,
+    image_grid_thw: Optional[torch.Tensor],
     model_config: dict,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     input_ids = torch.tensor(prompt_token_ids, dtype=torch.long).unsqueeze(0)

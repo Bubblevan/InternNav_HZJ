@@ -9,6 +9,7 @@ from pathlib import Path
 import torch
 import requests as http_requests
 from PIL import Image
+from typing import Optional
 
 from internnav.model.utils.latents_request import (
     attach_explicit_mm_metadata,
@@ -104,7 +105,7 @@ class VLLMHiddenLatentsRunner:
     def __init__(
         self,
         model_path: str,
-        dump_dir: str | None = None,
+        dump_dir: Optional[str] = None,
         *,
         max_model_len: int = 4096,
         gpu_memory_utilization: float = 0.45,

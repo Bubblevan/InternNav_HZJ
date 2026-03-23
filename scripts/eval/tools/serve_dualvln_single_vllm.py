@@ -75,7 +75,11 @@ def parse_args():
     parser.add_argument(
         "--latent-backend",
         default=None,
-        help="Latent extraction backend. Defaults to vllm_hidden; legacy backends remain available for debugging.",
+        help=(
+            "Latent extraction backend. Defaults to shared_engine_forward; "
+            "vllm_hidden is kept as an alias to that shared-engine path, and "
+            "vllm_hidden_separate_llm keeps the old second-LLM behavior for debugging."
+        ),
     )
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--enforce-eager", action="store_true")
@@ -105,7 +109,7 @@ if __name__ == "__main__":
         f"model={args.model_path} "
         f"hf_model_path={args.hf_model_path or args.model_path} "
         f"model_impl={args.model_impl} "
-        f"latent_backend={args.latent_backend or 'vllm_hidden'} "
+        f"latent_backend={args.latent_backend or 'shared_engine_forward'} "
         f"served_model_name={served_model_name} "
         f"port={args.port}",
         flush=True,

@@ -129,8 +129,18 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         self.model_args = argparse.Namespace(**cfg.agent.model_settings)
         self._init_env_capabilities()
         self.dualvln_single_vllm_url = getattr(self.model_args, "dualvln_single_vllm_url", None)
+        if self.dualvln_single_vllm_url is not None:
+            self.dualvln_single_vllm_url = str(self.dualvln_single_vllm_url).strip()
+        if not self.dualvln_single_vllm_url:
+            self.dualvln_single_vllm_url = None
+        self.force_single_vllm_http = bool(getattr(self.model_args, "force_single_vllm_http", False))
         self.dualvln_single_vllm_timeout = float(getattr(self.model_args, "dualvln_single_vllm_timeout", 300.0))
         self._dualvln_single_vllm_client = None
+        if self.force_single_vllm_http and not self.dualvln_single_vllm_url:
+            raise RuntimeError(
+                "force_single_vllm_http=True requires dualvln_single_vllm_url to be set. "
+                "Refusing to fall back to local HF generation."
+            )
 
         device = torch.device(f"cuda:{self.local_rank}")
         if self.model_args.mode == 'dual_system':
@@ -175,6 +185,16 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
         self.model = model
         self.processor = processor
+        if self.dualvln_single_vllm_url:
+            if self._dualvln_single_vllm_client is None:
+                raise RuntimeError(
+                    "dualvln_single_vllm_url is set, but the single-vLLM HTTP client was not initialized."
+                )
+            if self.processor is not None:
+                raise RuntimeError(
+                    "dualvln_single_vllm_url should disable local HF System-2 initialization. "
+                    "Refusing to continue with an ambiguous fallback path."
+                )
 
         # refactor: this part used in three places
         prompt = "You are an autonomous navigation assistant. Your task is to <instruction>. Where should you go next to stay on track? Please output the next waypoint\'s coordinates in the image. Please output STOP when you have successfully completed the task."

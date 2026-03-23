@@ -5,7 +5,7 @@ import math
 import os
 import sys
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Optional
 
 import torch
 from transformers import AutoModelForCausalLM
@@ -47,7 +47,7 @@ def as_tensor(x: Any, name: str) -> torch.Tensor:
     raise TypeError(f"Unsupported type for {name}: {type(x)}")
 
 
-def squeeze_batch(t: torch.Tensor, expected_rank: int | None = None) -> torch.Tensor:
+def squeeze_batch(t: torch.Tensor, expected_rank: Optional[int] = None) -> torch.Tensor:
     if t.ndim >= 1 and t.shape[0] == 1:
         t = t.squeeze(0)
     if expected_rank is not None and t.ndim != expected_rank:

@@ -392,7 +392,10 @@ class DualVLNSingleVLLMRunner:
         self.n_query = int(self.latent_queries.shape[0])
         self.traj_token_index = TRAJ_TOKEN_INDEX
         self.model_impl = model_impl
-        self.latent_backend = latent_backend or "vllm_hidden"
+        requested_latent_backend = latent_backend or "shared_engine_forward"
+        if requested_latent_backend == "vllm_hidden":
+            requested_latent_backend = "shared_engine_forward"
+        self.latent_backend = requested_latent_backend
         self._hidden_latents_runner = None
         self._hidden_latents_runner_kwargs = {
             "model_path": model_path,
@@ -418,6 +421,19 @@ class DualVLNSingleVLLMRunner:
             seed=seed,
             disable_log_stats=True,
         )
+
+    def _generate_latents_via_shared_engine(self, bundle):
+        return self.llm.apply_model(
+            functools.partial(
+                _generate_latents_from_vllm_model,
+                prompt_token_ids=bundle.full_output_token_ids,
+                pixel_values_cpu=bundle.pixel_values,
+                image_grid_thw_cpu=bundle.image_grid_thw,
+                latent_queries_cpu=bundle.latent_queries,
+                traj_token_index=self.traj_token_index,
+                n_query=self.n_query,
+            )
+        )[0]
 
     def _ensure_hidden_latents_runner(self):
         if self._hidden_latents_runner is None:
@@ -476,19 +492,9 @@ class DualVLNSingleVLLMRunner:
                     image_grid_thw_cpu=bundle.image_grid_thw,
                 )
             )[0]
-        elif self.latent_backend == "legacy_custom_forward":
-            latents = self.llm.apply_model(
-                functools.partial(
-                    _generate_latents_from_vllm_model,
-                    prompt_token_ids=bundle.full_output_token_ids,
-                    pixel_values_cpu=bundle.pixel_values,
-                    image_grid_thw_cpu=bundle.image_grid_thw,
-                    latent_queries_cpu=bundle.latent_queries,
-                    traj_token_index=self.traj_token_index,
-                    n_query=self.n_query,
-                )
-            )[0]
-        elif self.latent_backend == "vllm_hidden":
+        elif self.latent_backend in ("legacy_custom_forward", "shared_engine_forward"):
+            latents = self._generate_latents_via_shared_engine(bundle)
+        elif self.latent_backend == "vllm_hidden_separate_llm":
             latents = self._ensure_hidden_latents_runner().generate_latents_from_bundle(bundle)
         else:
             raise ValueError(f"Unsupported latent_backend: {self.latent_backend}")
