@@ -254,6 +254,14 @@ def _build_native_latent_prefill_prompt_embeds(
     return embeds.detach().cpu()
 
 
+def _build_native_latent_prefill_suffix_prompt_embeds(
+    model,
+    latent_queries_cpu,
+):
+    embed_dtype = next(model.parameters()).dtype
+    return latent_queries_cpu.to(dtype=embed_dtype).detach().cpu().contiguous()
+
+
 def _inspect_transformers_backend_model_tree(model) -> dict:
     wrapper_type = type(model).__name__
     wrapped = getattr(model, "model", None)
@@ -516,21 +524,49 @@ class DualVLNSingleVLLMRunner:
         self._last_step_s2_engine_request = None
 
     def _generate_latents_via_shared_engine(self, bundle):
-        if bundle.prompt_embeds is None:
-            bundle.prompt_embeds = self.llm.apply_model(
-                functools.partial(
-                    _build_native_latent_prefill_prompt_embeds,
-                    prompt_token_ids=bundle.prefill_token_ids,
-                    latent_queries_cpu=bundle.latent_queries,
-                    mm_features=bundle.mm_features,
-                )
-            )[0]
+        prompt_embeds_mode = os.environ.get(
+            "INTERNNAV_NATIVE_PREFILL_PROMPT_EMBEDS_MODE",
+            "full_prompt",
+        )
+        prompt_embeds_soft_suffix_len = None
+
+        if prompt_embeds_mode == "full_prompt":
+            if (
+                bundle.prompt_embeds is None
+                or int(bundle.prompt_embeds.shape[0]) != len(bundle.prefill_token_ids)
+            ):
+                bundle.prompt_embeds = self.llm.apply_model(
+                    functools.partial(
+                        _build_native_latent_prefill_prompt_embeds,
+                        prompt_token_ids=bundle.prefill_token_ids,
+                        latent_queries_cpu=bundle.latent_queries,
+                        mm_features=bundle.mm_features,
+                    )
+                )[0]
+        elif prompt_embeds_mode == "soft_suffix_only":
+            if (
+                bundle.prompt_embeds is None
+                or int(bundle.prompt_embeds.shape[0]) != self.n_query
+            ):
+                bundle.prompt_embeds = self.llm.apply_model(
+                    functools.partial(
+                        _build_native_latent_prefill_suffix_prompt_embeds,
+                        latent_queries_cpu=bundle.latent_queries,
+                    )
+                )[0]
+            prompt_embeds_soft_suffix_len = self.n_query
+        else:
+            raise ValueError(
+                "Unsupported INTERNNAV_NATIVE_PREFILL_PROMPT_EMBEDS_MODE: "
+                f"{prompt_embeds_mode}"
+            )
 
         return self.llm.generate_latents_native_prefill(
             prompt_token_ids=bundle.prefill_token_ids,
             prompt_embeds=bundle.prompt_embeds,
             mm_features=bundle.mm_features,
             n_query=self.n_query,
+            prompt_embeds_soft_suffix_len=prompt_embeds_soft_suffix_len,
         )[0]
 
     def _ensure_hidden_latents_runner(self):
