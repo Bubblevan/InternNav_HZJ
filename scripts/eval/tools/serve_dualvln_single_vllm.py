@@ -51,6 +51,9 @@ def dualvln_step_s2():
             "generated_token_ids": result["generated_token_ids"],
             "pixel_goal": result["pixel_goal"],
             "latents": encode_tensor_to_b64(result["latents"]) if result["latents"] is not None else None,
+            "runtime_metrics": result.get("runtime_metrics"),
+            "vllm_kv_cache": result.get("vllm_kv_cache"),
+            "debug_mm": result.get("debug_mm"),
         }
     )
 

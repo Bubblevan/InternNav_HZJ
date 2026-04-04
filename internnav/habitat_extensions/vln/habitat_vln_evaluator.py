@@ -1,10 +1,12 @@
 import argparse
 import base64
+import glob
 import hashlib
 import io
 import json
 import os
 import sys
+import time
 from enum import IntEnum
 
 sys.path.append('./src/diffusion-policy')
@@ -87,6 +89,13 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         self.epoch = args.epoch
         self.max_steps_per_episode = args.max_steps_per_episode
         self.output_path = args.output_path
+        self._progress_path = os.path.join(self.output_path, "progress.json")
+        self._episode_metrics_path = None
+        self._unified_summary_path = os.path.join(self.output_path, "unified_summary.json")
+        self._unified_summary_meta_path = os.path.join(
+            self.output_path,
+            "unified_summary_meta.json",
+        )
 
         # create habitat config
         self.config_path = cfg.env.env_settings['config_path']
@@ -125,6 +134,10 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
         # init agent and env
         super().__init__(cfg, init_agent=False)
+        self._episode_metrics_path = os.path.join(
+            self.output_path,
+            f"episode_metrics_rank{self.local_rank}.jsonl",
+        )
 
         # ------------------------------------- model ------------------------------------------
         self.model_args = argparse.Namespace(**cfg.agent.model_settings)
@@ -146,6 +159,14 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         self._shadow_diff_stage_counts = defaultdict(int)
         self._shadow_diff_first_divergence = {}
         self._shadow_diff_records = 0
+        if not os.path.exists(self._progress_path):
+            for path in (
+                self._episode_metrics_path,
+                self._unified_summary_path,
+                self._unified_summary_meta_path,
+            ):
+                if os.path.exists(path):
+                    os.remove(path)
         self._init_env_capabilities()
         self.dualvln_single_vllm_url = getattr(self.model_args, "dualvln_single_vllm_url", None)
         if self.dualvln_single_vllm_url is not None:
@@ -709,10 +730,606 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
     def _generate_traj(self, traj_latents, images_dp, depths_dp, scene_id=None, episode_id=None, step_id=None, salt=17):
         generator = None
+        seed = None
         if scene_id is not None and episode_id is not None and step_id is not None:
-            generator, _ = self._make_system1_generator(scene_id, episode_id, step_id, salt)
+            generator, seed = self._make_system1_generator(scene_id, episode_id, step_id, salt)
+        start_time = time.perf_counter()
         with torch.no_grad():
-            return self.model.generate_traj(traj_latents, images_dp, depths_dp, generator=generator)
+            actions = self.model.generate_traj(traj_latents, images_dp, depths_dp, generator=generator)
+        metrics = dict(getattr(self.model, "_last_generate_traj_metrics", {}) or {})
+        metrics.setdefault("s1_generate_traj_ms_total", (time.perf_counter() - start_time) * 1000.0)
+        metrics["s1_generator_seed"] = seed
+        metrics["s1_deterministic_mode"] = seed is not None
+        self._last_generate_traj_metrics = metrics
+        return actions
+
+    def _resolve_backend_label(self) -> str:
+        if self.model_args.mode == "dual_system":
+            if self.dualvln_single_vllm_url:
+                return "dual_system_single_vllm"
+            return "dual_system_hf"
+        if self.s2_vllm_url:
+            return "system2_vllm_http"
+        return "system2_hf"
+
+    @staticmethod
+    def _metric_percentile(values, percentile):
+        if not values:
+            return None
+        return float(np.percentile(np.asarray(values, dtype=np.float64), percentile))
+
+    def _latency_summary(self, values, *, prefix: str, include_p50: bool = False, include_p99: bool = False) -> dict:
+        summary = {
+            f"{prefix}_mean": float(np.mean(values)) if values else None,
+            f"{prefix}_p90": self._metric_percentile(values, 90),
+            f"{prefix}_max": float(np.max(values)) if values else None,
+        }
+        if include_p50:
+            summary[f"{prefix}_p50"] = self._metric_percentile(values, 50)
+        if include_p99:
+            summary[f"{prefix}_p99"] = self._metric_percentile(values, 99)
+        return summary
+
+    def _default_s1_metrics(self, enabled: bool) -> dict:
+        if not enabled:
+            return {
+                "s1_generate_traj_ms_total": None,
+                "s1_memory_encode_ms": None,
+                "s1_rgb_encode_ms": None,
+                "s1_cond_project_ms": None,
+                "s1_dit_loop_ms": None,
+                "s1_action_decode_ms": None,
+                "diffusion_steps_total": None,
+                "diffusion_steps_reused": None,
+                "diffusion_steps_executed": None,
+                "s1_generator_seed": None,
+                "s1_deterministic_mode": None,
+                "s1_generator_seed_trace": [],
+            }
+        return {
+            "s1_generate_traj_ms_total": 0.0,
+            "s1_memory_encode_ms": 0.0,
+            "s1_rgb_encode_ms": 0.0,
+            "s1_cond_project_ms": 0.0,
+            "s1_dit_loop_ms": 0.0,
+            "s1_action_decode_ms": 0.0,
+            "diffusion_steps_total": 0,
+            "diffusion_steps_reused": 0,
+            "diffusion_steps_executed": 0,
+            "s1_generator_seed": None,
+            "s1_deterministic_mode": bool(self.deterministic_seed is not None),
+            "s1_generator_seed_trace": [],
+        }
+
+    @staticmethod
+    def _default_dit_cache_metrics(enabled: bool) -> dict:
+        if not enabled:
+            return {
+                "dit_cache_enabled": None,
+                "dit_cache_hit_rate": None,
+                "dit_cache_hits": None,
+                "dit_cache_misses": None,
+                "dit_cache_saved_ms_total": None,
+                "dit_cache_saved_ms_per_call": None,
+                "diffusion_steps_total": None,
+                "diffusion_steps_reused": None,
+                "diffusion_steps_executed": None,
+            }
+        return {
+            "dit_cache_enabled": False,
+            "dit_cache_hit_rate": 0.0,
+            "dit_cache_hits": 0,
+            "dit_cache_misses": 0,
+            "dit_cache_saved_ms_total": 0.0,
+            "dit_cache_saved_ms_per_call": 0.0,
+            "diffusion_steps_total": 0,
+            "diffusion_steps_reused": 0,
+            "diffusion_steps_executed": 0,
+        }
+
+    @staticmethod
+    def _default_vllm_kv_cache_metrics() -> dict:
+        return {
+            "available_kv_cache_memory_bytes": None,
+            "requested_memory_bytes": None,
+            "peak_activation_memory_bytes": None,
+            "cudagraph_memory_estimate_bytes": None,
+            "effective_kv_budget_bytes": None,
+            "gpu_memory_utilization": None,
+            "max_model_len": None,
+            "num_gpu_blocks": None,
+            "worker_count": None,
+        }
+
+    @staticmethod
+    def _placeholder_fields() -> list[str]:
+        return [
+            "cache_metrics.dit_cache.*",
+            "runtime_breakdown.prefill_share_of_total",
+            "runtime_breakdown.decode_share_of_total",
+        ]
+
+    def _summary_metadata(self, plot_generated_files=None) -> dict:
+        return {
+            "schema_version": 1,
+            "backend_filter_default": "dual_system_*",
+            "placeholder_fields": self._placeholder_fields(),
+            "metrics_collection_mode": "hot_path_local_timing + cached_worker_stats",
+            "hot_path_rpc_free": True,
+            "plot_generated_files": list(plot_generated_files or []),
+            "notes": [
+                "dit_cache_* fields are placeholders unless a real DiT cache implementation is enabled.",
+                "prefill_share_of_total and decode_share_of_total may be null when no faithful decomposition is available.",
+                "pure system2 backends remain schema-compatible but are excluded from default comparison plots.",
+            ],
+        }
+
+    def _write_unified_summary_meta(self, *, plot_generated_files=None) -> None:
+        os.makedirs(self.output_path, exist_ok=True)
+        with open(self._unified_summary_meta_path, "w", encoding="utf-8") as f:
+            json.dump(
+                self._summary_metadata(plot_generated_files=plot_generated_files),
+                f,
+                indent=2,
+                ensure_ascii=False,
+            )
+
+    def _new_episode_runtime_state(self, *, scene_id, episode_id, episode_instruction):
+        return {
+            "scene_id": scene_id,
+            "episode_id": int(episode_id),
+            "episode_instruction": episode_instruction,
+            "backend": self._resolve_backend_label(),
+            "s2_requests": 0,
+            "pixel_goal_count": 0,
+            "latent_success_count": 0,
+            "s1_invocation_count": 0,
+            "s1_actions_total": 0,
+            "s2_discrete_action_count": 0,
+            "s2_step_latency_ms": [],
+            "end_to_end_control_gap_ms": [],
+            "s2_runtime_samples": [],
+            "s1_call_metrics": [],
+            "vllm_kv_cache": None,
+        }
+
+    def _append_episode_metric_record(self, record: dict) -> None:
+        os.makedirs(self.output_path, exist_ok=True)
+        with open(self._episode_metrics_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    @staticmethod
+    def _load_jsonl_records(path_pattern: str) -> list[dict]:
+        records = []
+        for path in sorted(glob.glob(path_pattern)):
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    records.append(json.loads(line))
+        return records
+
+    def _build_episode_summary(
+        self,
+        *,
+        runtime_state,
+        env_metrics,
+        step_id,
+        collision_count,
+        psi_steps,
+        psi_rate,
+        avg_min_dist_to_human,
+        episode_wall_time_s,
+    ) -> dict:
+        s2_requests = int(runtime_state["s2_requests"])
+        pixel_goal_count = int(runtime_state["pixel_goal_count"])
+        latent_success_count = int(runtime_state["latent_success_count"])
+        s1_invocation_count = int(runtime_state["s1_invocation_count"])
+        s2_discrete_action_count = int(runtime_state["s2_discrete_action_count"])
+        s1_actions_total = int(runtime_state["s1_actions_total"])
+
+        s2_metrics = {
+            "s2_requests": s2_requests,
+            "pixel_goal_yield_rate": (
+                float(pixel_goal_count / s2_requests) if s2_requests > 0 else None
+            ),
+            "latent_success_rate": (
+                float(latent_success_count / pixel_goal_count) if pixel_goal_count > 0 else None
+            ),
+            "s1_invocation_rate": (
+                float(s1_invocation_count / s2_requests)
+                if s2_requests > 0 and self.model_args.mode == "dual_system"
+                else None
+            ),
+            "avg_s1_actions_per_trigger": (
+                float(s1_actions_total / s1_invocation_count) if s1_invocation_count > 0 else None
+            ),
+            "s2_discrete_action_rate": (
+                float(s2_discrete_action_count / s2_requests) if s2_requests > 0 else None
+            ),
+            "episode_wall_time_s": float(episode_wall_time_s),
+            "effective_low_level_hz": (
+                float(step_id / episode_wall_time_s) if episode_wall_time_s > 0 else None
+            ),
+            "pixel_goal_count": pixel_goal_count,
+            "latent_success_count": latent_success_count,
+            "s1_invocation_count": s1_invocation_count,
+            "s1_actions_total": s1_actions_total,
+            "s2_discrete_action_count": s2_discrete_action_count,
+        }
+        s2_metrics.update(
+            self._latency_summary(
+                runtime_state["s2_step_latency_ms"],
+                prefix="s2_step_latency_ms",
+                include_p50=True,
+                include_p99=True,
+            )
+        )
+        s2_metrics.update(
+            self._latency_summary(
+                runtime_state["end_to_end_control_gap_ms"],
+                prefix="end_to_end_control_gap_ms",
+            )
+        )
+
+        runtime_breakdown = {}
+        if runtime_state["s2_runtime_samples"]:
+            runtime_fields = (
+                "preprocess_ms",
+                "generate_ms",
+                "bundle_build_ms",
+                "mm_attach_ms",
+                "latent_prefill_ms",
+                "total_ms",
+                "prefill_share_of_total",
+                "latent_prefill_share_of_total",
+                "decode_share_of_total",
+                "prompt_token_count",
+                "generated_token_count",
+                "prefill_token_count",
+                "n_query",
+                "num_images",
+                "mm_feature_count",
+            )
+            for field in runtime_fields:
+                values = [
+                    sample[field]
+                    for sample in runtime_state["s2_runtime_samples"]
+                    if sample.get(field) is not None
+                ]
+                runtime_breakdown[field] = float(np.mean(values)) if values else None
+
+        s1_enabled = self.model_args.mode == "dual_system"
+        s1_metrics = self._default_s1_metrics(s1_enabled)
+        dit_cache_metrics = self._default_dit_cache_metrics(s1_enabled)
+        if runtime_state["s1_call_metrics"]:
+            call_metrics = runtime_state["s1_call_metrics"]
+            for field in (
+                "s1_generate_traj_ms_total",
+                "s1_memory_encode_ms",
+                "s1_rgb_encode_ms",
+                "s1_cond_project_ms",
+                "s1_dit_loop_ms",
+                "s1_action_decode_ms",
+            ):
+                s1_metrics[field] = float(sum(metric.get(field, 0.0) or 0.0 for metric in call_metrics))
+            for field in (
+                "diffusion_steps_total",
+                "diffusion_steps_reused",
+                "diffusion_steps_executed",
+            ):
+                s1_metrics[field] = int(sum(metric.get(field, 0) or 0 for metric in call_metrics))
+            seed_trace = [
+                int(metric["s1_generator_seed"])
+                for metric in call_metrics
+                if metric.get("s1_generator_seed") is not None
+            ]
+            s1_metrics["s1_generator_seed_trace"] = seed_trace
+            s1_metrics["s1_generator_seed"] = seed_trace[0] if len(seed_trace) == 1 else None
+            s1_metrics["s1_deterministic_mode"] = any(
+                bool(metric.get("s1_deterministic_mode")) for metric in call_metrics
+            )
+
+            dit_cache_hits = int(sum(metric.get("dit_cache_hits", 0) or 0 for metric in call_metrics))
+            dit_cache_misses = int(sum(metric.get("dit_cache_misses", 0) or 0 for metric in call_metrics))
+            dit_cache_saved_ms_total = float(
+                sum(metric.get("dit_cache_saved_ms_total", 0.0) or 0.0 for metric in call_metrics)
+            )
+            diffusion_steps_total = int(sum(metric.get("diffusion_steps_total", 0) or 0 for metric in call_metrics))
+            diffusion_steps_reused = int(sum(metric.get("diffusion_steps_reused", 0) or 0 for metric in call_metrics))
+            diffusion_steps_executed = int(
+                sum(metric.get("diffusion_steps_executed", 0) or 0 for metric in call_metrics)
+            )
+            dit_cache_metrics = {
+                "dit_cache_enabled": any(bool(metric.get("dit_cache_enabled")) for metric in call_metrics),
+                "dit_cache_hit_rate": (
+                    float(dit_cache_hits / (dit_cache_hits + dit_cache_misses))
+                    if (dit_cache_hits + dit_cache_misses) > 0
+                    else 0.0
+                ),
+                "dit_cache_hits": dit_cache_hits,
+                "dit_cache_misses": dit_cache_misses,
+                "dit_cache_saved_ms_total": dit_cache_saved_ms_total,
+                "dit_cache_saved_ms_per_call": (
+                    float(dit_cache_saved_ms_total / len(call_metrics)) if call_metrics else 0.0
+                ),
+                "diffusion_steps_total": diffusion_steps_total,
+                "diffusion_steps_reused": diffusion_steps_reused,
+                "diffusion_steps_executed": diffusion_steps_executed,
+            }
+
+        return {
+            "backend": runtime_state["backend"],
+            "scene_id": runtime_state["scene_id"],
+            "episode_id": runtime_state["episode_id"],
+            "episode_instruction": runtime_state["episode_instruction"],
+            "metadata": self._summary_metadata(),
+            "nav_metrics": {
+                "sr": float(env_metrics["success"]),
+                "spl": float(env_metrics["spl"]),
+                "osr": float(env_metrics["oracle_success"]),
+                "ne": float(env_metrics["distance_to_goal"]),
+                "ndtw": (
+                    float(env_metrics["ndtw"]) if "ndtw" in env_metrics else None
+                ),
+                "collision_count": float(collision_count),
+                "psi_rate": float(psi_rate),
+            },
+            "s2_metrics": s2_metrics,
+            "s1_metrics": s1_metrics,
+            "cache_metrics": {
+                "dit_cache": dit_cache_metrics,
+                "vllm_kv_cache": runtime_state["vllm_kv_cache"] or self._default_vllm_kv_cache_metrics(),
+            },
+            "shadow_diff_metrics": {
+                "enabled": bool(self.shadow_diff_enabled),
+            },
+            "runtime_breakdown": runtime_breakdown,
+            "social_metrics": {
+                "psi_steps": int(psi_steps),
+                "avg_min_dist_to_human": float(avg_min_dist_to_human),
+            },
+            "traces": {
+                "s2_step_latency_ms": runtime_state["s2_step_latency_ms"],
+                "end_to_end_control_gap_ms": runtime_state["end_to_end_control_gap_ms"],
+                "s2_runtime_samples": runtime_state["s2_runtime_samples"],
+                "s1_call_metrics": runtime_state["s1_call_metrics"],
+            },
+        }
+
+    def _write_unified_summary(self, global_metrics: dict) -> None:
+        if self.rank != 0:
+            return
+
+        episode_records = self._load_jsonl_records(
+            os.path.join(self.output_path, "episode_metrics_rank*.jsonl")
+        )
+        backends = sorted({record.get("backend") for record in episode_records if record.get("backend")})
+        backend_label = backends[0] if len(backends) == 1 else "mixed"
+
+        s2_latency_values = []
+        control_gap_values = []
+        runtime_samples = []
+        s1_call_metrics = []
+        for record in episode_records:
+            traces = record.get("traces") or {}
+            s2_latency_values.extend(traces.get("s2_step_latency_ms") or [])
+            control_gap_values.extend(traces.get("end_to_end_control_gap_ms") or [])
+            runtime_samples.extend(traces.get("s2_runtime_samples") or [])
+            s1_call_metrics.extend(traces.get("s1_call_metrics") or [])
+
+        total_s2_requests = int(sum((record.get("s2_metrics") or {}).get("s2_requests", 0) or 0 for record in episode_records))
+        total_pixel_goal_count = int(
+            sum((record.get("s2_metrics") or {}).get("pixel_goal_count", 0) or 0 for record in episode_records)
+        )
+        total_latent_success_count = int(
+            sum((record.get("s2_metrics") or {}).get("latent_success_count", 0) or 0 for record in episode_records)
+        )
+        total_s1_invocation_count = int(
+            sum((record.get("s2_metrics") or {}).get("s1_invocation_count", 0) or 0 for record in episode_records)
+        )
+        total_s1_actions = int(
+            sum((record.get("s2_metrics") or {}).get("s1_actions_total", 0) or 0 for record in episode_records)
+        )
+        total_s2_discrete_action_count = int(
+            sum((record.get("s2_metrics") or {}).get("s2_discrete_action_count", 0) or 0 for record in episode_records)
+        )
+        episode_wall_times = [
+            (record.get("s2_metrics") or {}).get("episode_wall_time_s")
+            for record in episode_records
+            if (record.get("s2_metrics") or {}).get("episode_wall_time_s") is not None
+        ]
+        effective_low_level_hz = [
+            (record.get("s2_metrics") or {}).get("effective_low_level_hz")
+            for record in episode_records
+            if (record.get("s2_metrics") or {}).get("effective_low_level_hz") is not None
+        ]
+
+        runtime_breakdown = {}
+        for field in (
+            "preprocess_ms",
+            "generate_ms",
+            "bundle_build_ms",
+            "mm_attach_ms",
+            "latent_prefill_ms",
+            "total_ms",
+            "prefill_share_of_total",
+            "latent_prefill_share_of_total",
+            "decode_share_of_total",
+            "prompt_token_count",
+            "generated_token_count",
+            "prefill_token_count",
+            "n_query",
+            "num_images",
+            "mm_feature_count",
+        ):
+            values = [sample.get(field) for sample in runtime_samples if sample.get(field) is not None]
+            runtime_breakdown[field] = float(np.mean(values)) if values else None
+
+        s1_metrics = self._default_s1_metrics(self.model_args.mode == "dual_system")
+        dit_cache_metrics = self._default_dit_cache_metrics(self.model_args.mode == "dual_system")
+        if s1_call_metrics:
+            for field in (
+                "s1_generate_traj_ms_total",
+                "s1_memory_encode_ms",
+                "s1_rgb_encode_ms",
+                "s1_cond_project_ms",
+                "s1_dit_loop_ms",
+                "s1_action_decode_ms",
+            ):
+                values = [metric.get(field) for metric in s1_call_metrics if metric.get(field) is not None]
+                s1_metrics[field] = float(np.mean(values)) if values else None
+            for field in (
+                "diffusion_steps_total",
+                "diffusion_steps_reused",
+                "diffusion_steps_executed",
+            ):
+                values = [metric.get(field) for metric in s1_call_metrics if metric.get(field) is not None]
+                s1_metrics[field] = int(sum(values)) if values else None
+            seed_trace = [
+                int(metric["s1_generator_seed"])
+                for metric in s1_call_metrics
+                if metric.get("s1_generator_seed") is not None
+            ]
+            s1_metrics["s1_generator_seed_trace"] = seed_trace
+            s1_metrics["s1_generator_seed"] = seed_trace[0] if len(seed_trace) == 1 else None
+            s1_metrics["s1_deterministic_mode"] = any(
+                bool(metric.get("s1_deterministic_mode")) for metric in s1_call_metrics
+            )
+
+            hits = int(sum(metric.get("dit_cache_hits", 0) or 0 for metric in s1_call_metrics))
+            misses = int(sum(metric.get("dit_cache_misses", 0) or 0 for metric in s1_call_metrics))
+            saved = float(sum(metric.get("dit_cache_saved_ms_total", 0.0) or 0.0 for metric in s1_call_metrics))
+            total_steps = int(sum(metric.get("diffusion_steps_total", 0) or 0 for metric in s1_call_metrics))
+            reused_steps = int(sum(metric.get("diffusion_steps_reused", 0) or 0 for metric in s1_call_metrics))
+            executed_steps = int(sum(metric.get("diffusion_steps_executed", 0) or 0 for metric in s1_call_metrics))
+            dit_cache_metrics = {
+                "dit_cache_enabled": any(bool(metric.get("dit_cache_enabled")) for metric in s1_call_metrics),
+                "dit_cache_hit_rate": float(hits / (hits + misses)) if (hits + misses) > 0 else 0.0,
+                "dit_cache_hits": hits,
+                "dit_cache_misses": misses,
+                "dit_cache_saved_ms_total": saved,
+                "dit_cache_saved_ms_per_call": float(saved / len(s1_call_metrics)) if s1_call_metrics else 0.0,
+                "diffusion_steps_total": total_steps,
+                "diffusion_steps_reused": reused_steps,
+                "diffusion_steps_executed": executed_steps,
+            }
+
+        vllm_kv_cache = self._default_vllm_kv_cache_metrics()
+        for record in reversed(episode_records):
+            cache_block = ((record.get("cache_metrics") or {}).get("vllm_kv_cache") or {})
+            if any(cache_block.get(key) is not None for key in vllm_kv_cache.keys()):
+                vllm_kv_cache = cache_block
+                break
+
+        shadow_summary = {
+            "enabled": bool(self.shadow_diff_enabled),
+            "records": int(self._shadow_diff_records),
+            "stage_counts": dict(self._shadow_diff_stage_counts),
+            "first_divergence": self._shadow_diff_first_divergence,
+        }
+        if self.shadow_diff_enabled:
+            combined_stage_counts = defaultdict(int)
+            combined_first_divergence = {}
+            combined_records = 0
+            for path in sorted(glob.glob(os.path.join(self.output_path, "shadow_diff_summary_rank*.json"))):
+                with open(path, "r", encoding="utf-8") as f:
+                    payload = json.load(f)
+                metadata = payload.get("metadata") or {}
+                combined_records += int(metadata.get("records", 0) or 0)
+                for stage, count in (payload.get("stage_counts") or {}).items():
+                    combined_stage_counts[stage] += int(count)
+                combined_first_divergence.update(payload.get("first_divergence") or {})
+            shadow_summary = {
+                "enabled": True,
+                "records": combined_records,
+                "stage_counts": dict(combined_stage_counts),
+                "first_divergence": combined_first_divergence,
+            }
+
+        summary = {
+            "schema_version": 1,
+            "backend": backend_label,
+            "episode_count": len(episode_records),
+            "metadata": self._summary_metadata(),
+            "nav_metrics": {
+                "sr": float(global_metrics["sucs"].mean().item()) if len(global_metrics["sucs"]) > 0 else 0.0,
+                "spl": float(global_metrics["spls"].mean().item()) if len(global_metrics["spls"]) > 0 else 0.0,
+                "osr": float(global_metrics["oss"].mean().item()) if len(global_metrics["oss"]) > 0 else 0.0,
+                "ne": float(global_metrics["nes"][torch.isfinite(global_metrics["nes"])].mean().item())
+                if torch.isfinite(global_metrics["nes"]).any()
+                else 0.0,
+                "ndtw": (
+                    float(global_metrics["ndtws"].mean().item())
+                    if "ndtws" in global_metrics and len(global_metrics["ndtws"]) > 0
+                    else None
+                ),
+                "collision_count": (
+                    float(global_metrics["collision_counts"].mean().item())
+                    if "collision_counts" in global_metrics and len(global_metrics["collision_counts"]) > 0
+                    else None
+                ),
+                "psi_rate": (
+                    float(global_metrics["psi_rates"].mean().item())
+                    if "psi_rates" in global_metrics and len(global_metrics["psi_rates"]) > 0
+                    else None
+                ),
+            },
+            "s2_metrics": {
+                "s2_requests": total_s2_requests,
+                "pixel_goal_yield_rate": (
+                    float(total_pixel_goal_count / total_s2_requests) if total_s2_requests > 0 else None
+                ),
+                "latent_success_rate": (
+                    float(total_latent_success_count / total_pixel_goal_count) if total_pixel_goal_count > 0 else None
+                ),
+                "s1_invocation_rate": (
+                    float(total_s1_invocation_count / total_s2_requests)
+                    if total_s2_requests > 0 and self.model_args.mode == "dual_system"
+                    else None
+                ),
+                "avg_s1_actions_per_trigger": (
+                    float(total_s1_actions / total_s1_invocation_count) if total_s1_invocation_count > 0 else None
+                ),
+                "s2_discrete_action_rate": (
+                    float(total_s2_discrete_action_count / total_s2_requests) if total_s2_requests > 0 else None
+                ),
+                "episode_wall_time_s": float(np.mean(episode_wall_times)) if episode_wall_times else None,
+                "effective_low_level_hz": float(np.mean(effective_low_level_hz)) if effective_low_level_hz else None,
+            },
+            "s1_metrics": s1_metrics,
+            "cache_metrics": {
+                "dit_cache": dit_cache_metrics,
+                "vllm_kv_cache": vllm_kv_cache,
+            },
+            "shadow_diff_metrics": shadow_summary,
+            "runtime_breakdown": runtime_breakdown,
+            "artifacts": {
+                "episode_metrics_glob": os.path.join(self.output_path, "episode_metrics_rank*.jsonl"),
+                "progress_path": self._progress_path,
+                "result_path": os.path.join(self.output_path, "result.json"),
+            },
+        }
+        summary["s2_metrics"].update(
+            self._latency_summary(
+                s2_latency_values,
+                prefix="s2_step_latency_ms",
+                include_p50=True,
+                include_p99=True,
+            )
+        )
+        summary["s2_metrics"].update(
+            self._latency_summary(
+                control_gap_values,
+                prefix="end_to_end_control_gap_ms",
+            )
+        )
+
+        os.makedirs(self.output_path, exist_ok=True)
+        with open(self._unified_summary_path, "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2, ensure_ascii=False)
+        self._write_unified_summary_meta()
 
     def _init_env_capabilities(self):
         lab_sensors = getattr(self.config.habitat.task, "lab_sensors", None)
@@ -809,6 +1426,9 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             result_all["avg_collision_count"] = float(ccs.mean().item()) if denom > 0 else 0.0
             result_all["psi_rate_all"] = float(prs.mean().item()) if denom > 0 else 0.0
 
+        self._write_unified_summary(global_metrics)
+        result_all["unified_summary_path"] = self._unified_summary_path
+        result_all["unified_summary_meta_path"] = self._unified_summary_meta_path
         return result_all
 
     def parse_actions(self, output):
@@ -880,6 +1500,12 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 process_bar.write(f"[Resume] Skipped {_n_skipped} completed episodes, resuming from {scene_id}_{episode_id:04d}")
 
             print("episode start", episode_instruction)
+            episode_start_time = time.perf_counter()
+            episode_runtime_state = self._new_episode_runtime_state(
+                scene_id=scene_id,
+                episode_id=episode_id,
+                episode_instruction=episode_instruction,
+            )
 
             # save first frame per rank to validate sim quality
             os.makedirs(os.path.join(self.output_path, f'check_sim_{self.epoch}'), exist_ok=True)
@@ -913,6 +1539,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
             # ---------- 2. Episode step loop -----------
             while (not done) and (step_id <= self.max_steps_per_episode):
+                control_gap_start = time.perf_counter()
                 # refactor agent get action
                 rgb = observations["rgb"]
                 depth = observations["depth"]
@@ -1017,23 +1644,40 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     inputs = None
                     traj_latents = None
                     if self.dualvln_single_vllm_url:
+                        s2_start = time.perf_counter()
                         single_vllm_result = self._single_vllm_step_s2(messages, max_new_tokens=128)
+                        episode_runtime_state["s2_step_latency_ms"].append(
+                            (time.perf_counter() - s2_start) * 1000.0
+                        )
+                        episode_runtime_state["s2_requests"] += 1
                         llm_outputs = single_vllm_result["llm_output"]
                         pixel_goal = single_vllm_result["pixel_goal"]
                         traj_latents = single_vllm_result["latents"]
+                        runtime_metrics = single_vllm_result.get("runtime_metrics")
+                        if runtime_metrics is not None:
+                            episode_runtime_state["s2_runtime_samples"].append(runtime_metrics)
+                        vllm_kv_cache = single_vllm_result.get("vllm_kv_cache")
+                        if vllm_kv_cache is not None:
+                            episode_runtime_state["vllm_kv_cache"] = vllm_kv_cache
                         output_ids = None
                     else:
                         text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
                         inputs = self.processor(text=[text], images=input_images, return_tensors="pt").to(self.device)
 
                         if self.s2_vllm_url:
+                            s2_start = time.perf_counter()
                             llm_outputs = self._vllm_generate(messages, max_new_tokens=128)
+                            episode_runtime_state["s2_step_latency_ms"].append(
+                                (time.perf_counter() - s2_start) * 1000.0
+                            )
+                            episode_runtime_state["s2_requests"] += 1
                             generated_ids = self.processor.tokenizer.encode(llm_outputs, add_special_tokens=False)
                             output_ids = torch.cat([
                                 inputs.input_ids,
                                 torch.tensor([generated_ids], device=inputs.input_ids.device),
                             ], dim=1)
                         else:
+                            s2_start = time.perf_counter()
                             with torch.no_grad():
                                 output_ids = self.model.generate(
                                     **inputs,
@@ -1043,6 +1687,10 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                                     past_key_values=None,
                                     return_dict_in_generate=True,
                                 ).sequences
+                            episode_runtime_state["s2_step_latency_ms"].append(
+                                (time.perf_counter() - s2_start) * 1000.0
+                            )
+                            episode_runtime_state["s2_requests"] += 1
                             llm_outputs = self.processor.tokenizer.decode(
                                 output_ids[0][inputs.input_ids.shape[1] :], skip_special_tokens=True
                             )
@@ -1050,12 +1698,17 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     print('step_id:', step_id, 'output text:', llm_outputs)
 
                     if bool(re.search(r'\d', llm_outputs)):  # output pixel goal
+                        episode_runtime_state["pixel_goal_count"] += 1
+                        latent_success_recorded = False
                         forward_action = 0
                         if pixel_goal is None:
                             coord = [int(c) for c in re.findall(r'\d+', llm_outputs)]
                             pixel_goal = [int(coord[1]), int(coord[0])]
 
                         if not self.use_system1_local_policy:
+                            if traj_latents is not None and not latent_success_recorded:
+                                episode_runtime_state["latent_success_count"] += 1
+                                latent_success_recorded = True
                             action_seq = [self._pixel_goal_to_discrete_action(pixel_goal, rgb.shape[1])]
                             print('pixel_goal_fallback_actions', action_seq, flush=True)
                             pixel_goal = None
@@ -1075,6 +1728,9 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                                     image_grid_thw,
                                     input_images,
                                 )
+                            if traj_latents is not None and not latent_success_recorded:
+                                episode_runtime_state["latent_success_count"] += 1
+                                latent_success_recorded = True
 
                             # prepocess align with navdp
                             image_dp = torch.tensor(np.array(look_down_image.resize((224, 224)))).to(torch.bfloat16) / 255
@@ -1092,6 +1748,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                                 episode_id=episode_id,
                                 step_id=step_id,
                             )
+                            episode_runtime_state["s1_invocation_count"] += 1
 
                             action_list = traj_to_actions(dp_actions)
                             if len(action_list) < MAX_STEPS:
@@ -1100,6 +1757,11 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             local_actions = action_list
                             if len(local_actions) >= MAX_LOCAL_STEPS:
                                 local_actions = local_actions[:MAX_LOCAL_STEPS]
+                            episode_runtime_state["s1_actions_total"] += int(len(local_actions))
+                            if getattr(self, "_last_generate_traj_metrics", None) is not None:
+                                episode_runtime_state["s1_call_metrics"].append(
+                                    dict(self._last_generate_traj_metrics)
+                                )
                             primary_local_plan = {
                                 "seed": self._make_step_seed(scene_id, episode_id, step_id, 17),
                                 "action_prefix": [int(a) for a in local_actions],
@@ -1118,6 +1780,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             print('predicted goal', pixel_goal, flush=True)
 
                     else:
+                        episode_runtime_state["s2_discrete_action_count"] += 1
                         action_seq = self.parse_actions(llm_outputs)
                         print('actions', action_seq, flush=True)
 
@@ -1186,6 +1849,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             episode_id=episode_id,
                             step_id=step_id,
                         )
+                        episode_runtime_state["s1_invocation_count"] += 1
 
                         action_list = traj_to_actions(dp_actions)
                         if len(action_list) < MAX_STEPS:
@@ -1194,6 +1858,11 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         local_actions = action_list
                         if len(local_actions) >= MAX_LOCAL_STEPS:
                             local_actions = local_actions[:MAX_LOCAL_STEPS]
+                        episode_runtime_state["s1_actions_total"] += int(len(local_actions))
+                        if getattr(self, "_last_generate_traj_metrics", None) is not None:
+                            episode_runtime_state["s1_call_metrics"].append(
+                                dict(self._last_generate_traj_metrics)
+                            )
                         print("local_actions", local_actions)
                         action = local_actions.pop(0)
                     else:
@@ -1218,6 +1887,10 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         continue
                 else:
                     action = 0
+
+                episode_runtime_state["end_to_end_control_gap_ms"].append(
+                    (time.perf_counter() - control_gap_start) * 1000.0
+                )
 
                 info = self.env.get_metrics()
 
@@ -1274,6 +1947,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             _avg_min_dist_h = _sum_min_dist_h / _dist_h_count if _dist_h_count > 0 else -1.0
             collision_counts.append(float(_collision_count))
             psi_rates.append(_psi_rate)
+            episode_wall_time_s = time.perf_counter() - episode_start_time
 
             print(
                 f"scene_episode {scene_id}_{episode_id:04d} success: {metrics['success']}, "
@@ -1305,6 +1979,18 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             os.makedirs(self.output_path, exist_ok=True)
             with open(os.path.join(self.output_path, 'progress.json'), 'a') as f:
                 f.write(json.dumps(result) + "\n")
+            self._append_episode_metric_record(
+                self._build_episode_summary(
+                    runtime_state=episode_runtime_state,
+                    env_metrics=metrics,
+                    step_id=step_id,
+                    collision_count=_collision_count,
+                    psi_steps=_psi_steps,
+                    psi_rate=_psi_rate,
+                    avg_min_dist_to_human=_avg_min_dist_h,
+                    episode_wall_time_s=episode_wall_time_s,
+                )
+            )
 
             # save video: always if save_video=True; only failures if save_video_failures=True
             _is_failure = metrics['success'] == 0.0
@@ -1370,6 +2056,12 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 process_bar.write(f"[Resume] Skipped {_n_skipped} completed episodes, resuming from {scene_id}_{episode_id:04d}")
 
             print("episode start", episode_instruction)
+            episode_start_time = time.perf_counter()
+            episode_runtime_state = self._new_episode_runtime_state(
+                scene_id=scene_id,
+                episode_id=episode_id,
+                episode_instruction=episode_instruction,
+            )
 
             agent_state = self.env._env.sim.get_agent_state()
             rotation = agent_state.rotation
@@ -1419,6 +2111,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
             # ---------- 2. Episode step loop -----------
             while (not done) and (step_id <= self.max_steps_per_episode):
+                control_gap_start = time.perf_counter()
                 # refactor agent get action
                 rgb = observations["rgb"]
                 depth = observations["depth"]
@@ -1495,13 +2188,19 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     inputs = self.processor(text=[text], images=input_images, return_tensors="pt").to(self.device)
 
                     if self.s2_vllm_url:
+                        s2_start = time.perf_counter()
                         llm_outputs = self._vllm_generate(messages, max_new_tokens=128)
+                        episode_runtime_state["s2_step_latency_ms"].append(
+                            (time.perf_counter() - s2_start) * 1000.0
+                        )
+                        episode_runtime_state["s2_requests"] += 1
                         generated_ids = self.processor.tokenizer.encode(llm_outputs, add_special_tokens=False)
                         output_ids = torch.cat([
                             inputs.input_ids,
                             torch.tensor([generated_ids], device=inputs.input_ids.device),
                         ], dim=1)
                     else:
+                        s2_start = time.perf_counter()
                         with torch.no_grad():
                             output_ids = self.model.generate(
                                 **inputs,
@@ -1511,6 +2210,10 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                                 past_key_values=None,
                                 return_dict_in_generate=True,
                             ).sequences
+                        episode_runtime_state["s2_step_latency_ms"].append(
+                            (time.perf_counter() - s2_start) * 1000.0
+                        )
+                        episode_runtime_state["s2_requests"] += 1
                         llm_outputs = self.processor.tokenizer.decode(
                             output_ids[0][inputs.input_ids.shape[1] :], skip_special_tokens=True
                         )
@@ -1518,6 +2221,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     print('step_id:', step_id, 'output text:', llm_outputs)
 
                     if bool(re.search(r'\d', llm_outputs)):  # output pixel goal
+                        episode_runtime_state["pixel_goal_count"] += 1
                         forward_action = 0
                         coord = [int(c) for c in re.findall(r'\d+', llm_outputs)]
 
@@ -1550,6 +2254,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             print('predicted goal', pixel_goal, goal, flush=True)
 
                     else:
+                        episode_runtime_state["s2_discrete_action_count"] += 1
                         action_seq = self.parse_actions(llm_outputs)
                         print('actions', action_seq, flush=True)
 
@@ -1578,6 +2283,10 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         continue
                 else:
                     action = 0
+
+                episode_runtime_state["end_to_end_control_gap_ms"].append(
+                    (time.perf_counter() - control_gap_start) * 1000.0
+                )
 
                 info = self.env.get_metrics()
 
@@ -1634,6 +2343,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             _avg_min_dist_h = _sum_min_dist_h / _dist_h_count if _dist_h_count > 0 else -1.0
             collision_counts.append(float(_collision_count))
             psi_rates.append(_psi_rate)
+            episode_wall_time_s = time.perf_counter() - episode_start_time
 
             print(
                 f"scene_episode {scene_id}_{episode_id:04d} success: {metrics['success']}, "
@@ -1664,6 +2374,18 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             os.makedirs(self.output_path, exist_ok=True)
             with open(os.path.join(self.output_path, 'progress.json'), 'a') as f:
                 f.write(json.dumps(result) + "\n")
+            self._append_episode_metric_record(
+                self._build_episode_summary(
+                    runtime_state=episode_runtime_state,
+                    env_metrics=metrics,
+                    step_id=step_id,
+                    collision_count=_collision_count,
+                    psi_steps=_psi_steps,
+                    psi_rate=_psi_rate,
+                    avg_min_dist_to_human=_avg_min_dist_h,
+                    episode_wall_time_s=episode_wall_time_s,
+                )
+            )
 
             # save video: always if save_video=True; only failures if save_video_failures=True
             _is_failure = metrics['success'] == 0.0

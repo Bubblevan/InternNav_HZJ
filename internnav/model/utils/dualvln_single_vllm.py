@@ -6,6 +6,7 @@ import os
 import re
 from pathlib import Path
 from typing import Optional
+import time
 
 import requests as http_requests
 import torch
@@ -462,6 +463,61 @@ def _collect_step_s2_mm_debug(processed_prompt, bundle) -> dict:
     }
 
 
+def _bundle_mm_features_have_missing_payload(bundle) -> bool:
+    mm_features = getattr(bundle, "mm_features", None)
+    if not mm_features:
+        return False
+    return any(getattr(feature, "data", None) is None for feature in mm_features)
+
+
+def _aggregate_vllm_worker_runtime_stats(worker_reports) -> dict:
+    reports = [report for report in (worker_reports or []) if isinstance(report, dict)]
+    if not reports:
+        return {
+            "available_kv_cache_memory_bytes": None,
+            "requested_memory_bytes": None,
+            "peak_activation_memory_bytes": None,
+            "cudagraph_memory_estimate_bytes": None,
+            "effective_kv_budget_bytes": None,
+            "gpu_memory_utilization": None,
+            "max_model_len": None,
+            "num_gpu_blocks": None,
+            "worker_count": 0,
+        }
+
+    def _sum_optional_int(key: str):
+        values = [report.get(key) for report in reports if report.get(key) is not None]
+        return int(sum(values)) if values else None
+
+    head = reports[0]
+    return {
+        "available_kv_cache_memory_bytes": _sum_optional_int("available_kv_cache_memory_bytes"),
+        "requested_memory_bytes": _sum_optional_int("requested_memory_bytes"),
+        "peak_activation_memory_bytes": _sum_optional_int("peak_activation_memory_bytes"),
+        "cudagraph_memory_estimate_bytes": _sum_optional_int("cudagraph_memory_estimate_bytes"),
+        "effective_kv_budget_bytes": _sum_optional_int("effective_kv_budget_bytes"),
+        "gpu_memory_utilization": head.get("gpu_memory_utilization"),
+        "max_model_len": head.get("max_model_len"),
+        "num_gpu_blocks": _sum_optional_int("num_gpu_blocks"),
+        "worker_count": len(reports),
+    }
+
+
+def _make_runtime_stats_error_payload(exc: Exception) -> dict:
+    return {
+        "available_kv_cache_memory_bytes": None,
+        "requested_memory_bytes": None,
+        "peak_activation_memory_bytes": None,
+        "cudagraph_memory_estimate_bytes": None,
+        "effective_kv_budget_bytes": None,
+        "gpu_memory_utilization": None,
+        "max_model_len": None,
+        "num_gpu_blocks": None,
+        "worker_count": 0,
+        "collect_error": repr(exc),
+    }
+
+
 class DualVLNSingleVLLMRunner:
     def __init__(
         self,
@@ -522,6 +578,32 @@ class DualVLNSingleVLLMRunner:
             disable_log_stats=True,
         )
         self._last_step_s2_engine_request = None
+        self._runtime_stats_refresh_mode = os.environ.get(
+            "INTERNNAV_VLLM_RUNTIME_STATS_REFRESH_MODE",
+            "init_once",
+        )
+        self._cached_vllm_runtime_stats = self._fetch_vllm_runtime_stats_once()
+
+    def _fetch_vllm_runtime_stats_once(self) -> dict:
+        try:
+            worker_reports = self.llm.collective_rpc("get_internnav_runtime_stats")
+        except Exception as exc:
+            return _make_runtime_stats_error_payload(exc)
+        return _aggregate_vllm_worker_runtime_stats(worker_reports)
+
+    def _get_cached_vllm_runtime_stats(self) -> dict:
+        if self._runtime_stats_refresh_mode == "manual":
+            return dict(self._cached_vllm_runtime_stats)
+        if self._runtime_stats_refresh_mode == "init_once":
+            return dict(self._cached_vllm_runtime_stats)
+        if self._runtime_stats_refresh_mode == "lazy_once":
+            if self._cached_vllm_runtime_stats is None:
+                self._cached_vllm_runtime_stats = self._fetch_vllm_runtime_stats_once()
+            return dict(self._cached_vllm_runtime_stats)
+        raise ValueError(
+            "Unsupported INTERNNAV_VLLM_RUNTIME_STATS_REFRESH_MODE: "
+            f"{self._runtime_stats_refresh_mode}"
+        )
 
     def _generate_latents_via_shared_engine(self, bundle):
         prompt_embeds_mode = os.environ.get(
@@ -580,8 +662,13 @@ class DualVLNSingleVLLMRunner:
         from vllm import SamplingParams
         from vllm.outputs import RequestOutput
 
+        total_start = time.perf_counter()
+        preprocess_start = total_start
         vllm_messages = to_vllm_chat_messages(messages)
         processed_prompt = self.llm._preprocess_chat_one(vllm_messages)
+        preprocess_ms = (time.perf_counter() - preprocess_start) * 1000.0
+
+        generate_start = time.perf_counter()
         sampling_params = SamplingParams(max_tokens=max_new_tokens, temperature=0.0)
         outputs = self.llm._render_and_run_requests(
             prompts=(processed_prompt,),
@@ -589,6 +676,7 @@ class DualVLNSingleVLLMRunner:
             output_type=RequestOutput,
             use_tqdm=False,
         )
+        generate_ms = (time.perf_counter() - generate_start) * 1000.0
         request_output = outputs[0]
         self._last_step_s2_engine_request = self.llm.llm_engine.pop_debug_engine_core_request(
             request_output.request_id
@@ -597,6 +685,26 @@ class DualVLNSingleVLLMRunner:
         llm_output = completion.text
         prompt_token_ids = list(request_output.prompt_token_ids or [])
         generated_token_ids = list(completion.token_ids)
+        input_images = extract_images_from_messages(messages)
+        image_placeholders = (processed_prompt.get("mm_placeholders") or {}).get("image") or []
+
+        runtime_metrics = {
+            "preprocess_ms": preprocess_ms,
+            "generate_ms": generate_ms,
+            "bundle_build_ms": 0.0,
+            "mm_attach_ms": 0.0,
+            "latent_prefill_ms": 0.0,
+            "total_ms": 0.0,
+            "prompt_token_count": int(len(prompt_token_ids)),
+            "generated_token_count": int(len(generated_token_ids)),
+            "prefill_token_count": None,
+            "n_query": int(self.n_query),
+            "num_images": int(len(input_images)),
+            "mm_feature_count": int(len(image_placeholders)),
+            "prefill_share_of_total": None,
+            "latent_prefill_share_of_total": None,
+            "decode_share_of_total": None,
+        }
 
         result = {
             "llm_output": llm_output,
@@ -604,16 +712,20 @@ class DualVLNSingleVLLMRunner:
             "generated_token_ids": generated_token_ids,
             "pixel_goal": None,
             "latents": None,
+            "runtime_metrics": runtime_metrics,
+            "vllm_kv_cache": self._get_cached_vllm_runtime_stats(),
         }
 
         if not re.search(r"\d", llm_output):
+            runtime_metrics["total_ms"] = (time.perf_counter() - total_start) * 1000.0
             return result
 
         coord = [int(c) for c in re.findall(r"\d+", llm_output)]
         if len(coord) < 2:
+            runtime_metrics["total_ms"] = (time.perf_counter() - total_start) * 1000.0
             return result
 
-        input_images = extract_images_from_messages(messages)
+        bundle_start = time.perf_counter()
         bundle = build_latents_request_bundle(
             processor=self.processor,
             messages=messages,
@@ -624,7 +736,9 @@ class DualVLNSingleVLLMRunner:
             traj_token_index=self.traj_token_index,
             n_query=self.n_query,
         )
+        runtime_metrics["bundle_build_ms"] = (time.perf_counter() - bundle_start) * 1000.0
         mm_attach_source = os.environ.get("INTERNNAV_STEP_S2_MM_SOURCE", "engine_core_request")
+        mm_attach_start = time.perf_counter()
         if mm_attach_source == "engine_core_request":
             attach_explicit_mm_metadata_from_engine_core_request(
                 bundle,
@@ -636,14 +750,29 @@ class DualVLNSingleVLLMRunner:
             attach_explicit_mm_metadata(bundle, self.llm)
         else:
             raise ValueError(f"Unsupported INTERNNAV_STEP_S2_MM_SOURCE: {mm_attach_source}")
+        mm_attach_backfill = None
+        if mm_attach_source == "engine_core_request" and _bundle_mm_features_have_missing_payload(bundle):
+            attach_explicit_mm_metadata_from_processed_inputs(bundle, processed_prompt)
+            mm_attach_backfill = "processed_prompt_missing_data"
+        if _bundle_mm_features_have_missing_payload(bundle):
+            attach_explicit_mm_metadata(bundle, self.llm)
+            if mm_attach_backfill is None:
+                mm_attach_backfill = "llm_input_processor_missing_data"
+            else:
+                mm_attach_backfill = f"{mm_attach_backfill}+llm_input_processor_missing_data"
+        runtime_metrics["mm_attach_ms"] = (time.perf_counter() - mm_attach_start) * 1000.0
         mm_debug = _collect_step_s2_mm_debug(processed_prompt, bundle)
         mm_debug["mm_attach_source"] = mm_attach_source
+        mm_debug["mm_attach_backfill"] = mm_attach_backfill
+        runtime_metrics["prefill_token_count"] = int(len(bundle.prefill_token_ids))
+        runtime_metrics["mm_feature_count"] = int(len(bundle.mm_features or []))
         if os.environ.get("INTERNNAV_DEBUG_STEP_S2_MM"):
             print(
                 "[DualVLN step_s2 mm_debug] "
                 + json.dumps(mm_debug, ensure_ascii=False, sort_keys=True),
                 flush=True,
             )
+        latent_prefill_start = time.perf_counter()
         if self.latent_backend == "transformers_backend_apply_model":
             latents = self.llm.apply_model(
                 functools.partial(
@@ -659,6 +788,12 @@ class DualVLNSingleVLLMRunner:
             latents = self._ensure_hidden_latents_runner().generate_latents_from_bundle(bundle)
         else:
             raise ValueError(f"Unsupported latent_backend: {self.latent_backend}")
+        runtime_metrics["latent_prefill_ms"] = (time.perf_counter() - latent_prefill_start) * 1000.0
+        runtime_metrics["total_ms"] = (time.perf_counter() - total_start) * 1000.0
+        if runtime_metrics["total_ms"] > 0:
+            runtime_metrics["latent_prefill_share_of_total"] = (
+                runtime_metrics["latent_prefill_ms"] / runtime_metrics["total_ms"]
+            )
 
         result["pixel_goal"] = [int(coord[1]), int(coord[0])]
         result["latents"] = latents

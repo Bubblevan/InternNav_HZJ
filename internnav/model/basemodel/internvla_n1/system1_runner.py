@@ -1,6 +1,7 @@
 import json
 from collections import defaultdict
 from pathlib import Path
+import time
 from types import SimpleNamespace
 from typing import Optional, Union
 
@@ -136,23 +137,32 @@ class InternVLAN1System1Runner(nn.Module):
         if "nextdit" not in self.config.system1:
             raise NotImplementedError(f"Unsupported system1 type: {self.config.system1}")
 
+        total_start = time.perf_counter()
         scheduler = FlowMatchEulerDiscreteScheduler()
         device = traj_latents.device
         dtype = traj_latents.dtype
 
+        cond_project_start = time.perf_counter()
         traj_latents = self.cond_projector(traj_latents)
+        cond_project_ms = (time.perf_counter() - cond_project_start) * 1000.0
+        rgb_encode_ms = 0.0
+        memory_encode_ms = 0.0
         if "async" in self.config.system1:
             with torch.no_grad():
                 images_dp = images_dp.permute(0, 1, 4, 2, 3)
                 images_dp_norm = (images_dp - self._resnet_mean) / self._resnet_std
                 self.rgb_model.to(dtype)
+                rgb_encode_start = time.perf_counter()
                 images_dp_feat = (
                     self.rgb_model.get_intermediate_layers(images_dp_norm.flatten(0, 1).to(dtype))[0]
                     .unflatten(dim=0, sizes=(1, -1))
                 )
+                rgb_encode_ms = (time.perf_counter() - rgb_encode_start) * 1000.0
+                memory_encode_start = time.perf_counter()
                 memory_feat = self.memory_encoder(images_dp_feat.flatten(1, 2))
                 memory_feat = torch.cat([images_dp_feat.flatten(1, 2), memory_feat], dim=-1)
                 memory_tokens = self.rgb_resampler(memory_feat)
+                memory_encode_ms = (time.perf_counter() - memory_encode_start) * 1000.0
             hidden_states = torch.cat([memory_tokens, traj_latents], dim=1)
         else:
             hidden_states = traj_latents
@@ -175,6 +185,8 @@ class InternVLAN1System1Runner(nn.Module):
 
         hidden_states_input = hidden_states_input.repeat_interleave(num_sample_trajs, dim=0)
 
+        dit_loop_start = time.perf_counter()
+        action_decode_ms = 0.0
         for t in scheduler.timesteps:
             latent_features = self.action_encoder(latents)
             pos_ids = (
@@ -192,12 +204,43 @@ class InternVLAN1System1Runner(nn.Module):
                 z_latents=hidden_states_input,
             )
 
+            action_decode_start = time.perf_counter()
             noise_pred = self.action_decoder(noise_pred)
+            action_decode_ms += (time.perf_counter() - action_decode_start) * 1000.0
 
             noise_pred_uncond, noise_pred = noise_pred.chunk(2)
             noise_pred = noise_pred_uncond + guidance_scale * (noise_pred - noise_pred_uncond)
 
             latents = scheduler.step(noise_pred, t, latents, return_dict=False)[0]
+        dit_loop_ms = (time.perf_counter() - dit_loop_start) * 1000.0
+
+        generator_seed = None
+        if generator is not None:
+            try:
+                generator_seed = int(generator.initial_seed())
+            except Exception:
+                generator_seed = None
+        diffusion_steps_total = int(len(scheduler.timesteps))
+        total_ms = (time.perf_counter() - total_start) * 1000.0
+        self._last_generate_traj_metrics = {
+            "s1_generate_traj_ms_total": total_ms,
+            "s1_memory_encode_ms": memory_encode_ms,
+            "s1_rgb_encode_ms": rgb_encode_ms,
+            "s1_cond_project_ms": cond_project_ms,
+            "s1_dit_loop_ms": dit_loop_ms,
+            "s1_action_decode_ms": action_decode_ms,
+            "dit_cache_enabled": False,
+            "dit_cache_hit_rate": 0.0,
+            "dit_cache_hits": 0,
+            "dit_cache_misses": 0,
+            "dit_cache_saved_ms_total": 0.0,
+            "dit_cache_saved_ms_per_call": 0.0,
+            "diffusion_steps_total": diffusion_steps_total,
+            "diffusion_steps_reused": 0,
+            "diffusion_steps_executed": diffusion_steps_total,
+            "s1_generator_seed": generator_seed,
+            "s1_deterministic_mode": generator is not None,
+        }
 
         # Match InternVLAN1ForCausalLM.generate_traj(): [batch_size * num_sample_trajs, T, 3]
         return latents
