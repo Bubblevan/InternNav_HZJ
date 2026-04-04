@@ -14,6 +14,8 @@ from safetensors.torch import load_file
 from transformers import AutoProcessor
 
 from internnav.model.utils.latents_request import (
+    attach_explicit_mm_metadata,
+    attach_explicit_mm_metadata_from_engine_core_request,
     attach_explicit_mm_metadata_from_processed_inputs,
     build_latents_request_bundle,
 )
@@ -226,6 +228,32 @@ def _generate_latents_from_vllm_model(
         return hidden_states[-n_query:, :].unsqueeze(0).cpu()
 
 
+def _build_native_latent_prefill_prompt_embeds(
+    model,
+    prompt_token_ids,
+    latent_queries_cpu,
+    mm_features,
+):
+    if mm_features is None:
+        raise RuntimeError(
+            "Native shared-engine latent prefill requires canonical mm_features."
+        )
+
+    device = next(model.parameters()).device
+    input_ids = torch.tensor(
+        prompt_token_ids,
+        device=device,
+        dtype=torch.long,
+    )
+    embeds = build_prompt_embeds_with_mm_features(
+        model=model,
+        input_ids=input_ids,
+        latent_queries=latent_queries_cpu,
+        mm_features=mm_features,
+    )
+    return embeds.detach().cpu()
+
+
 def _inspect_transformers_backend_model_tree(model) -> dict:
     wrapper_type = type(model).__name__
     wrapped = getattr(model, "model", None)
@@ -390,6 +418,42 @@ def to_vllm_chat_messages(messages):
     return converted
 
 
+def _collect_step_s2_mm_debug(processed_prompt, bundle) -> dict:
+    mm_placeholders = processed_prompt.get("mm_placeholders") or {}
+    mm_kwargs = processed_prompt.get("mm_kwargs") or {}
+    image_placeholders = mm_placeholders.get("image") or []
+    image_kwargs = mm_kwargs.get("image") or []
+    none_mm_kwargs = sum(item is None for item in image_kwargs)
+
+    mm_features = bundle.mm_features
+    mm_features_len = len(mm_features) if mm_features is not None else None
+    mm_features_type = type(mm_features).__name__
+    mm_features_num_data_none = (
+        sum(getattr(feature, "data", None) is None for feature in mm_features)
+        if mm_features is not None
+        else None
+    )
+
+    feature0_offset = None
+    feature0_length = None
+    if mm_features:
+        feature0_offset = int(mm_features[0].mm_position.offset)
+        feature0_length = int(mm_features[0].mm_position.length)
+
+    return {
+        "processed_prompt_type": processed_prompt.get("type"),
+        "processed_prompt_num_image_placeholders": len(image_placeholders),
+        "processed_prompt_num_image_kwargs": len(image_kwargs),
+        "processed_prompt_num_image_kwargs_none": none_mm_kwargs,
+        "bundle_mm_features_is_none": mm_features is None,
+        "bundle_mm_features_len": mm_features_len,
+        "bundle_mm_features_type": mm_features_type,
+        "bundle_mm_features_num_data_none": mm_features_num_data_none,
+        "bundle_mm_feature0_offset": feature0_offset,
+        "bundle_mm_feature0_length": feature0_length,
+    }
+
+
 class DualVLNSingleVLLMRunner:
     def __init__(
         self,
@@ -411,7 +475,10 @@ class DualVLNSingleVLLMRunner:
 
         self.model_path = model_path
         self.hf_model_path = hf_model_path or model_path
-        self.processor = AutoProcessor.from_pretrained(self.hf_model_path)
+        self.processor = AutoProcessor.from_pretrained(
+            self.hf_model_path,
+            trust_remote_code=trust_remote_code,
+        )
         self.processor.tokenizer.padding_side = "left"
         self.latent_queries = _load_latent_queries_tensor(self.hf_model_path)
         self.n_query = int(self.latent_queries.shape[0])
@@ -446,19 +513,24 @@ class DualVLNSingleVLLMRunner:
             seed=seed,
             disable_log_stats=True,
         )
+        self._last_step_s2_engine_request = None
 
     def _generate_latents_via_shared_engine(self, bundle):
-        return self.llm.apply_model(
-            functools.partial(
-                _generate_latents_from_vllm_model,
-                prompt_token_ids=bundle.full_output_token_ids,
-                pixel_values_cpu=bundle.pixel_values,
-                image_grid_thw_cpu=bundle.image_grid_thw,
-                latent_queries_cpu=bundle.latent_queries,
-                traj_token_index=self.traj_token_index,
-                n_query=self.n_query,
-                mm_features=bundle.mm_features,
-            )
+        if bundle.prompt_embeds is None:
+            bundle.prompt_embeds = self.llm.apply_model(
+                functools.partial(
+                    _build_native_latent_prefill_prompt_embeds,
+                    prompt_token_ids=bundle.prefill_token_ids,
+                    latent_queries_cpu=bundle.latent_queries,
+                    mm_features=bundle.mm_features,
+                )
+            )[0]
+
+        return self.llm.generate_latents_native_prefill(
+            prompt_token_ids=bundle.prefill_token_ids,
+            prompt_embeds=bundle.prompt_embeds,
+            mm_features=bundle.mm_features,
+            n_query=self.n_query,
         )[0]
 
     def _ensure_hidden_latents_runner(self):
@@ -482,6 +554,9 @@ class DualVLNSingleVLLMRunner:
             use_tqdm=False,
         )
         request_output = outputs[0]
+        self._last_step_s2_engine_request = self.llm.llm_engine.pop_debug_engine_core_request(
+            request_output.request_id
+        )
         completion = request_output.outputs[0]
         llm_output = completion.text
         prompt_token_ids = list(request_output.prompt_token_ids or [])
@@ -513,7 +588,26 @@ class DualVLNSingleVLLMRunner:
             traj_token_index=self.traj_token_index,
             n_query=self.n_query,
         )
-        attach_explicit_mm_metadata_from_processed_inputs(bundle, processed_prompt)
+        mm_attach_source = os.environ.get("INTERNNAV_STEP_S2_MM_SOURCE", "engine_core_request")
+        if mm_attach_source == "engine_core_request":
+            attach_explicit_mm_metadata_from_engine_core_request(
+                bundle,
+                self._last_step_s2_engine_request,
+            )
+        elif mm_attach_source == "processed_prompt":
+            attach_explicit_mm_metadata_from_processed_inputs(bundle, processed_prompt)
+        elif mm_attach_source == "llm_input_processor":
+            attach_explicit_mm_metadata(bundle, self.llm)
+        else:
+            raise ValueError(f"Unsupported INTERNNAV_STEP_S2_MM_SOURCE: {mm_attach_source}")
+        mm_debug = _collect_step_s2_mm_debug(processed_prompt, bundle)
+        mm_debug["mm_attach_source"] = mm_attach_source
+        if os.environ.get("INTERNNAV_DEBUG_STEP_S2_MM"):
+            print(
+                "[DualVLN step_s2 mm_debug] "
+                + json.dumps(mm_debug, ensure_ascii=False, sort_keys=True),
+                flush=True,
+            )
         if self.latent_backend == "transformers_backend_apply_model":
             latents = self.llm.apply_model(
                 functools.partial(
@@ -532,6 +626,7 @@ class DualVLNSingleVLLMRunner:
 
         result["pixel_goal"] = [int(coord[1]), int(coord[0])]
         result["latents"] = latents
+        result["debug_mm"] = mm_debug
         return result
 
 

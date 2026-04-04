@@ -1,3 +1,4 @@
+from dataclasses import replace
 from typing import Any, Optional, Sequence
 
 import torch
@@ -26,6 +27,59 @@ def _get_mm_item_data(mm_item: Any) -> dict:
     for key, value in mm_item.items():
         data[key] = getattr(value, "data", value)
     return data
+
+
+def _normalize_mm_kwargs_for_embed_multimodal(mm_kwargs: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(mm_kwargs)
+
+    for key in ("image_grid_thw", "video_grid_thw"):
+        value = normalized.get(key)
+        if torch.is_tensor(value) and value.ndim == 1:
+            normalized[key] = value.unsqueeze(0)
+
+    second_per_grid_ts = normalized.get("second_per_grid_ts")
+    if torch.is_tensor(second_per_grid_ts) and second_per_grid_ts.ndim == 0:
+        normalized["second_per_grid_ts"] = second_per_grid_ts.unsqueeze(0)
+
+    return normalized
+
+
+def _get_mm_feature_cache_key(mm_feature: Any) -> Optional[str]:
+    return getattr(mm_feature, "mm_hash", None) or getattr(mm_feature, "identifier", None)
+
+
+def materialize_mm_features_with_cached_data(
+    mm_features: Optional[Sequence[Any]],
+) -> list[Any]:
+    if not mm_features:
+        return []
+
+    resolved_features = []
+    cached_mm_items: dict[str, Any] = {}
+    for mm_feature in sorted(mm_features, key=lambda feature: feature.mm_position.offset):
+        mm_item = mm_feature.data
+        cache_key = _get_mm_feature_cache_key(mm_feature)
+
+        if mm_item is not None:
+            if cache_key is not None:
+                cached_mm_items[cache_key] = mm_item
+            resolved_features.append(mm_feature)
+            continue
+
+        if cache_key is None or cache_key not in cached_mm_items:
+            raise RuntimeError(
+                "Missing mm_feature.data with no prior cached payload for the same "
+                "identifier/mm_hash while rebuilding generate_latents multimodal inputs."
+            )
+
+        resolved_features.append(
+            replace(
+                mm_feature,
+                data=cached_mm_items[cache_key],
+            )
+        )
+
+    return resolved_features
 
 
 def build_is_multimodal_mask(
@@ -68,20 +122,25 @@ def build_multimodal_embeddings_from_mm_features(
         return ()
 
     multimodal_embeddings = []
-    for mm_feature in sorted(mm_features, key=lambda feature: feature.mm_position.offset):
+    embedding_cache: dict[str, torch.Tensor] = {}
+    resolved_features = materialize_mm_features_with_cached_data(mm_features)
+    for mm_feature in resolved_features:
         mm_item = mm_feature.data
-        if mm_item is None:
-            raise RuntimeError(
-                "Missing mm_feature.data while rebuilding generate_latents prompt embeds. "
-                "This indicates vLLM cached away the multimodal payload."
-            )
+        cache_key = _get_mm_feature_cache_key(mm_feature)
+
+        if cache_key is not None and cache_key in embedding_cache:
+            multimodal_embeddings.append(embedding_cache[cache_key])
+            continue
 
         mm_kwargs = {
             key: _move_nested_to_device(value, device=device)
             for key, value in _get_mm_item_data(mm_item).items()
         }
+        mm_kwargs = _normalize_mm_kwargs_for_embed_multimodal(mm_kwargs)
         item_embeddings = model.embed_multimodal(**mm_kwargs)
         if isinstance(item_embeddings, torch.Tensor):
+            if cache_key is not None:
+                embedding_cache[cache_key] = item_embeddings
             multimodal_embeddings.append(item_embeddings)
             continue
         if len(item_embeddings) != 1:
@@ -89,7 +148,11 @@ def build_multimodal_embeddings_from_mm_features(
                 "Expected exactly one multimodal embedding tensor per feature, got "
                 f"{len(item_embeddings)} for modality={mm_feature.modality!r}."
             )
-        multimodal_embeddings.append(item_embeddings[0])
+        item_embeddings = item_embeddings[0]
+
+        if cache_key is not None:
+            embedding_cache[cache_key] = item_embeddings
+        multimodal_embeddings.append(item_embeddings)
 
     return tuple(multimodal_embeddings)
 
@@ -140,8 +203,9 @@ def compute_mrope_positions_from_mm_features(
     if not mm_features or not hasattr(model, "get_mrope_input_positions"):
         return None
 
+    resolved_features = materialize_mm_features_with_cached_data(mm_features)
     positions, _ = model.get_mrope_input_positions(
         list(prompt_token_ids),
-        list(mm_features),
+        resolved_features,
     )
     return positions.to(device=device)

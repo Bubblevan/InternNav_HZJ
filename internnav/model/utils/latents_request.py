@@ -66,9 +66,6 @@ def attach_explicit_mm_metadata_from_processed_inputs(
     for modality, idx in argsort_mm_positions(mm_placeholders):
         item_hash = mm_hashes[modality][idx]
         item_data = mm_kwargs[modality][idx]
-        if item_data is None:
-            bundle.mm_features = None
-            return bundle
         mm_features.append(
             MultiModalFeatureSpec(
                 data=item_data,
@@ -80,6 +77,52 @@ def attach_explicit_mm_metadata_from_processed_inputs(
         )
     bundle.mm_features = mm_features or None
     return bundle
+
+
+def _attach_mm_metadata_from_features(
+    bundle: LatentsRequestBundle,
+    mm_features,
+) -> LatentsRequestBundle:
+    mm_kwargs: Dict[str, List[Any]] = defaultdict(list)
+    mm_hashes: Dict[str, List[str | None]] = defaultdict(list)
+    mm_placeholders: Dict[str, List[Any]] = defaultdict(list)
+    copied_mm_features = list(mm_features or [])
+
+    for mm_feature in copied_mm_features:
+        mm_kwargs[mm_feature.modality].append(mm_feature.data)
+        mm_hashes[mm_feature.modality].append(mm_feature.mm_hash)
+        mm_placeholders[mm_feature.modality].append(mm_feature.mm_position)
+
+    bundle.mm_kwargs = dict(mm_kwargs) if mm_kwargs else None
+    bundle.mm_hashes = dict(mm_hashes) if mm_hashes else None
+    bundle.mm_placeholders = dict(mm_placeholders) if mm_placeholders else None
+    bundle.mm_features = copied_mm_features or None
+    return bundle
+
+
+def attach_explicit_mm_metadata_from_engine_core_request(
+    bundle: LatentsRequestBundle,
+    engine_request,
+) -> LatentsRequestBundle:
+    if (
+        bundle.mm_kwargs is not None
+        and bundle.mm_hashes is not None
+        and bundle.mm_placeholders is not None
+        and bundle.mm_features is not None
+    ):
+        return bundle
+
+    if engine_request is None:
+        raise RuntimeError("Missing EngineCoreRequest for step_s2 multimodal metadata attach.")
+
+    processed_prompt_token_ids = list(engine_request.prompt_token_ids or [])
+    if processed_prompt_token_ids != bundle.prompt_token_ids:
+        raise RuntimeError(
+            "EngineCoreRequest prompt_token_ids do not match the canonical "
+            "request_output.prompt_token_ids used by single-vLLM."
+        )
+
+    return _attach_mm_metadata_from_features(bundle, engine_request.mm_features)
 
 
 def build_latents_request_bundle(
@@ -168,16 +211,26 @@ def attach_explicit_mm_metadata(bundle: LatentsRequestBundle, llm) -> LatentsReq
         return bundle
 
     from vllm.pooling_params import PoolingParams
+    from vllm.sampling_params import SamplingParams
+    from vllm.tasks import POOLING_TASKS
 
     prompt = {
         "prompt_token_ids": bundle.prefill_token_ids,
         "multi_modal_data": {"image": bundle.input_images},
     }
+    supported_tasks = tuple(llm.supported_tasks)
+    if any(task in POOLING_TASKS for task in supported_tasks):
+        params = PoolingParams(task="token_embed")
+    else:
+        # We only need InputProcessor's multimodal normalization here. For a
+        # generation-only engine, a trivial SamplingParams is enough to build
+        # EngineCoreRequest.mm_features without ever submitting a decode.
+        params = SamplingParams(max_tokens=1, temperature=0.0)
     engine_request = llm.input_processor.process_inputs(
         request_id="internnav-generate-latents-prefill",
         prompt=prompt,
-        params=PoolingParams(task="token_embed"),
-        supported_tasks=llm.supported_tasks,
+        params=params,
+        supported_tasks=supported_tasks,
     )
 
     processed_prompt_token_ids = list(engine_request.prompt_token_ids or [])
@@ -186,17 +239,4 @@ def attach_explicit_mm_metadata(bundle: LatentsRequestBundle, llm) -> LatentsReq
             "vLLM preprocessor changed the canonical prefill token ids for generate_latents. "
             "This breaks the strict HF-aligned latent contract."
         )
-
-    mm_kwargs: Dict[str, List[Any]] = defaultdict(list)
-    mm_hashes: Dict[str, List[str]] = defaultdict(list)
-    mm_placeholders: Dict[str, List[Any]] = defaultdict(list)
-    for mm_feature in engine_request.mm_features or []:
-        mm_kwargs[mm_feature.modality].append(mm_feature.data)
-        mm_hashes[mm_feature.modality].append(mm_feature.mm_hash)
-        mm_placeholders[mm_feature.modality].append(mm_feature.mm_position)
-
-    bundle.mm_kwargs = dict(mm_kwargs) if mm_kwargs else None
-    bundle.mm_hashes = dict(mm_hashes) if mm_hashes else None
-    bundle.mm_placeholders = dict(mm_placeholders) if mm_placeholders else None
-    bundle.mm_features = list(engine_request.mm_features or []) or None
-    return bundle
+    return _attach_mm_metadata_from_features(bundle, engine_request.mm_features)
