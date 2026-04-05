@@ -4,6 +4,8 @@ import io
 import json
 import os
 import re
+import uuid
+from multiprocessing import shared_memory
 from pathlib import Path
 from typing import Optional
 import time
@@ -30,6 +32,8 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
 
 TRAJ_TOKEN_INDEX = 151667
+DEFAULT_IMAGE_TRANSPORT_MODE = "base64"
+IMAGE_TRANSPORT_ENV = "INTERNNAV_DUALVLN_IMAGE_TRANSPORT"
 
 
 def _load_latent_queries_tensor(model_path: str) -> torch.Tensor:
@@ -373,19 +377,144 @@ def decode_pil_image_from_b64(payload: str) -> Image.Image:
     return Image.open(io.BytesIO(raw)).convert("RGB")
 
 
-def encode_messages(messages):
+def _get_image_transport_mode() -> str:
+    mode = os.environ.get(IMAGE_TRANSPORT_ENV, DEFAULT_IMAGE_TRANSPORT_MODE).strip().lower()
+    if mode not in {"base64", "image_shm"}:
+        raise ValueError(
+            f"Unsupported {IMAGE_TRANSPORT_ENV}={mode!r}; expected 'base64' or 'image_shm'."
+        )
+    return mode
+
+
+def _build_image_shm_name() -> str:
+    return f"internnav_img_{os.getpid()}_{time.time_ns()}_{uuid.uuid4().hex}"
+
+
+def _best_effort_unregister_shared_memory(shm_handle: shared_memory.SharedMemory) -> None:
+    try:
+        from multiprocessing import resource_tracker
+
+        resource_name = getattr(shm_handle, "_name", None) or shm_handle.name
+        resource_tracker.unregister(resource_name, "shared_memory")
+    except Exception:
+        pass
+
+
+def _encode_pil_image_to_shm(image: Image.Image, *, message_index: int, content_index: int):
+    rgb_image = image.convert("RGB")
+    width, height = rgb_image.size
+    raw = rgb_image.tobytes()
+    shm_handle = shared_memory.SharedMemory(
+        name=_build_image_shm_name(),
+        create=True,
+        size=len(raw),
+    )
+    shm_handle.buf[: len(raw)] = raw
+    payload = {
+        "type": "image",
+        "image_transport": "image_shm",
+        "shm_name": shm_handle.name,
+        "shape": [height, width, 3],
+        "dtype": "uint8",
+        "mode": "RGB",
+        "nbytes": len(raw),
+        "message_index": int(message_index),
+        "content_index": int(content_index),
+    }
+    return payload, shm_handle, len(raw)
+
+
+def _decode_pil_image_from_shm(payload: dict) -> Image.Image:
+    shm_name = payload["shm_name"]
+    shape = payload["shape"]
+    dtype = payload.get("dtype", "uint8")
+    mode = payload.get("mode", "RGB")
+    nbytes = int(payload["nbytes"])
+    if dtype != "uint8":
+        raise ValueError(f"Unsupported shared-memory image dtype: {dtype}")
+    if mode != "RGB":
+        raise ValueError(f"Unsupported shared-memory image mode: {mode}")
+    if len(shape) != 3 or int(shape[2]) != 3:
+        raise ValueError(f"Unsupported shared-memory image shape: {shape}")
+
+    height = int(shape[0])
+    width = int(shape[1])
+    expected_nbytes = height * width * 3
+    if nbytes != expected_nbytes:
+        raise ValueError(
+            f"Shared-memory image payload size mismatch: nbytes={nbytes}, expected={expected_nbytes}"
+        )
+
+    shm_handle = shared_memory.SharedMemory(name=shm_name, create=False)
+    try:
+        raw = bytes(shm_handle.buf[:nbytes])
+        return Image.frombytes("RGB", (width, height), raw)
+    finally:
+        try:
+            shm_handle.close()
+        finally:
+            try:
+                shm_handle.unlink()
+            except FileNotFoundError:
+                pass
+            finally:
+                _best_effort_unregister_shared_memory(shm_handle)
+
+
+def _cleanup_client_shared_memory_handles(shared_memory_handles) -> None:
+    for shm_handle in shared_memory_handles:
+        try:
+            shm_handle.close()
+        finally:
+            try:
+                shm_handle.unlink()
+            except FileNotFoundError:
+                pass
+            finally:
+                _best_effort_unregister_shared_memory(shm_handle)
+
+
+def encode_messages(messages, *, image_transport_mode: Optional[str] = None):
+    transport_mode = image_transport_mode or _get_image_transport_mode()
     encoded = []
+    shared_memory_handles = []
+    image_payload_bytes = 0
+    image_count = 0
     for message in messages:
         content = []
-        for item in message["content"]:
+        for content_index, item in enumerate(message["content"]):
             if item["type"] == "text":
                 content.append({"type": "text", "text": item["text"]})
             elif item["type"] == "image":
-                content.append({"type": "image", "image": encode_pil_image_to_b64(item["image"])})
+                image_count += 1
+                if transport_mode == "base64":
+                    content.append(
+                        {
+                            "type": "image",
+                            "image_transport": "base64",
+                            "image": encode_pil_image_to_b64(item["image"]),
+                        }
+                    )
+                elif transport_mode == "image_shm":
+                    shm_payload, shm_handle, payload_bytes = _encode_pil_image_to_shm(
+                        item["image"],
+                        message_index=len(encoded),
+                        content_index=content_index,
+                    )
+                    content.append(shm_payload)
+                    shared_memory_handles.append(shm_handle)
+                    image_payload_bytes += payload_bytes
+                else:
+                    raise ValueError(f"Unsupported image transport mode: {transport_mode}")
             else:
                 raise ValueError(f"Unsupported message content type: {item['type']}")
         encoded.append({"role": message["role"], "content": content})
-    return encoded
+    return encoded, {
+        "image_transport_mode": transport_mode,
+        "shared_memory_handles": shared_memory_handles,
+        "image_count": image_count,
+        "image_payload_bytes": image_payload_bytes,
+    }
 
 
 def decode_messages(messages):
@@ -396,7 +525,13 @@ def decode_messages(messages):
             if item["type"] == "text":
                 content.append({"type": "text", "text": item["text"]})
             elif item["type"] == "image":
-                content.append({"type": "image", "image": decode_pil_image_from_b64(item["image"])})
+                image_transport = item.get("image_transport", "base64")
+                if image_transport == "base64":
+                    content.append({"type": "image", "image": decode_pil_image_from_b64(item["image"])})
+                elif image_transport == "image_shm":
+                    content.append({"type": "image", "image": _decode_pil_image_from_shm(item)})
+                else:
+                    raise ValueError(f"Unsupported image transport type: {image_transport}")
             else:
                 raise ValueError(f"Unsupported message content type: {item['type']}")
         decoded.append({"role": message["role"], "content": content})
@@ -805,59 +940,71 @@ class DualVLNSingleVLLMHTTPClient:
     def __init__(self, base_url: str, timeout: float = 300.0):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        self.image_transport_mode = _get_image_transport_mode()
 
     def step_s2(self, messages, *, max_new_tokens: int = 128, target_device=None, target_dtype=None):
         client_total_start = time.perf_counter()
         encode_start = client_total_start
-        encoded_messages = encode_messages(messages)
+        encoded_messages, encode_state = encode_messages(
+            messages,
+            image_transport_mode=self.image_transport_mode,
+        )
         client_encode_messages_ms = (time.perf_counter() - encode_start) * 1000.0
         payload = {
             "messages": encoded_messages,
             "max_new_tokens": int(max_new_tokens),
+            "image_transport_mode": encode_state["image_transport_mode"],
         }
-        http_start = time.perf_counter()
-        resp = http_requests.post(
-            f"{self.base_url}/dualvln/step_s2",
-            json=payload,
-            timeout=self.timeout,
-        )
-        client_http_post_ms = (time.perf_counter() - http_start) * 1000.0
-        resp.raise_for_status()
-        response_json_start = time.perf_counter()
-        data = resp.json()
-        client_response_json_ms = (time.perf_counter() - response_json_start) * 1000.0
-        latents = None
-        decode_latents_start = time.perf_counter()
-        if data.get("latents") is not None:
-            latents = decode_tensor_from_b64(data["latents"])
-            if target_dtype is not None:
-                latents = latents.to(dtype=target_dtype)
-            if target_device is not None:
-                latents = latents.to(device=target_device)
-        client_decode_latents_ms = (time.perf_counter() - decode_latents_start) * 1000.0
-        client_total_ms = (time.perf_counter() - client_total_start) * 1000.0
-        transport_metrics = dict(data.get("transport_metrics") or {})
-        transport_metrics.update(
-            {
-                "client_encode_messages_ms": client_encode_messages_ms,
-                "client_http_post_ms": client_http_post_ms,
-                "client_response_json_ms": client_response_json_ms,
-                "client_decode_latents_ms": client_decode_latents_ms,
-                "client_total_ms": client_total_ms,
-            }
-        )
-        runtime_total_ms = ((data.get("runtime_metrics") or {}).get("total_ms"))
-        server_total_ms = transport_metrics.get("server_total_ms")
-        transport_metrics["client_side_overhead_ms"] = (
-            float(max(client_total_ms - server_total_ms, 0.0))
-            if server_total_ms is not None
-            else None
-        )
-        transport_metrics["end_to_end_transport_overhead_ms"] = (
-            float(max(client_total_ms - runtime_total_ms, 0.0))
-            if runtime_total_ms is not None
-            else None
-        )
-        data["latents"] = latents
-        data["transport_metrics"] = transport_metrics
-        return data
+        data = None
+        try:
+            http_start = time.perf_counter()
+            resp = http_requests.post(
+                f"{self.base_url}/dualvln/step_s2",
+                json=payload,
+                timeout=self.timeout,
+            )
+            client_http_post_ms = (time.perf_counter() - http_start) * 1000.0
+            resp.raise_for_status()
+            response_json_start = time.perf_counter()
+            data = resp.json()
+            client_response_json_ms = (time.perf_counter() - response_json_start) * 1000.0
+            latents = None
+            decode_latents_start = time.perf_counter()
+            if data.get("latents") is not None:
+                latents = decode_tensor_from_b64(data["latents"])
+                if target_dtype is not None:
+                    latents = latents.to(dtype=target_dtype)
+                if target_device is not None:
+                    latents = latents.to(device=target_device)
+            client_decode_latents_ms = (time.perf_counter() - decode_latents_start) * 1000.0
+            client_total_ms = (time.perf_counter() - client_total_start) * 1000.0
+            transport_metrics = dict(data.get("transport_metrics") or {})
+            transport_metrics.update(
+                {
+                    "client_encode_messages_ms": client_encode_messages_ms,
+                    "client_http_post_ms": client_http_post_ms,
+                    "client_response_json_ms": client_response_json_ms,
+                    "client_decode_latents_ms": client_decode_latents_ms,
+                    "client_total_ms": client_total_ms,
+                    "image_transport_mode": encode_state["image_transport_mode"],
+                    "image_transport_count": int(encode_state["image_count"]),
+                    "image_transport_payload_bytes": int(encode_state["image_payload_bytes"]),
+                }
+            )
+            runtime_total_ms = ((data.get("runtime_metrics") or {}).get("total_ms"))
+            server_total_ms = transport_metrics.get("server_total_ms")
+            transport_metrics["client_side_overhead_ms"] = (
+                float(max(client_total_ms - server_total_ms, 0.0))
+                if server_total_ms is not None
+                else None
+            )
+            transport_metrics["end_to_end_transport_overhead_ms"] = (
+                float(max(client_total_ms - runtime_total_ms, 0.0))
+                if runtime_total_ms is not None
+                else None
+            )
+            data["latents"] = latents
+            data["transport_metrics"] = transport_metrics
+            return data
+        finally:
+            _cleanup_client_shared_memory_handles(encode_state["shared_memory_handles"])

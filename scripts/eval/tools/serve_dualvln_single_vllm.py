@@ -35,6 +35,7 @@ def dualvln_step_s2():
     request_parse_start = server_total_start
     payload = request.get_json(force=True, cache=False)
     server_request_parse_ms = (time.perf_counter() - request_parse_start) * 1000.0
+    image_transport_mode = str(payload.get("image_transport_mode", "base64"))
 
     decode_start = time.perf_counter()
     messages = decode_messages(payload["messages"])
@@ -55,6 +56,7 @@ def dualvln_step_s2():
         "server_encode_response_ms": None,
         "server_total_ms": None,
         "server_outer_overhead_ms": None,
+        "image_transport_mode": image_transport_mode,
     }
     response_payload = {
         "llm_output": result["llm_output"],
