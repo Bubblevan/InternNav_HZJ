@@ -807,23 +807,57 @@ class DualVLNSingleVLLMHTTPClient:
         self.timeout = timeout
 
     def step_s2(self, messages, *, max_new_tokens: int = 128, target_device=None, target_dtype=None):
+        client_total_start = time.perf_counter()
+        encode_start = client_total_start
+        encoded_messages = encode_messages(messages)
+        client_encode_messages_ms = (time.perf_counter() - encode_start) * 1000.0
         payload = {
-            "messages": encode_messages(messages),
+            "messages": encoded_messages,
             "max_new_tokens": int(max_new_tokens),
         }
+        http_start = time.perf_counter()
         resp = http_requests.post(
             f"{self.base_url}/dualvln/step_s2",
             json=payload,
             timeout=self.timeout,
         )
+        client_http_post_ms = (time.perf_counter() - http_start) * 1000.0
         resp.raise_for_status()
+        response_json_start = time.perf_counter()
         data = resp.json()
+        client_response_json_ms = (time.perf_counter() - response_json_start) * 1000.0
         latents = None
+        decode_latents_start = time.perf_counter()
         if data.get("latents") is not None:
             latents = decode_tensor_from_b64(data["latents"])
             if target_dtype is not None:
                 latents = latents.to(dtype=target_dtype)
             if target_device is not None:
                 latents = latents.to(device=target_device)
+        client_decode_latents_ms = (time.perf_counter() - decode_latents_start) * 1000.0
+        client_total_ms = (time.perf_counter() - client_total_start) * 1000.0
+        transport_metrics = dict(data.get("transport_metrics") or {})
+        transport_metrics.update(
+            {
+                "client_encode_messages_ms": client_encode_messages_ms,
+                "client_http_post_ms": client_http_post_ms,
+                "client_response_json_ms": client_response_json_ms,
+                "client_decode_latents_ms": client_decode_latents_ms,
+                "client_total_ms": client_total_ms,
+            }
+        )
+        runtime_total_ms = ((data.get("runtime_metrics") or {}).get("total_ms"))
+        server_total_ms = transport_metrics.get("server_total_ms")
+        transport_metrics["client_side_overhead_ms"] = (
+            float(max(client_total_ms - server_total_ms, 0.0))
+            if server_total_ms is not None
+            else None
+        )
+        transport_metrics["end_to_end_transport_overhead_ms"] = (
+            float(max(client_total_ms - runtime_total_ms, 0.0))
+            if runtime_total_ms is not None
+            else None
+        )
         data["latents"] = latents
+        data["transport_metrics"] = transport_metrics
         return data

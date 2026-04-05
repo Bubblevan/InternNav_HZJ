@@ -19,7 +19,18 @@ def _summary_metadata(plot_generated_files=None):
             "runtime_breakdown.decode_share_of_total",
         ],
         "metrics_collection_mode": "hot_path_local_timing + cached_worker_stats",
+        "hot_path_rpc_free": True,
+        "deprecated_fields": [
+            "s2_metrics.s1_invocation_rate",
+            "s2_metrics.s1_invocation_count",
+        ],
         "plot_generated_files": list(plot_generated_files or []),
+        "notes": [
+            "s1_trigger_rate is the recommended collaboration metric.",
+            "avg_s1_rollout_calls_per_trigger explains repeated local S1 replanning under one trigger.",
+            "legacy rollout-call-based S1 counters are deprecated if still present.",
+            "transport_metrics quantify non-vLLM-core overhead outside runtime_breakdown.total_ms.",
+        ],
     }
 
 
@@ -77,12 +88,14 @@ def _aggregate_episode_jsonl(path: Path):
     s2_latency_trace = []
     control_gap_trace = []
     runtime_samples = []
+    transport_samples = []
     s1_call_metrics = []
     for record in records:
         traces = record.get("traces") or {}
         s2_latency_trace.extend(traces.get("s2_step_latency_ms") or [])
         control_gap_trace.extend(traces.get("end_to_end_control_gap_ms") or [])
         runtime_samples.extend(traces.get("s2_runtime_samples") or [])
+        transport_samples.extend(traces.get("transport_metric_samples") or [])
         s1_call_metrics.extend(traces.get("s1_call_metrics") or [])
 
     total_s2_requests = int(sum((record.get("s2_metrics") or {}).get("s2_requests", 0) or 0 for record in records))
@@ -92,8 +105,11 @@ def _aggregate_episode_jsonl(path: Path):
     total_latent_success_count = int(
         sum((record.get("s2_metrics") or {}).get("latent_success_count", 0) or 0 for record in records)
     )
-    total_s1_invocation_count = int(
-        sum((record.get("s2_metrics") or {}).get("s1_invocation_count", 0) or 0 for record in records)
+    total_s1_trigger_count = int(
+        sum((record.get("s2_metrics") or {}).get("s1_trigger_count", 0) or 0 for record in records)
+    )
+    total_s1_rollout_call_count = int(
+        sum((record.get("s2_metrics") or {}).get("s1_rollout_call_count", 0) or 0 for record in records)
     )
     total_s1_actions = int(sum((record.get("s2_metrics") or {}).get("s1_actions_total", 0) or 0 for record in records))
     total_s2_discrete_action_count = int(
@@ -108,11 +124,14 @@ def _aggregate_episode_jsonl(path: Path):
         "latent_success_rate": (
             float(total_latent_success_count / total_pixel_goal_count) if total_pixel_goal_count > 0 else None
         ),
-        "s1_invocation_rate": (
-            float(total_s1_invocation_count / total_s2_requests) if total_s2_requests > 0 else None
+        "s1_trigger_rate": (
+            float(total_s1_trigger_count / total_s2_requests) if total_s2_requests > 0 else None
         ),
         "avg_s1_actions_per_trigger": (
-            float(total_s1_actions / total_s1_invocation_count) if total_s1_invocation_count > 0 else None
+            float(total_s1_actions / total_s1_trigger_count) if total_s1_trigger_count > 0 else None
+        ),
+        "avg_s1_rollout_calls_per_trigger": (
+            float(total_s1_rollout_call_count / total_s1_trigger_count) if total_s1_trigger_count > 0 else None
         ),
         "s2_discrete_action_rate": (
             float(total_s2_discrete_action_count / total_s2_requests) if total_s2_requests > 0 else None
@@ -131,6 +150,13 @@ def _aggregate_episode_jsonl(path: Path):
         "effective_low_level_hz": _mean_or_none(
             [(record.get("s2_metrics") or {}).get("effective_low_level_hz") for record in records]
         ),
+        "s1_trigger_count": total_s1_trigger_count,
+        "s1_rollout_call_count": total_s1_rollout_call_count,
+        "s1_actions_total": total_s1_actions,
+        "s1_invocation_rate": (
+            float(total_s1_rollout_call_count / total_s2_requests) if total_s2_requests > 0 else None
+        ),
+        "s1_invocation_count": total_s1_rollout_call_count,
     }
 
     runtime_breakdown = {}
@@ -152,6 +178,24 @@ def _aggregate_episode_jsonl(path: Path):
         "mm_feature_count",
     ):
         runtime_breakdown[field] = _mean_or_none([sample.get(field) for sample in runtime_samples])
+
+    transport_metrics = {
+        "client_encode_messages_ms": _mean_or_none([sample.get("client_encode_messages_ms") for sample in transport_samples]),
+        "client_http_post_ms": _mean_or_none([sample.get("client_http_post_ms") for sample in transport_samples]),
+        "client_response_json_ms": _mean_or_none([sample.get("client_response_json_ms") for sample in transport_samples]),
+        "client_decode_latents_ms": _mean_or_none([sample.get("client_decode_latents_ms") for sample in transport_samples]),
+        "client_total_ms": _mean_or_none([sample.get("client_total_ms") for sample in transport_samples]),
+        "server_request_parse_ms": _mean_or_none([sample.get("server_request_parse_ms") for sample in transport_samples]),
+        "server_decode_messages_ms": _mean_or_none([sample.get("server_decode_messages_ms") for sample in transport_samples]),
+        "server_runner_step_s2_ms": _mean_or_none([sample.get("server_runner_step_s2_ms") for sample in transport_samples]),
+        "server_encode_response_ms": _mean_or_none([sample.get("server_encode_response_ms") for sample in transport_samples]),
+        "server_total_ms": _mean_or_none([sample.get("server_total_ms") for sample in transport_samples]),
+        "server_outer_overhead_ms": _mean_or_none([sample.get("server_outer_overhead_ms") for sample in transport_samples]),
+        "client_side_overhead_ms": _mean_or_none([sample.get("client_side_overhead_ms") for sample in transport_samples]),
+        "end_to_end_transport_overhead_ms": _mean_or_none(
+            [sample.get("end_to_end_transport_overhead_ms") for sample in transport_samples]
+        ),
+    }
 
     s1_metrics = {
         "s1_generate_traj_ms_total": _mean_or_none([metric.get("s1_generate_traj_ms_total") for metric in s1_call_metrics]),
@@ -196,6 +240,7 @@ def _aggregate_episode_jsonl(path: Path):
             "vllm_kv_cache": vllm_kv_cache,
         },
         "runtime_breakdown": runtime_breakdown,
+        "transport_metrics": transport_metrics,
         "source_path": str(path),
     }
 
@@ -379,8 +424,9 @@ def main():
             [
                 ("s2_metrics", "pixel_goal_yield_rate", "Pixel Goal Yield"),
                 ("s2_metrics", "latent_success_rate", "Latent Success"),
-                ("s2_metrics", "s1_invocation_rate", "S1 Invocation"),
+                ("s2_metrics", "s1_trigger_rate", "S1 Trigger"),
                 ("s2_metrics", "avg_s1_actions_per_trigger", "Avg S1 Actions"),
+                ("s2_metrics", "avg_s1_rollout_calls_per_trigger", "Avg S1 Rollout Calls"),
                 ("s2_metrics", "s2_discrete_action_rate", "S2 Discrete Action"),
             ],
             title="Dual-System Collaboration",
@@ -391,7 +437,7 @@ def main():
     plot_files.extend(
         _plot_stacked_runtime(
             summaries,
-            title="S2 Runtime Breakdown",
+            title="S2 Runtime Breakdown (Core Service Time)",
             output_stem="runtime_breakdown",
             output_dir=output_dir,
             section="runtime_breakdown",
@@ -402,6 +448,20 @@ def main():
                 "mm_attach_ms",
                 "latent_prefill_ms",
             ],
+        )
+    )
+    plot_files.extend(
+        _plot_metric_panels(
+            summaries,
+            [
+                ("runtime_breakdown", "total_ms", "Core Runtime Total"),
+                ("transport_metrics", "server_total_ms", "Server Total"),
+                ("transport_metrics", "client_total_ms", "Client Total"),
+                ("transport_metrics", "end_to_end_transport_overhead_ms", "End-to-End Overhead"),
+            ],
+            title="Transport And Wrapper Overhead",
+            output_stem="transport_overhead",
+            output_dir=output_dir,
         )
     )
     plot_files.extend(

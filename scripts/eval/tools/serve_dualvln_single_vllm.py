@@ -31,31 +31,57 @@ def list_models():
 
 @app.route("/dualvln/step_s2", methods=["POST"])
 def dualvln_step_s2():
-    payload = request.get_json(force=True)
+    server_total_start = time.perf_counter()
+    request_parse_start = server_total_start
+    payload = request.get_json(force=True, cache=False)
+    server_request_parse_ms = (time.perf_counter() - request_parse_start) * 1000.0
+
+    decode_start = time.perf_counter()
     messages = decode_messages(payload["messages"])
+    server_decode_messages_ms = (time.perf_counter() - decode_start) * 1000.0
     max_new_tokens = int(payload.get("max_new_tokens", 128))
-    start_time = time.time()
+
+    runner_start = time.perf_counter()
     result = runner.step_s2(messages, max_new_tokens=max_new_tokens)
-    latency = time.time() - start_time
+    server_runner_step_s2_ms = (time.perf_counter() - runner_start) * 1000.0
+
+    encode_start = time.perf_counter()
+    latents_payload = encode_tensor_to_b64(result["latents"]) if result["latents"] is not None else None
+    runtime_total_ms = ((result.get("runtime_metrics") or {}).get("total_ms"))
+    transport_metrics = {
+        "server_request_parse_ms": server_request_parse_ms,
+        "server_decode_messages_ms": server_decode_messages_ms,
+        "server_runner_step_s2_ms": server_runner_step_s2_ms,
+        "server_encode_response_ms": None,
+        "server_total_ms": None,
+        "server_outer_overhead_ms": None,
+    }
+    response_payload = {
+        "llm_output": result["llm_output"],
+        "prompt_token_ids": result["prompt_token_ids"],
+        "generated_token_ids": result["generated_token_ids"],
+        "pixel_goal": result["pixel_goal"],
+        "latents": latents_payload,
+        "runtime_metrics": result.get("runtime_metrics"),
+        "vllm_kv_cache": result.get("vllm_kv_cache"),
+        "transport_metrics": transport_metrics,
+        "debug_mm": result.get("debug_mm"),
+    }
+    transport_metrics["server_encode_response_ms"] = (time.perf_counter() - encode_start) * 1000.0
+    transport_metrics["server_total_ms"] = (time.perf_counter() - server_total_start) * 1000.0
+    transport_metrics["server_outer_overhead_ms"] = (
+        float(max(transport_metrics["server_total_ms"] - runtime_total_ms, 0.0))
+        if runtime_total_ms is not None
+        else None
+    )
     print(
         "[DualVLN Single vLLM] /dualvln/step_s2 "
-        f"latency={latency:.3f}s "
+        f"latency={transport_metrics['server_total_ms'] / 1000.0:.3f}s "
         f"pixel_goal={result['pixel_goal']} "
         f"gen_tokens={len(result['generated_token_ids'])}",
         flush=True,
     )
-    return jsonify(
-        {
-            "llm_output": result["llm_output"],
-            "prompt_token_ids": result["prompt_token_ids"],
-            "generated_token_ids": result["generated_token_ids"],
-            "pixel_goal": result["pixel_goal"],
-            "latents": encode_tensor_to_b64(result["latents"]) if result["latents"] is not None else None,
-            "runtime_metrics": result.get("runtime_metrics"),
-            "vllm_kv_cache": result.get("vllm_kv_cache"),
-            "debug_mm": result.get("debug_mm"),
-        }
-    )
+    return jsonify(response_payload)
 
 
 def parse_args():

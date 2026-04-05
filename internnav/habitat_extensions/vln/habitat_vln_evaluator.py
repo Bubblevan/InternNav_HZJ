@@ -849,11 +849,40 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             "runtime_breakdown.decode_share_of_total",
         ]
 
+    @staticmethod
+    def _deprecated_fields() -> list[str]:
+        return [
+            "s2_metrics.s1_invocation_rate",
+            "s2_metrics.s1_invocation_count",
+        ]
+
+    @staticmethod
+    def _default_transport_metrics(enabled: bool) -> dict:
+        fields = {
+            "client_encode_messages_ms": None,
+            "client_http_post_ms": None,
+            "client_response_json_ms": None,
+            "client_decode_latents_ms": None,
+            "client_total_ms": None,
+            "server_request_parse_ms": None,
+            "server_decode_messages_ms": None,
+            "server_runner_step_s2_ms": None,
+            "server_encode_response_ms": None,
+            "server_total_ms": None,
+            "server_outer_overhead_ms": None,
+            "client_side_overhead_ms": None,
+            "end_to_end_transport_overhead_ms": None,
+        }
+        if enabled:
+            return dict(fields)
+        return dict(fields)
+
     def _summary_metadata(self, plot_generated_files=None) -> dict:
         return {
             "schema_version": 1,
             "backend_filter_default": "dual_system_*",
             "placeholder_fields": self._placeholder_fields(),
+            "deprecated_fields": self._deprecated_fields(),
             "metrics_collection_mode": "hot_path_local_timing + cached_worker_stats",
             "hot_path_rpc_free": True,
             "plot_generated_files": list(plot_generated_files or []),
@@ -861,6 +890,10 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 "dit_cache_* fields are placeholders unless a real DiT cache implementation is enabled.",
                 "prefill_share_of_total and decode_share_of_total may be null when no faithful decomposition is available.",
                 "pure system2 backends remain schema-compatible but are excluded from default comparison plots.",
+                "s1_trigger_rate is the recommended collaboration metric.",
+                "avg_s1_rollout_calls_per_trigger explains repeated local S1 replanning under one trigger.",
+                "legacy rollout-call-based S1 counters are deprecated if still present.",
+                "transport_metrics quantify non-vLLM-core overhead outside runtime_breakdown.total_ms.",
             ],
         }
 
@@ -883,12 +916,14 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             "s2_requests": 0,
             "pixel_goal_count": 0,
             "latent_success_count": 0,
-            "s1_invocation_count": 0,
+            "s1_trigger_count": 0,
+            "s1_rollout_call_count": 0,
             "s1_actions_total": 0,
             "s2_discrete_action_count": 0,
             "s2_step_latency_ms": [],
             "end_to_end_control_gap_ms": [],
             "s2_runtime_samples": [],
+            "transport_metric_samples": [],
             "s1_call_metrics": [],
             "vllm_kv_cache": None,
         }
@@ -925,7 +960,8 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         s2_requests = int(runtime_state["s2_requests"])
         pixel_goal_count = int(runtime_state["pixel_goal_count"])
         latent_success_count = int(runtime_state["latent_success_count"])
-        s1_invocation_count = int(runtime_state["s1_invocation_count"])
+        s1_trigger_count = int(runtime_state["s1_trigger_count"])
+        s1_rollout_call_count = int(runtime_state["s1_rollout_call_count"])
         s2_discrete_action_count = int(runtime_state["s2_discrete_action_count"])
         s1_actions_total = int(runtime_state["s1_actions_total"])
 
@@ -937,13 +973,16 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             "latent_success_rate": (
                 float(latent_success_count / pixel_goal_count) if pixel_goal_count > 0 else None
             ),
-            "s1_invocation_rate": (
-                float(s1_invocation_count / s2_requests)
+            "s1_trigger_rate": (
+                float(s1_trigger_count / s2_requests)
                 if s2_requests > 0 and self.model_args.mode == "dual_system"
                 else None
             ),
             "avg_s1_actions_per_trigger": (
-                float(s1_actions_total / s1_invocation_count) if s1_invocation_count > 0 else None
+                float(s1_actions_total / s1_trigger_count) if s1_trigger_count > 0 else None
+            ),
+            "avg_s1_rollout_calls_per_trigger": (
+                float(s1_rollout_call_count / s1_trigger_count) if s1_trigger_count > 0 else None
             ),
             "s2_discrete_action_rate": (
                 float(s2_discrete_action_count / s2_requests) if s2_requests > 0 else None
@@ -954,10 +993,19 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             ),
             "pixel_goal_count": pixel_goal_count,
             "latent_success_count": latent_success_count,
-            "s1_invocation_count": s1_invocation_count,
+            "s1_trigger_count": s1_trigger_count,
+            "s1_rollout_call_count": s1_rollout_call_count,
             "s1_actions_total": s1_actions_total,
             "s2_discrete_action_count": s2_discrete_action_count,
         }
+        if self.model_args.mode == "dual_system":
+            s2_metrics["s1_invocation_rate"] = (
+                float(s1_rollout_call_count / s2_requests) if s2_requests > 0 else None
+            )
+            s2_metrics["s1_invocation_count"] = s1_rollout_call_count
+        else:
+            s2_metrics["s1_invocation_rate"] = None
+            s2_metrics["s1_invocation_count"] = None
         s2_metrics.update(
             self._latency_summary(
                 runtime_state["s2_step_latency_ms"],
@@ -999,6 +1047,18 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     if sample.get(field) is not None
                 ]
                 runtime_breakdown[field] = float(np.mean(values)) if values else None
+
+        transport_metrics = self._default_transport_metrics(
+            runtime_state["backend"] == "dual_system_single_vllm"
+        )
+        if runtime_state["transport_metric_samples"]:
+            for field in transport_metrics.keys():
+                values = [
+                    sample[field]
+                    for sample in runtime_state["transport_metric_samples"]
+                    if sample.get(field) is not None
+                ]
+                transport_metrics[field] = float(np.mean(values)) if values else None
 
         s1_enabled = self.model_args.mode == "dual_system"
         s1_metrics = self._default_s1_metrics(s1_enabled)
@@ -1086,6 +1146,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 "enabled": bool(self.shadow_diff_enabled),
             },
             "runtime_breakdown": runtime_breakdown,
+            "transport_metrics": transport_metrics,
             "social_metrics": {
                 "psi_steps": int(psi_steps),
                 "avg_min_dist_to_human": float(avg_min_dist_to_human),
@@ -1094,6 +1155,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 "s2_step_latency_ms": runtime_state["s2_step_latency_ms"],
                 "end_to_end_control_gap_ms": runtime_state["end_to_end_control_gap_ms"],
                 "s2_runtime_samples": runtime_state["s2_runtime_samples"],
+                "transport_metric_samples": runtime_state["transport_metric_samples"],
                 "s1_call_metrics": runtime_state["s1_call_metrics"],
             },
         }
@@ -1111,12 +1173,14 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         s2_latency_values = []
         control_gap_values = []
         runtime_samples = []
+        transport_samples = []
         s1_call_metrics = []
         for record in episode_records:
             traces = record.get("traces") or {}
             s2_latency_values.extend(traces.get("s2_step_latency_ms") or [])
             control_gap_values.extend(traces.get("end_to_end_control_gap_ms") or [])
             runtime_samples.extend(traces.get("s2_runtime_samples") or [])
+            transport_samples.extend(traces.get("transport_metric_samples") or [])
             s1_call_metrics.extend(traces.get("s1_call_metrics") or [])
 
         total_s2_requests = int(sum((record.get("s2_metrics") or {}).get("s2_requests", 0) or 0 for record in episode_records))
@@ -1126,8 +1190,11 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         total_latent_success_count = int(
             sum((record.get("s2_metrics") or {}).get("latent_success_count", 0) or 0 for record in episode_records)
         )
-        total_s1_invocation_count = int(
-            sum((record.get("s2_metrics") or {}).get("s1_invocation_count", 0) or 0 for record in episode_records)
+        total_s1_trigger_count = int(
+            sum((record.get("s2_metrics") or {}).get("s1_trigger_count", 0) or 0 for record in episode_records)
+        )
+        total_s1_rollout_call_count = int(
+            sum((record.get("s2_metrics") or {}).get("s1_rollout_call_count", 0) or 0 for record in episode_records)
         )
         total_s1_actions = int(
             sum((record.get("s2_metrics") or {}).get("s1_actions_total", 0) or 0 for record in episode_records)
@@ -1166,6 +1233,11 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         ):
             values = [sample.get(field) for sample in runtime_samples if sample.get(field) is not None]
             runtime_breakdown[field] = float(np.mean(values)) if values else None
+
+        transport_metrics = self._default_transport_metrics(backend_label == "dual_system_single_vllm")
+        for field in transport_metrics.keys():
+            values = [sample.get(field) for sample in transport_samples if sample.get(field) is not None]
+            transport_metrics[field] = float(np.mean(values)) if values else None
 
         s1_metrics = self._default_s1_metrics(self.model_args.mode == "dual_system")
         dit_cache_metrics = self._default_dit_cache_metrics(self.model_args.mode == "dual_system")
@@ -1284,13 +1356,18 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 "latent_success_rate": (
                     float(total_latent_success_count / total_pixel_goal_count) if total_pixel_goal_count > 0 else None
                 ),
-                "s1_invocation_rate": (
-                    float(total_s1_invocation_count / total_s2_requests)
+                "s1_trigger_rate": (
+                    float(total_s1_trigger_count / total_s2_requests)
                     if total_s2_requests > 0 and self.model_args.mode == "dual_system"
                     else None
                 ),
                 "avg_s1_actions_per_trigger": (
-                    float(total_s1_actions / total_s1_invocation_count) if total_s1_invocation_count > 0 else None
+                    float(total_s1_actions / total_s1_trigger_count) if total_s1_trigger_count > 0 else None
+                ),
+                "avg_s1_rollout_calls_per_trigger": (
+                    float(total_s1_rollout_call_count / total_s1_trigger_count)
+                    if total_s1_trigger_count > 0
+                    else None
                 ),
                 "s2_discrete_action_rate": (
                     float(total_s2_discrete_action_count / total_s2_requests) if total_s2_requests > 0 else None
@@ -1305,12 +1382,24 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             },
             "shadow_diff_metrics": shadow_summary,
             "runtime_breakdown": runtime_breakdown,
+            "transport_metrics": transport_metrics,
             "artifacts": {
                 "episode_metrics_glob": os.path.join(self.output_path, "episode_metrics_rank*.jsonl"),
                 "progress_path": self._progress_path,
                 "result_path": os.path.join(self.output_path, "result.json"),
             },
         }
+        if self.model_args.mode == "dual_system":
+            summary["s2_metrics"]["s1_invocation_rate"] = (
+                float(total_s1_rollout_call_count / total_s2_requests) if total_s2_requests > 0 else None
+            )
+            summary["s2_metrics"]["s1_invocation_count"] = total_s1_rollout_call_count
+        else:
+            summary["s2_metrics"]["s1_invocation_rate"] = None
+            summary["s2_metrics"]["s1_invocation_count"] = None
+        summary["s2_metrics"]["s1_trigger_count"] = total_s1_trigger_count
+        summary["s2_metrics"]["s1_rollout_call_count"] = total_s1_rollout_call_count
+        summary["s2_metrics"]["s1_actions_total"] = total_s1_actions
         summary["s2_metrics"].update(
             self._latency_summary(
                 s2_latency_values,
@@ -1656,6 +1745,9 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         runtime_metrics = single_vllm_result.get("runtime_metrics")
                         if runtime_metrics is not None:
                             episode_runtime_state["s2_runtime_samples"].append(runtime_metrics)
+                        transport_metrics = single_vllm_result.get("transport_metrics")
+                        if transport_metrics is not None:
+                            episode_runtime_state["transport_metric_samples"].append(transport_metrics)
                         vllm_kv_cache = single_vllm_result.get("vllm_kv_cache")
                         if vllm_kv_cache is not None:
                             episode_runtime_state["vllm_kv_cache"] = vllm_kv_cache
@@ -1740,6 +1832,8 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             pix_goal_depth = copy.copy(depth_dp)
                             depths_dp = torch.stack([pix_goal_depth, depth_dp]).unsqueeze(0).to(self.device)
 
+                            episode_runtime_state["s1_trigger_count"] += 1
+                            episode_runtime_state["s1_rollout_call_count"] += 1
                             dp_actions = self._generate_traj(
                                 traj_latents,
                                 images_dp,
@@ -1748,7 +1842,6 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                                 episode_id=episode_id,
                                 step_id=step_id,
                             )
-                            episode_runtime_state["s1_invocation_count"] += 1
 
                             action_list = traj_to_actions(dp_actions)
                             if len(action_list) < MAX_STEPS:
@@ -1841,6 +1934,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         depth_dp = look_down_depth.unsqueeze(-1).to(torch.bfloat16)
 
                         depths_dp = torch.stack([pix_goal_depth, depth_dp]).unsqueeze(0).to(self.device)
+                        episode_runtime_state["s1_rollout_call_count"] += 1
                         dp_actions = self._generate_traj(
                             traj_latents,
                             images_dp,
@@ -1849,7 +1943,6 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             episode_id=episode_id,
                             step_id=step_id,
                         )
-                        episode_runtime_state["s1_invocation_count"] += 1
 
                         action_list = traj_to_actions(dp_actions)
                         if len(action_list) < MAX_STEPS:
