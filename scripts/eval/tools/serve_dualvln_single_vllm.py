@@ -1,5 +1,6 @@
 import argparse
 import time
+import os
 
 from flask import Flask, jsonify, request
 
@@ -115,11 +116,23 @@ def parse_args():
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--enable-mm-encoder-compile",
+        action="store_true",
+        help="Enable vLLM torch.compile for multimodal encoder.",
+    )
+    parser.add_argument(
+        "--force-v1",
+        action="store_true",
+        help="Set VLLM_USE_V1=1 before engine init.",
+    )
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
+    if args.force_v1:
+        os.environ["VLLM_USE_V1"] = "1"
     served_model_name = args.served_model_name
     runner = DualVLNSingleVLLMRunner(
         model_path=args.model_path,
@@ -134,6 +147,11 @@ if __name__ == "__main__":
         trust_remote_code=args.trust_remote_code,
         enforce_eager=args.enforce_eager,
         seed=args.seed,
+        compilation_config=(
+        {"compile_mm_encoder": True}
+        if args.enable_mm_encoder_compile
+        else None
+    ),
     )
     print(
         "[DualVLN Single vLLM] ready "

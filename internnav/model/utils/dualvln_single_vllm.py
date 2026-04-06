@@ -450,15 +450,7 @@ def _decode_pil_image_from_shm(payload: dict) -> Image.Image:
         raw = bytes(shm_handle.buf[:nbytes])
         return Image.frombytes("RGB", (width, height), raw)
     finally:
-        try:
-            shm_handle.close()
-        finally:
-            try:
-                shm_handle.unlink()
-            except FileNotFoundError:
-                pass
-            finally:
-                _best_effort_unregister_shared_memory(shm_handle)
+        shm_handle.close()  # 这样 server 只负责读完关闭句柄，不负责删除共享内存
 
 
 def _cleanup_client_shared_memory_handles(shared_memory_handles) -> None:
@@ -667,8 +659,9 @@ class DualVLNSingleVLLMRunner:
         model_impl: str = "auto",
         latent_backend: Optional[str] = None,
         trust_remote_code: bool = False,
-        enforce_eager: bool = True,
+        enforce_eager: bool = False,
         seed: int = 0,
+        compilation_config: Optional[dict] = None,
     ):
         from vllm import LLM, SamplingParams
 
@@ -704,6 +697,7 @@ class DualVLNSingleVLLMRunner:
             tensor_parallel_size=tensor_parallel_size,
             dtype=dtype,
             max_model_len=max_model_len,
+            compilation_config=compilation_config,
             gpu_memory_utilization=gpu_memory_utilization,
             limit_mm_per_prompt={"image": limit_mm_per_prompt_image},
             model_impl=model_impl,
