@@ -2,6 +2,7 @@ import base64
 import functools
 import io
 import json
+import logging
 import os
 import re
 import uuid
@@ -30,6 +31,8 @@ from internnav.model.utils.vllm_hidden_latents import VLLMHiddenLatentsRunner
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+
+logger = logging.getLogger(__name__)
 
 TRAJ_TOKEN_INDEX = 151667
 DEFAULT_IMAGE_TRANSPORT_MODE = "base64"
@@ -702,6 +705,7 @@ class DualVLNSingleVLLMRunner:
             enforce_eager=enforce_eager,
             seed=seed,
             disable_log_stats=True,
+            async_scheduling=False,
         )
         self._last_step_s2_engine_request = None
         self._runtime_stats_refresh_mode = os.environ.get(
@@ -796,12 +800,48 @@ class DualVLNSingleVLLMRunner:
 
         generate_start = time.perf_counter()
         sampling_params = SamplingParams(max_tokens=max_new_tokens, temperature=0.0)
-        outputs = self.llm._render_and_run_requests(
-            prompts=(processed_prompt,),
-            params=[sampling_params],
-            output_type=RequestOutput,
-            use_tqdm=False,
+        continuation_enabled = (
+            os.environ.get("INTERNNAV_DUALVLN_LATENT_CONTINUATION", "1") != "0"
         )
+        continuation_backend_eligible = self.latent_backend in (
+            "legacy_custom_forward",
+            "shared_engine_forward",
+        )
+        continuation_attempted = continuation_enabled and continuation_backend_eligible
+        continuation_result = None
+        continuation_setup_error = None
+        if continuation_attempted:
+            try:
+                outputs, continuation_result = (
+                    self.llm._run_request_with_dualvln_latent_continuation(
+                        prompt=processed_prompt,
+                        params=sampling_params,
+                        suffix_token_ids=[self.traj_token_index] * self.n_query,
+                        use_tqdm=False,
+                    )
+                )
+            except Exception as exc:
+                continuation_setup_error = (
+                    f"continuation_setup_error:{type(exc).__name__}:{exc}"
+                )
+                logger.warning(
+                    "DualVLN step_s2 could not arm same-request latent continuation; "
+                    "falling back to normal text generate path: %s",
+                    continuation_setup_error,
+                )
+                outputs = self.llm._render_and_run_requests(
+                    prompts=(processed_prompt,),
+                    params=[sampling_params],
+                    output_type=RequestOutput,
+                    use_tqdm=False,
+                )
+        else:
+            outputs = self.llm._render_and_run_requests(
+                prompts=(processed_prompt,),
+                params=[sampling_params],
+                output_type=RequestOutput,
+                use_tqdm=False,
+            )
         generate_ms = (time.perf_counter() - generate_start) * 1000.0
         request_output = outputs[0]
         self._last_step_s2_engine_request = self.llm.llm_engine.pop_debug_engine_core_request(
@@ -830,7 +870,40 @@ class DualVLNSingleVLLMRunner:
             "prefill_share_of_total": None,
             "latent_prefill_share_of_total": None,
             "decode_share_of_total": None,
+            "same_request_continuation_enabled": bool(continuation_enabled),
+            "same_request_continuation_attempted": bool(continuation_attempted),
+            "same_request_continuation_used": False,
+            "same_request_suffix_len": int(self.n_query),
+            "same_request_external_request_id": request_output.request_id,
+            "same_request_internal_request_id": (
+                self._last_step_s2_engine_request.request_id
+                if self._last_step_s2_engine_request is not None
+                else None
+            ),
+            "same_request_request_ids_match": None,
+            "same_request_fallback_reason": None,
+            "same_request_result_missing": False,
+            "latent_path": (
+                "same_request_continuation_attempt"
+                if continuation_attempted
+                else "legacy_latent_path"
+            ),
         }
+        if continuation_result is not None:
+            runtime_metrics["same_request_internal_request_id"] = (
+                continuation_result.internal_request_id
+            )
+            runtime_metrics["same_request_request_ids_match"] = bool(
+                continuation_result.external_request_id == request_output.request_id
+            )
+            runtime_metrics["same_request_fallback_reason"] = (
+                continuation_result.fallback_reason
+            )
+        elif continuation_attempted:
+            runtime_metrics["same_request_result_missing"] = True
+            runtime_metrics["same_request_fallback_reason"] = "continuation_result_missing"
+        if continuation_setup_error is not None:
+            runtime_metrics["same_request_fallback_reason"] = continuation_setup_error
 
         result = {
             "llm_output": llm_output,
@@ -899,7 +972,29 @@ class DualVLNSingleVLLMRunner:
                 flush=True,
             )
         latent_prefill_start = time.perf_counter()
-        if self.latent_backend == "transformers_backend_apply_model":
+        continuation_latents = (
+            continuation_result.latents
+            if continuation_result is not None
+            and bool(continuation_result.continuation_used)
+            and continuation_result.latents is not None
+            else None
+        )
+        if continuation_latents is not None:
+            runtime_metrics["same_request_continuation_used"] = True
+            runtime_metrics["latent_path"] = "same_request_continuation"
+            latents = continuation_latents
+            runtime_metrics["prefill_token_count"] = int(
+                len(prompt_token_ids) + len(generated_token_ids) + self.n_query
+            )
+            logger.info(
+                "DualVLN step_s2 used same-request latent continuation for request %s "
+                "(internal=%s, suffix_len=%d).",
+                request_output.request_id,
+                continuation_result.internal_request_id,
+                self.n_query,
+            )
+        elif self.latent_backend == "transformers_backend_apply_model":
+            runtime_metrics["latent_path"] = "transformers_backend_apply_model"
             latents = self.llm.apply_model(
                 functools.partial(
                     _generate_latents_via_transformers_backend_apply_model,
@@ -909,8 +1004,16 @@ class DualVLNSingleVLLMRunner:
                 )
             )[0]
         elif self.latent_backend in ("legacy_custom_forward", "shared_engine_forward"):
+            runtime_metrics["latent_path"] = "native_latent_prefill_fallback"
+            if continuation_attempted:
+                logger.info(
+                    "DualVLN step_s2 falling back to native latent prefill for request %s: %s",
+                    request_output.request_id,
+                    runtime_metrics["same_request_fallback_reason"],
+                )
             latents = self._generate_latents_via_shared_engine(bundle)
         elif self.latent_backend == "vllm_hidden_separate_llm":
+            runtime_metrics["latent_path"] = "vllm_hidden_separate_llm"
             latents = self._ensure_hidden_latents_runner().generate_latents_from_bundle(bundle)
         else:
             raise ValueError(f"Unsupported latent_backend: {self.latent_backend}")
