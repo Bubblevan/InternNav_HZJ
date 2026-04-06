@@ -9,3 +9,4 @@ eval_cfg.eval_settings["allowed_scene_ids"] = TARGET_SCENE_IDS
 eval_cfg.eval_settings["allowed_episode_ids"] = TARGET_EPISODE_IDS
 eval_cfg.eval_settings["max_eval_episodes"] = 1
 eval_cfg.eval_settings["replay_num_episodes"] = 1
+eval_cfg.agent.model_settings["dit_cond_cache_enabled"] = False

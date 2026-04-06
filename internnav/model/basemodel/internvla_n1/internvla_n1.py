@@ -1,5 +1,5 @@
 import time
-from typing import List, Optional, Tuple, Union
+from typing import Any, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -451,6 +451,82 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
 
         return hidden_states
 
+    def _build_hidden_states_input(self, traj_latents, images_dp):
+        device = traj_latents.device
+        dtype = traj_latents.dtype
+
+        cond_project_start = time.perf_counter()
+        traj_latents = self.get_model().cond_projector(traj_latents)
+        cond_project_ms = (time.perf_counter() - cond_project_start) * 1000.0
+
+        rgb_encode_ms = 0.0
+        memory_encode_ms = 0.0
+        if 'async' in self.get_system1_type():
+            with torch.no_grad():
+                images_dp = images_dp.permute(0, 1, 4, 2, 3)
+                images_dp_norm = (images_dp - self._resnet_mean) / self._resnet_std
+                self.get_model().rgb_model.to(dtype)
+                rgb_encode_start = time.perf_counter()
+                images_dp_feat = (
+                    self.get_model()
+                    .rgb_model.get_intermediate_layers(images_dp_norm.flatten(0, 1).to(dtype))[0]
+                    .unflatten(dim=0, sizes=(1, -1))
+                )
+                rgb_encode_ms = (time.perf_counter() - rgb_encode_start) * 1000.0
+                memory_encode_start = time.perf_counter()
+                memory_feat = self.get_model().memory_encoder(images_dp_feat.flatten(1, 2))
+                memory_feat = torch.cat([images_dp_feat.flatten(1, 2), memory_feat], dim=-1)
+                memory_tokens = self.get_model().rgb_resampler(memory_feat)
+                memory_encode_ms = (time.perf_counter() - memory_encode_start) * 1000.0
+            hidden_states = torch.cat([memory_tokens, traj_latents], dim=1)
+        else:
+            hidden_states = traj_latents
+
+        hidden_states_null = torch.zeros_like(hidden_states, device=device, dtype=dtype)
+        hidden_states_input = torch.cat([hidden_states_null, hidden_states], 0)
+        return hidden_states_input, {
+            "s1_cond_project_ms": cond_project_ms,
+            "s1_rgb_encode_ms": rgb_encode_ms,
+            "s1_memory_encode_ms": memory_encode_ms,
+        }
+
+    def _build_dit_cond_cache(self, hidden_states_input):
+        model = self.get_model().traj_dit.model
+        # Exact single-call cache: only encoder-side condition tensors that stay
+        # constant for every diffusion step inside one generate_traj() call.
+        cache: dict[str, Any] = {
+            "projected_encoder_hidden_states": None,
+            "layer_normed_encoder_hidden_states": [None] * len(model.layers),
+            "_timings": {
+                "projected_encoder_hidden_states_ms": None,
+                "layer_normed_encoder_hidden_states_ms": [None] * len(model.layers),
+            },
+            "_stats": {
+                "hits": 0,
+                "misses": 0,
+                "saved_ms_total": 0.0,
+                "crossattn_kv_hits": 0,
+                "crossattn_kv_misses": 0,
+                "crossattn_kv_saved_ms_total": 0.0,
+            },
+        }
+
+        build_start = time.perf_counter()
+        projected_start = time.perf_counter()
+        projected_encoder_hidden_states = model.caption_projection(hidden_states_input)
+        cache["projected_encoder_hidden_states"] = projected_encoder_hidden_states
+        cache["_timings"]["projected_encoder_hidden_states_ms"] = (time.perf_counter() - projected_start) * 1000.0
+
+        for layer_idx, layer in enumerate(model.layers):
+            layer_norm_start = time.perf_counter()
+            cache["layer_normed_encoder_hidden_states"][layer_idx] = layer.norm1_context(projected_encoder_hidden_states)
+            cache["_timings"]["layer_normed_encoder_hidden_states_ms"][layer_idx] = (
+                time.perf_counter() - layer_norm_start
+            ) * 1000.0
+
+        build_ms = (time.perf_counter() - build_start) * 1000.0
+        return cache, build_ms
+
     def generate_traj(
         self,
         traj_latents,
@@ -461,6 +537,7 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
         num_inference_steps: int = 10,
         num_sample_trajs: int = 32,
         generator: Optional[torch.Generator] = None,
+        dit_cond_cache_enabled: bool = False,
     ):
         if 'nextdit' in self.get_system1_type():
             from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
@@ -468,38 +545,9 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
 
             total_start = time.perf_counter()
             scheduler = FlowMatchEulerDiscreteScheduler()
-            device = traj_latents.device
             dtype = traj_latents.dtype
 
-            cond_project_start = time.perf_counter()
-            traj_latents = self.get_model().cond_projector(traj_latents)
-            cond_project_ms = (time.perf_counter() - cond_project_start) * 1000.0
-            rgb_encode_ms = 0.0
-            memory_encode_ms = 0.0
-            if 'async' in self.get_system1_type():
-                with torch.no_grad():
-                    images_dp = images_dp.permute(0, 1, 4, 2, 3)
-                    images_dp_norm = (images_dp - self._resnet_mean) / self._resnet_std
-                    self.get_model().rgb_model.to(dtype)
-                    rgb_encode_start = time.perf_counter()
-                    images_dp_feat = (
-                        self.get_model()
-                        .rgb_model.get_intermediate_layers(images_dp_norm.flatten(0, 1).to(dtype))[0]
-                        .unflatten(dim=0, sizes=(1, -1))
-                    )
-                    rgb_encode_ms = (time.perf_counter() - rgb_encode_start) * 1000.0
-                    memory_encode_start = time.perf_counter()
-                    memory_feat = self.get_model().memory_encoder(
-                        images_dp_feat.flatten(1, 2)
-                    )  # [bs*select_size,512,384]
-                    memory_feat = torch.cat([images_dp_feat.flatten(1, 2), memory_feat], dim=-1)
-                    memory_tokens = self.get_model().rgb_resampler(memory_feat)
-                    memory_encode_ms = (time.perf_counter() - memory_encode_start) * 1000.0
-                hidden_states = torch.cat([memory_tokens, traj_latents], dim=1)
-            else:
-                hidden_states = traj_latents
-            hidden_states_null = torch.zeros_like(hidden_states, device=device, dtype=dtype)
-            hidden_states_input = torch.cat([hidden_states_null, hidden_states], 0)
+            hidden_states_input, hidden_state_metrics = self._build_hidden_states_input(traj_latents, images_dp)
             batch_size = traj_latents.shape[0]
             latent_size = predict_step_nums
             latent_channels = 3
@@ -507,7 +555,7 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
             latents = randn_tensor(
                 shape=(batch_size * num_sample_trajs, latent_size, latent_channels),
                 generator=generator,
-                device=device,
+                device=traj_latents.device,
                 dtype=dtype,
             )
 
@@ -515,6 +563,13 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
             scheduler.set_timesteps(num_inference_steps, sigmas=sigmas)
 
             hidden_states_input = hidden_states_input.repeat_interleave(num_sample_trajs, dim=0)
+            cond_cache = None
+            cond_cache_build_ms = 0.0
+            cond_cache_enabled = bool(
+                dit_cond_cache_enabled and 'nextdit' in self.get_system1_type() and 'async' in self.get_system1_type()
+            )
+            if cond_cache_enabled:
+                cond_cache, cond_cache_build_ms = self._build_dit_cond_cache(hidden_states_input)
 
             dit_loop_start = time.perf_counter()
             action_decode_ms = 0.0
@@ -539,6 +594,7 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
                     .expand(latent_model_input.shape[0])
                     .to(latent_model_input.device, torch.long),
                     z_latents=hidden_states_input,
+                    cond_cache=cond_cache,
                 )
 
                 action_decode_start = time.perf_counter()
@@ -560,13 +616,37 @@ class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration, InternVLAN1Meta
                     generator_seed = None
             diffusion_steps_total = int(len(scheduler.timesteps))
             total_ms = (time.perf_counter() - total_start) * 1000.0
+            cond_cache_stats = ((cond_cache or {}).get("_stats") or {}) if cond_cache_enabled else {}
+            cond_cache_hits = int(cond_cache_stats.get("hits", 0) or 0)
+            cond_cache_misses = int(cond_cache_stats.get("misses", 0) or 0)
+            cond_cache_saved_ms_total = float(cond_cache_stats.get("saved_ms_total", 0.0) or 0.0)
+            cond_cache_hit_rate = (
+                float(cond_cache_hits / (cond_cache_hits + cond_cache_misses))
+                if (cond_cache_hits + cond_cache_misses) > 0
+                else 0.0
+            )
+            cond_cache_saved_ms_per_call = (
+                float(cond_cache_saved_ms_total / diffusion_steps_total) if diffusion_steps_total > 0 else 0.0
+            )
             self._last_generate_traj_metrics = {
                 "s1_generate_traj_ms_total": total_ms,
-                "s1_memory_encode_ms": memory_encode_ms,
-                "s1_rgb_encode_ms": rgb_encode_ms,
-                "s1_cond_project_ms": cond_project_ms,
+                "s1_memory_encode_ms": hidden_state_metrics["s1_memory_encode_ms"],
+                "s1_rgb_encode_ms": hidden_state_metrics["s1_rgb_encode_ms"],
+                "s1_cond_project_ms": hidden_state_metrics["s1_cond_project_ms"],
                 "s1_dit_loop_ms": dit_loop_ms,
                 "s1_action_decode_ms": action_decode_ms,
+                "s1_cond_cache_enabled": cond_cache_enabled,
+                "s1_cond_cache_build_ms": cond_cache_build_ms,
+                "s1_cond_cache_hit_rate": cond_cache_hit_rate,
+                "s1_cond_cache_hits": cond_cache_hits,
+                "s1_cond_cache_misses": cond_cache_misses,
+                "s1_cond_cache_saved_ms_total": cond_cache_saved_ms_total,
+                "s1_cond_cache_saved_ms_per_call": cond_cache_saved_ms_per_call,
+                "s1_crossattn_kv_cache_enabled": False,
+                "s1_crossattn_kv_cache_hits": 0,
+                "s1_crossattn_kv_cache_misses": 0,
+                "s1_crossattn_kv_cache_saved_ms_total": 0.0,
+                "s1_crossattn_kv_cache_saved_ms_per_call": 0.0,
                 "dit_cache_enabled": False,
                 "dit_cache_hit_rate": 0.0,
                 "dit_cache_hits": 0,

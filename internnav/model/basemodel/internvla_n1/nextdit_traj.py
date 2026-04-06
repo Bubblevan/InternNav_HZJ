@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import time
 from typing import Any, Dict, Optional
 
 import torch
@@ -34,6 +35,51 @@ from diffusers.models.normalization import (
 from diffusers.utils import is_torch_version, logging
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
+
+
+def _ensure_cond_cache_metadata(cond_cache: Optional[Dict[str, Any]]) -> tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    if cond_cache is None:
+        return None, None
+
+    stats = cond_cache.setdefault("_stats", {})
+    stats.setdefault("hits", 0)
+    stats.setdefault("misses", 0)
+    stats.setdefault("saved_ms_total", 0.0)
+    stats.setdefault("crossattn_kv_hits", 0)
+    stats.setdefault("crossattn_kv_misses", 0)
+    stats.setdefault("crossattn_kv_saved_ms_total", 0.0)
+
+    timings = cond_cache.setdefault("_timings", {})
+    timings.setdefault("projected_encoder_hidden_states_ms", None)
+    timings.setdefault("layer_normed_encoder_hidden_states_ms", [])
+    return stats, timings
+
+
+def _record_cond_cache_access(
+    cond_cache: Optional[Dict[str, Any]],
+    *,
+    hit: bool,
+    saved_ms: float = 0.0,
+    kv: bool = False,
+) -> None:
+    stats, _ = _ensure_cond_cache_metadata(cond_cache)
+    if stats is None:
+        return
+
+    if kv:
+        key_hits = "crossattn_kv_hits"
+        key_misses = "crossattn_kv_misses"
+        key_saved = "crossattn_kv_saved_ms_total"
+    else:
+        key_hits = "hits"
+        key_misses = "misses"
+        key_saved = "saved_ms_total"
+
+    if hit:
+        stats[key_hits] += 1
+        stats[key_saved] += float(saved_ms)
+    else:
+        stats[key_misses] += 1
 
 
 class LuminaNextDiTBlock(nn.Module):
@@ -127,6 +173,7 @@ class LuminaNextDiTBlock(nn.Module):
         encoder_mask: torch.Tensor,
         temb: torch.Tensor,
         cross_attention_kwargs: Optional[Dict[str, Any]] = None,
+        norm_encoder_hidden_states: Optional[torch.Tensor] = None,
     ):
         """
         Perform a forward pass through the LuminaNextDiTBlock.
@@ -154,7 +201,8 @@ class LuminaNextDiTBlock(nn.Module):
         )
 
         # Cross-attention
-        norm_encoder_hidden_states = self.norm1_context(encoder_hidden_states)
+        if norm_encoder_hidden_states is None:
+            norm_encoder_hidden_states = self.norm1_context(encoder_hidden_states)
         cross_attn_output = self.attn2(
             hidden_states=norm_hidden_states,
             encoder_hidden_states=norm_encoder_hidden_states,
@@ -296,6 +344,71 @@ class LuminaNextDiT2DModel(ModelMixin, ConfigMixin):
         if hasattr(module, "gradient_checkpointing"):
             module.gradient_checkpointing = value
 
+    def _get_projected_encoder_hidden_states(
+        self,
+        encoder_hidden_states: torch.Tensor,
+        cond_cache: Optional[Dict[str, Any]] = None,
+    ) -> torch.Tensor:
+        # Exact cache entry: depends only on encoder-side condition tokens.
+        _, timings = _ensure_cond_cache_metadata(cond_cache)
+        if cond_cache is not None:
+            cached = cond_cache.get("projected_encoder_hidden_states")
+            if cached is not None:
+                saved_ms = float((timings or {}).get("projected_encoder_hidden_states_ms") or 0.0)
+                _record_cond_cache_access(cond_cache, hit=True, saved_ms=saved_ms)
+                return cached
+
+        start = time.perf_counter()
+        projected_encoder_hidden_states = self.caption_projection(encoder_hidden_states)
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+
+        if cond_cache is not None:
+            cond_cache["projected_encoder_hidden_states"] = projected_encoder_hidden_states
+            if timings is not None and timings.get("projected_encoder_hidden_states_ms") is None:
+                timings["projected_encoder_hidden_states_ms"] = elapsed_ms
+            _record_cond_cache_access(cond_cache, hit=False)
+
+        return projected_encoder_hidden_states
+
+    def _get_layer_normed_encoder_hidden_states(
+        self,
+        layer: LuminaNextDiTBlock,
+        layer_idx: int,
+        encoder_hidden_states: torch.Tensor,
+        cond_cache: Optional[Dict[str, Any]] = None,
+    ) -> torch.Tensor:
+        # Exact cache entry: per-layer encoder-side norm, independent of latents/timestep.
+        _, timings = _ensure_cond_cache_metadata(cond_cache)
+        layer_cache = None if cond_cache is None else cond_cache.get("layer_normed_encoder_hidden_states")
+        if layer_cache is not None and layer_idx < len(layer_cache) and layer_cache[layer_idx] is not None:
+            saved_ms = 0.0
+            if timings is not None:
+                layer_timings = timings.get("layer_normed_encoder_hidden_states_ms") or []
+                if layer_idx < len(layer_timings):
+                    saved_ms = float(layer_timings[layer_idx] or 0.0)
+            _record_cond_cache_access(cond_cache, hit=True, saved_ms=saved_ms)
+            return layer_cache[layer_idx]
+
+        start = time.perf_counter()
+        normed_encoder_hidden_states = layer.norm1_context(encoder_hidden_states)
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+
+        if cond_cache is not None:
+            if layer_cache is None:
+                layer_cache = [None] * len(self.layers)
+                cond_cache["layer_normed_encoder_hidden_states"] = layer_cache
+            layer_cache[layer_idx] = normed_encoder_hidden_states
+
+            if timings is not None:
+                layer_timings = timings.setdefault("layer_normed_encoder_hidden_states_ms", [])
+                if len(layer_timings) < len(self.layers):
+                    layer_timings.extend([None] * (len(self.layers) - len(layer_timings)))
+                if layer_timings[layer_idx] is None:
+                    layer_timings[layer_idx] = elapsed_ms
+            _record_cond_cache_access(cond_cache, hit=False)
+
+        return normed_encoder_hidden_states
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -304,6 +417,7 @@ class LuminaNextDiT2DModel(ModelMixin, ConfigMixin):
         encoder_mask: torch.Tensor,
         image_rotary_emb: torch.Tensor,
         cross_attention_kwargs: Dict[str, Any] = None,
+        cond_cache: Optional[Dict[str, Any]] = None,
         return_dict=True,
     ) -> torch.Tensor:
         """
@@ -319,12 +433,22 @@ class LuminaNextDiT2DModel(ModelMixin, ConfigMixin):
         mask = torch.ones(
             hidden_states.shape[0], hidden_states.shape[1], dtype=torch.int32, device=hidden_states.device
         )
-        encoder_hidden_states = self.caption_projection(encoder_hidden_states)
+        cross_attention_kwargs = cross_attention_kwargs or {}
+        encoder_hidden_states = self._get_projected_encoder_hidden_states(
+            encoder_hidden_states,
+            cond_cache=cond_cache,
+        )
         temb = self.time_caption_embed(timestep, encoder_hidden_states, encoder_mask)
 
         encoder_mask = encoder_mask.bool()
 
-        for layer in self.layers:
+        for layer_idx, layer in enumerate(self.layers):
+            norm_encoder_hidden_states = self._get_layer_normed_encoder_hidden_states(
+                layer,
+                layer_idx,
+                encoder_hidden_states,
+                cond_cache=cond_cache,
+            )
             if self.training and self.gradient_checkpointing:
 
                 def create_custom_forward(module, return_dict=None):
@@ -346,6 +470,7 @@ class LuminaNextDiT2DModel(ModelMixin, ConfigMixin):
                     encoder_mask,
                     temb,
                     cross_attention_kwargs,
+                    norm_encoder_hidden_states,
                     **ckpt_kwargs,
                 )
             else:
@@ -357,6 +482,7 @@ class LuminaNextDiT2DModel(ModelMixin, ConfigMixin):
                     encoder_mask,
                     temb=temb,
                     cross_attention_kwargs=cross_attention_kwargs,
+                    norm_encoder_hidden_states=norm_encoder_hidden_states,
                 )
 
         hidden_states = self.norm_out(hidden_states, temb)

@@ -83,7 +83,7 @@ class NextDiTCrossAttn(PreTrainedModel):
             384,
         )
 
-    def forward(self, x, timestep, z_latents, **kwargs):
+    def forward(self, x, timestep, z_latents, cond_cache=None, **kwargs):
         model_pred = self.model(
             hidden_states=x,
             timestep=timestep,
@@ -91,5 +91,6 @@ class NextDiTCrossAttn(PreTrainedModel):
             encoder_mask=torch.ones((z_latents.shape[0], z_latents.shape[1]), device=z_latents.device),
             image_rotary_emb=None,
             cross_attention_kwargs=dict(),
+            cond_cache=cond_cache,
         ).sample
         return model_pred

@@ -142,6 +142,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         # ------------------------------------- model ------------------------------------------
         self.model_args = argparse.Namespace(**cfg.agent.model_settings)
         self.deterministic_seed = getattr(self.model_args, "deterministic_seed", None)
+        self.s1_cond_cache_enabled = bool(getattr(self.model_args, "dit_cond_cache_enabled", False))
         if self.deterministic_seed is not None:
             random.seed(int(self.deterministic_seed))
             np.random.seed(int(self.deterministic_seed))
@@ -523,6 +524,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 images_dp,
                 depths_dp,
                 generator=generator,
+                dit_cond_cache_enabled=self.s1_cond_cache_enabled,
             )
 
         action_list = traj_to_actions(dp_actions)
@@ -735,7 +737,13 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             generator, seed = self._make_system1_generator(scene_id, episode_id, step_id, salt)
         start_time = time.perf_counter()
         with torch.no_grad():
-            actions = self.model.generate_traj(traj_latents, images_dp, depths_dp, generator=generator)
+            actions = self.model.generate_traj(
+                traj_latents,
+                images_dp,
+                depths_dp,
+                generator=generator,
+                dit_cond_cache_enabled=self.s1_cond_cache_enabled,
+            )
         metrics = dict(getattr(self.model, "_last_generate_traj_metrics", {}) or {})
         metrics.setdefault("s1_generate_traj_ms_total", (time.perf_counter() - start_time) * 1000.0)
         metrics["s1_generator_seed"] = seed
@@ -779,6 +787,18 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 "s1_cond_project_ms": None,
                 "s1_dit_loop_ms": None,
                 "s1_action_decode_ms": None,
+                "s1_cond_cache_enabled": None,
+                "s1_cond_cache_build_ms": None,
+                "s1_cond_cache_hit_rate": None,
+                "s1_cond_cache_hits": None,
+                "s1_cond_cache_misses": None,
+                "s1_cond_cache_saved_ms_total": None,
+                "s1_cond_cache_saved_ms_per_call": None,
+                "s1_crossattn_kv_cache_enabled": None,
+                "s1_crossattn_kv_cache_hits": None,
+                "s1_crossattn_kv_cache_misses": None,
+                "s1_crossattn_kv_cache_saved_ms_total": None,
+                "s1_crossattn_kv_cache_saved_ms_per_call": None,
                 "diffusion_steps_total": None,
                 "diffusion_steps_reused": None,
                 "diffusion_steps_executed": None,
@@ -793,6 +813,18 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             "s1_cond_project_ms": 0.0,
             "s1_dit_loop_ms": 0.0,
             "s1_action_decode_ms": 0.0,
+            "s1_cond_cache_enabled": False,
+            "s1_cond_cache_build_ms": 0.0,
+            "s1_cond_cache_hit_rate": 0.0,
+            "s1_cond_cache_hits": 0,
+            "s1_cond_cache_misses": 0,
+            "s1_cond_cache_saved_ms_total": 0.0,
+            "s1_cond_cache_saved_ms_per_call": 0.0,
+            "s1_crossattn_kv_cache_enabled": False,
+            "s1_crossattn_kv_cache_hits": 0,
+            "s1_crossattn_kv_cache_misses": 0,
+            "s1_crossattn_kv_cache_saved_ms_total": 0.0,
+            "s1_crossattn_kv_cache_saved_ms_per_call": 0.0,
             "diffusion_steps_total": 0,
             "diffusion_steps_reused": 0,
             "diffusion_steps_executed": 0,
@@ -1072,6 +1104,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 "s1_cond_project_ms",
                 "s1_dit_loop_ms",
                 "s1_action_decode_ms",
+                "s1_cond_cache_build_ms",
             ):
                 s1_metrics[field] = float(sum(metric.get(field, 0.0) or 0.0 for metric in call_metrics))
             for field in (
@@ -1089,6 +1122,45 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             s1_metrics["s1_generator_seed"] = seed_trace[0] if len(seed_trace) == 1 else None
             s1_metrics["s1_deterministic_mode"] = any(
                 bool(metric.get("s1_deterministic_mode")) for metric in call_metrics
+            )
+            s1_cond_cache_hits = int(sum(metric.get("s1_cond_cache_hits", 0) or 0 for metric in call_metrics))
+            s1_cond_cache_misses = int(sum(metric.get("s1_cond_cache_misses", 0) or 0 for metric in call_metrics))
+            s1_cond_cache_saved_ms_total = float(
+                sum(metric.get("s1_cond_cache_saved_ms_total", 0.0) or 0.0 for metric in call_metrics)
+            )
+            s1_crossattn_kv_cache_hits = int(
+                sum(metric.get("s1_crossattn_kv_cache_hits", 0) or 0 for metric in call_metrics)
+            )
+            s1_crossattn_kv_cache_misses = int(
+                sum(metric.get("s1_crossattn_kv_cache_misses", 0) or 0 for metric in call_metrics)
+            )
+            s1_crossattn_kv_cache_saved_ms_total = float(
+                sum(metric.get("s1_crossattn_kv_cache_saved_ms_total", 0.0) or 0.0 for metric in call_metrics)
+            )
+            s1_metrics.update(
+                {
+                    "s1_cond_cache_enabled": any(bool(metric.get("s1_cond_cache_enabled")) for metric in call_metrics),
+                    "s1_cond_cache_hit_rate": (
+                        float(s1_cond_cache_hits / (s1_cond_cache_hits + s1_cond_cache_misses))
+                        if (s1_cond_cache_hits + s1_cond_cache_misses) > 0
+                        else 0.0
+                    ),
+                    "s1_cond_cache_hits": s1_cond_cache_hits,
+                    "s1_cond_cache_misses": s1_cond_cache_misses,
+                    "s1_cond_cache_saved_ms_total": s1_cond_cache_saved_ms_total,
+                    "s1_cond_cache_saved_ms_per_call": (
+                        float(s1_cond_cache_saved_ms_total / len(call_metrics)) if call_metrics else 0.0
+                    ),
+                    "s1_crossattn_kv_cache_enabled": any(
+                        bool(metric.get("s1_crossattn_kv_cache_enabled")) for metric in call_metrics
+                    ),
+                    "s1_crossattn_kv_cache_hits": s1_crossattn_kv_cache_hits,
+                    "s1_crossattn_kv_cache_misses": s1_crossattn_kv_cache_misses,
+                    "s1_crossattn_kv_cache_saved_ms_total": s1_crossattn_kv_cache_saved_ms_total,
+                    "s1_crossattn_kv_cache_saved_ms_per_call": (
+                        float(s1_crossattn_kv_cache_saved_ms_total / len(call_metrics)) if call_metrics else 0.0
+                    ),
+                }
             )
 
             dit_cache_hits = int(sum(metric.get("dit_cache_hits", 0) or 0 for metric in call_metrics))
@@ -1249,6 +1321,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 "s1_cond_project_ms",
                 "s1_dit_loop_ms",
                 "s1_action_decode_ms",
+                "s1_cond_cache_build_ms",
             ):
                 values = [metric.get(field) for metric in s1_call_metrics if metric.get(field) is not None]
                 s1_metrics[field] = float(np.mean(values)) if values else None
@@ -1268,6 +1341,49 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             s1_metrics["s1_generator_seed"] = seed_trace[0] if len(seed_trace) == 1 else None
             s1_metrics["s1_deterministic_mode"] = any(
                 bool(metric.get("s1_deterministic_mode")) for metric in s1_call_metrics
+            )
+            s1_cond_cache_hits = int(sum(metric.get("s1_cond_cache_hits", 0) or 0 for metric in s1_call_metrics))
+            s1_cond_cache_misses = int(sum(metric.get("s1_cond_cache_misses", 0) or 0 for metric in s1_call_metrics))
+            s1_cond_cache_saved_ms_total = float(
+                sum(metric.get("s1_cond_cache_saved_ms_total", 0.0) or 0.0 for metric in s1_call_metrics)
+            )
+            s1_crossattn_kv_cache_hits = int(
+                sum(metric.get("s1_crossattn_kv_cache_hits", 0) or 0 for metric in s1_call_metrics)
+            )
+            s1_crossattn_kv_cache_misses = int(
+                sum(metric.get("s1_crossattn_kv_cache_misses", 0) or 0 for metric in s1_call_metrics)
+            )
+            s1_crossattn_kv_cache_saved_ms_total = float(
+                sum(metric.get("s1_crossattn_kv_cache_saved_ms_total", 0.0) or 0.0 for metric in s1_call_metrics)
+            )
+            s1_metrics.update(
+                {
+                    "s1_cond_cache_enabled": any(
+                        bool(metric.get("s1_cond_cache_enabled")) for metric in s1_call_metrics
+                    ),
+                    "s1_cond_cache_hit_rate": (
+                        float(s1_cond_cache_hits / (s1_cond_cache_hits + s1_cond_cache_misses))
+                        if (s1_cond_cache_hits + s1_cond_cache_misses) > 0
+                        else 0.0
+                    ),
+                    "s1_cond_cache_hits": s1_cond_cache_hits,
+                    "s1_cond_cache_misses": s1_cond_cache_misses,
+                    "s1_cond_cache_saved_ms_total": s1_cond_cache_saved_ms_total,
+                    "s1_cond_cache_saved_ms_per_call": (
+                        float(s1_cond_cache_saved_ms_total / len(s1_call_metrics)) if s1_call_metrics else 0.0
+                    ),
+                    "s1_crossattn_kv_cache_enabled": any(
+                        bool(metric.get("s1_crossattn_kv_cache_enabled")) for metric in s1_call_metrics
+                    ),
+                    "s1_crossattn_kv_cache_hits": s1_crossattn_kv_cache_hits,
+                    "s1_crossattn_kv_cache_misses": s1_crossattn_kv_cache_misses,
+                    "s1_crossattn_kv_cache_saved_ms_total": s1_crossattn_kv_cache_saved_ms_total,
+                    "s1_crossattn_kv_cache_saved_ms_per_call": (
+                        float(s1_crossattn_kv_cache_saved_ms_total / len(s1_call_metrics))
+                        if s1_call_metrics
+                        else 0.0
+                    ),
+                }
             )
 
             hits = int(sum(metric.get("dit_cache_hits", 0) or 0 for metric in s1_call_metrics))

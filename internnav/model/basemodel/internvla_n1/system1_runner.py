@@ -3,7 +3,7 @@ from collections import defaultdict
 from pathlib import Path
 import time
 from types import SimpleNamespace
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 import numpy as np
 import torch
@@ -123,28 +123,14 @@ class InternVLAN1System1Runner(nn.Module):
             sigma = sigma.unsqueeze(-1)
         return sigma
 
-    def generate_traj(
-        self,
-        traj_latents,
-        images_dp,
-        depths_dp=None,
-        predict_step_nums=32,
-        guidance_scale: float = 1.0,
-        num_inference_steps: int = 10,
-        num_sample_trajs: int = 32,
-        generator: Optional[torch.Generator] = None,
-    ):
-        if "nextdit" not in self.config.system1:
-            raise NotImplementedError(f"Unsupported system1 type: {self.config.system1}")
-
-        total_start = time.perf_counter()
-        scheduler = FlowMatchEulerDiscreteScheduler()
+    def _build_hidden_states_input(self, traj_latents, images_dp):
         device = traj_latents.device
         dtype = traj_latents.dtype
 
         cond_project_start = time.perf_counter()
         traj_latents = self.cond_projector(traj_latents)
         cond_project_ms = (time.perf_counter() - cond_project_start) * 1000.0
+
         rgb_encode_ms = 0.0
         memory_encode_ms = 0.0
         if "async" in self.config.system1:
@@ -169,6 +155,73 @@ class InternVLAN1System1Runner(nn.Module):
 
         hidden_states_null = torch.zeros_like(hidden_states, device=device, dtype=dtype)
         hidden_states_input = torch.cat([hidden_states_null, hidden_states], 0)
+        return hidden_states_input, {
+            "s1_cond_project_ms": cond_project_ms,
+            "s1_rgb_encode_ms": rgb_encode_ms,
+            "s1_memory_encode_ms": memory_encode_ms,
+        }
+
+    def _build_dit_cond_cache(self, hidden_states_input):
+        model = getattr(self.traj_dit, "model", None)
+        if model is None:
+            return None, 0.0
+
+        # Exact single-call cache: only store encoder-side tensors that are invariant
+        # across diffusion steps within the current generate_traj() invocation.
+        cache: dict[str, Any] = {
+            "projected_encoder_hidden_states": None,
+            "layer_normed_encoder_hidden_states": [None] * len(model.layers),
+            "_timings": {
+                "projected_encoder_hidden_states_ms": None,
+                "layer_normed_encoder_hidden_states_ms": [None] * len(model.layers),
+            },
+            "_stats": {
+                "hits": 0,
+                "misses": 0,
+                "saved_ms_total": 0.0,
+                "crossattn_kv_hits": 0,
+                "crossattn_kv_misses": 0,
+                "crossattn_kv_saved_ms_total": 0.0,
+            },
+        }
+
+        build_start = time.perf_counter()
+        projected_start = time.perf_counter()
+        projected_encoder_hidden_states = model.caption_projection(hidden_states_input)
+        cache["projected_encoder_hidden_states"] = projected_encoder_hidden_states
+        cache["_timings"]["projected_encoder_hidden_states_ms"] = (time.perf_counter() - projected_start) * 1000.0
+
+        for layer_idx, layer in enumerate(model.layers):
+            layer_norm_start = time.perf_counter()
+            cache["layer_normed_encoder_hidden_states"][layer_idx] = layer.norm1_context(projected_encoder_hidden_states)
+            cache["_timings"]["layer_normed_encoder_hidden_states_ms"][layer_idx] = (
+                time.perf_counter() - layer_norm_start
+            ) * 1000.0
+
+        build_ms = (time.perf_counter() - build_start) * 1000.0
+        return cache, build_ms
+
+    def generate_traj(
+        self,
+        traj_latents,
+        images_dp,
+        depths_dp=None,
+        predict_step_nums=32,
+        guidance_scale: float = 1.0,
+        num_inference_steps: int = 10,
+        num_sample_trajs: int = 32,
+        generator: Optional[torch.Generator] = None,
+        dit_cond_cache_enabled: bool = False,
+    ):
+        if "nextdit" not in self.config.system1:
+            raise NotImplementedError(f"Unsupported system1 type: {self.config.system1}")
+
+        total_start = time.perf_counter()
+        scheduler = FlowMatchEulerDiscreteScheduler()
+        device = traj_latents.device
+        dtype = traj_latents.dtype
+
+        hidden_states_input, hidden_state_metrics = self._build_hidden_states_input(traj_latents, images_dp)
         batch_size = traj_latents.shape[0]
         latent_size = predict_step_nums
         latent_channels = 3
@@ -184,6 +237,13 @@ class InternVLAN1System1Runner(nn.Module):
         scheduler.set_timesteps(num_inference_steps, sigmas=sigmas)
 
         hidden_states_input = hidden_states_input.repeat_interleave(num_sample_trajs, dim=0)
+        cond_cache = None
+        cond_cache_build_ms = 0.0
+        cond_cache_enabled = bool(
+            dit_cond_cache_enabled and "nextdit" in self.config.system1 and "async" in self.config.system1
+        )
+        if cond_cache_enabled:
+            cond_cache, cond_cache_build_ms = self._build_dit_cond_cache(hidden_states_input)
 
         dit_loop_start = time.perf_counter()
         action_decode_ms = 0.0
@@ -202,6 +262,7 @@ class InternVLAN1System1Runner(nn.Module):
                 x=latent_model_input,
                 timestep=t.unsqueeze(0).expand(latent_model_input.shape[0]).to(latent_model_input.device, torch.long),
                 z_latents=hidden_states_input,
+                cond_cache=cond_cache,
             )
 
             action_decode_start = time.perf_counter()
@@ -222,13 +283,37 @@ class InternVLAN1System1Runner(nn.Module):
                 generator_seed = None
         diffusion_steps_total = int(len(scheduler.timesteps))
         total_ms = (time.perf_counter() - total_start) * 1000.0
+        cond_cache_stats = ((cond_cache or {}).get("_stats") or {}) if cond_cache_enabled else {}
+        cond_cache_hits = int(cond_cache_stats.get("hits", 0) or 0)
+        cond_cache_misses = int(cond_cache_stats.get("misses", 0) or 0)
+        cond_cache_saved_ms_total = float(cond_cache_stats.get("saved_ms_total", 0.0) or 0.0)
+        cond_cache_hit_rate = (
+            float(cond_cache_hits / (cond_cache_hits + cond_cache_misses))
+            if (cond_cache_hits + cond_cache_misses) > 0
+            else 0.0
+        )
+        cond_cache_saved_ms_per_call = (
+            float(cond_cache_saved_ms_total / diffusion_steps_total) if diffusion_steps_total > 0 else 0.0
+        )
         self._last_generate_traj_metrics = {
             "s1_generate_traj_ms_total": total_ms,
-            "s1_memory_encode_ms": memory_encode_ms,
-            "s1_rgb_encode_ms": rgb_encode_ms,
-            "s1_cond_project_ms": cond_project_ms,
+            "s1_memory_encode_ms": hidden_state_metrics["s1_memory_encode_ms"],
+            "s1_rgb_encode_ms": hidden_state_metrics["s1_rgb_encode_ms"],
+            "s1_cond_project_ms": hidden_state_metrics["s1_cond_project_ms"],
             "s1_dit_loop_ms": dit_loop_ms,
             "s1_action_decode_ms": action_decode_ms,
+            "s1_cond_cache_enabled": cond_cache_enabled,
+            "s1_cond_cache_build_ms": cond_cache_build_ms,
+            "s1_cond_cache_hit_rate": cond_cache_hit_rate,
+            "s1_cond_cache_hits": cond_cache_hits,
+            "s1_cond_cache_misses": cond_cache_misses,
+            "s1_cond_cache_saved_ms_total": cond_cache_saved_ms_total,
+            "s1_cond_cache_saved_ms_per_call": cond_cache_saved_ms_per_call,
+            "s1_crossattn_kv_cache_enabled": False,
+            "s1_crossattn_kv_cache_hits": 0,
+            "s1_crossattn_kv_cache_misses": 0,
+            "s1_crossattn_kv_cache_saved_ms_total": 0.0,
+            "s1_crossattn_kv_cache_saved_ms_per_call": 0.0,
             "dit_cache_enabled": False,
             "dit_cache_hit_rate": 0.0,
             "dit_cache_hits": 0,

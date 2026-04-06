@@ -462,9 +462,6 @@ def _cleanup_client_shared_memory_handles(shared_memory_handles) -> None:
                 shm_handle.unlink()
             except FileNotFoundError:
                 pass
-            finally:
-                _best_effort_unregister_shared_memory(shm_handle)
-
 
 def encode_messages(messages, *, image_transport_mode: Optional[str] = None):
     transport_mode = image_transport_mode or _get_image_transport_mode()
