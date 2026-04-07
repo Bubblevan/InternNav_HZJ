@@ -83,7 +83,7 @@ class NextDiTCrossAttn(PreTrainedModel):
             384,
         )
 
-    def forward(self, x, timestep, z_latents, cond_cache=None, **kwargs):
+    def forward(self, x, timestep, z_latents, cond_cache=None, dit_crossattn_kv_cache_enabled: bool = False, **kwargs):
         model_pred = self.model(
             hidden_states=x,
             timestep=timestep,
@@ -92,5 +92,6 @@ class NextDiTCrossAttn(PreTrainedModel):
             image_rotary_emb=None,
             cross_attention_kwargs=dict(),
             cond_cache=cond_cache,
+            dit_crossattn_kv_cache_enabled=dit_crossattn_kv_cache_enabled,
         ).sample
         return model_pred

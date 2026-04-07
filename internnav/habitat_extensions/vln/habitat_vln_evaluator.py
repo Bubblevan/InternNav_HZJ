@@ -143,6 +143,9 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         self.model_args = argparse.Namespace(**cfg.agent.model_settings)
         self.deterministic_seed = getattr(self.model_args, "deterministic_seed", None)
         self.s1_cond_cache_enabled = bool(getattr(self.model_args, "dit_cond_cache_enabled", False))
+        self.s1_crossattn_kv_cache_enabled = bool(
+            getattr(self.model_args, "dit_crossattn_kv_cache_enabled", False)
+        )
         if self.deterministic_seed is not None:
             random.seed(int(self.deterministic_seed))
             np.random.seed(int(self.deterministic_seed))
@@ -525,6 +528,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 depths_dp,
                 generator=generator,
                 dit_cond_cache_enabled=self.s1_cond_cache_enabled,
+                dit_crossattn_kv_cache_enabled=self.s1_crossattn_kv_cache_enabled,
             )
 
         action_list = traj_to_actions(dp_actions)
@@ -743,6 +747,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 depths_dp,
                 generator=generator,
                 dit_cond_cache_enabled=self.s1_cond_cache_enabled,
+                dit_crossattn_kv_cache_enabled=self.s1_crossattn_kv_cache_enabled,
             )
         metrics = dict(getattr(self.model, "_last_generate_traj_metrics", {}) or {})
         metrics.setdefault("s1_generate_traj_ms_total", (time.perf_counter() - start_time) * 1000.0)

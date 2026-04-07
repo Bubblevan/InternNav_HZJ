@@ -13,10 +13,11 @@
 # limitations under the License.
 
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.attention import LuminaFeedForward
 from diffusers.models.attention_processor import Attention, LuminaAttnProcessor2_0
@@ -24,6 +25,7 @@ from diffusers.models.embeddings import (
     LuminaCombinedTimestepCaptionEmbedding,
     LuminaPatchEmbed,
     PixArtAlphaTextProjection,
+    apply_rotary_emb,
 )
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.modeling_utils import ModelMixin
@@ -52,6 +54,7 @@ def _ensure_cond_cache_metadata(cond_cache: Optional[Dict[str, Any]]) -> tuple[O
     timings = cond_cache.setdefault("_timings", {})
     timings.setdefault("projected_encoder_hidden_states_ms", None)
     timings.setdefault("layer_normed_encoder_hidden_states_ms", [])
+    timings.setdefault("layer_crossattn_kv_ms", [])
     return stats, timings
 
 
@@ -80,6 +83,122 @@ def _record_cond_cache_access(
         stats[key_saved] += float(saved_ms)
     else:
         stats[key_misses] += 1
+
+
+def _build_crossattn_kv_from_encoder_hidden_states(
+    attn: Attention,
+    encoder_hidden_states: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    # Exact encoder-side cache entry: K/V depend only on the per-layer normalized
+    # encoder condition and can be safely reused across diffusion steps.
+    key = attn.to_k(encoder_hidden_states)
+    value = attn.to_v(encoder_hidden_states)
+
+    if attn.norm_k is not None:
+        key = attn.norm_k(key)
+
+    batch_size = encoder_hidden_states.shape[0]
+    head_dim = attn.inner_dim // attn.heads
+    kv_heads = key.shape[-1] // head_dim
+
+    key = key.view(batch_size, -1, kv_heads, head_dim)
+    value = value.view(batch_size, -1, kv_heads, head_dim)
+
+    n_rep = attn.heads // kv_heads
+    if n_rep >= 1:
+        key = key.unsqueeze(3).repeat(1, 1, 1, n_rep, 1).flatten(2, 3)
+        value = value.unsqueeze(3).repeat(1, 1, 1, n_rep, 1).flatten(2, 3)
+
+    return key.transpose(1, 2), value.transpose(1, 2)
+
+
+def _maybe_get_cached_crossattn_kv(
+    attn: Attention,
+    layer_idx: int,
+    total_layers: int,
+    encoder_hidden_states: torch.Tensor,
+    cond_cache: Optional[Dict[str, Any]] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    _, timings = _ensure_cond_cache_metadata(cond_cache)
+    use_cache = bool(cond_cache is not None and cond_cache.get("crossattn_kv_cache_enabled"))
+
+    if not use_cache:
+        return _build_crossattn_kv_from_encoder_hidden_states(attn, encoder_hidden_states)
+
+    key_cache = cond_cache.get("layer_crossattn_k_cache")
+    value_cache = cond_cache.get("layer_crossattn_v_cache")
+    if key_cache is None or value_cache is None:
+        key_cache = [None] * total_layers
+        value_cache = [None] * total_layers
+        cond_cache["layer_crossattn_k_cache"] = key_cache
+        cond_cache["layer_crossattn_v_cache"] = value_cache
+
+    if layer_idx < len(key_cache) and key_cache[layer_idx] is not None and value_cache[layer_idx] is not None:
+        saved_ms = 0.0
+        if timings is not None:
+            layer_timings = timings.get("layer_crossattn_kv_ms") or []
+            if layer_idx < len(layer_timings):
+                saved_ms = float(layer_timings[layer_idx] or 0.0)
+        _record_cond_cache_access(cond_cache, hit=True, saved_ms=saved_ms, kv=True)
+        return key_cache[layer_idx], value_cache[layer_idx]
+
+    start = time.perf_counter()
+    key, value = _build_crossattn_kv_from_encoder_hidden_states(attn, encoder_hidden_states)
+    elapsed_ms = (time.perf_counter() - start) * 1000.0
+
+    key_cache[layer_idx] = key
+    value_cache[layer_idx] = value
+
+    if timings is not None:
+        layer_timings = timings.setdefault("layer_crossattn_kv_ms", [])
+        if len(layer_timings) < total_layers:
+            layer_timings.extend([None] * (total_layers - len(layer_timings)))
+        if layer_timings[layer_idx] is None:
+            layer_timings[layer_idx] = elapsed_ms
+
+    _record_cond_cache_access(cond_cache, hit=False, kv=True)
+    return key, value
+
+
+def _apply_cross_attention_with_cached_encoder_kv(
+    attn: Attention,
+    hidden_states: torch.Tensor,
+    encoder_hidden_states: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    query_rotary_emb: Optional[torch.Tensor],
+    cond_cache: Optional[Dict[str, Any]],
+    layer_idx: int,
+    total_layers: int,
+) -> torch.Tensor:
+    query = attn.to_q(hidden_states)
+    query_dim = query.shape[-1]
+    head_dim = query_dim // attn.heads
+    dtype = query.dtype
+
+    if attn.norm_q is not None:
+        query = attn.norm_q(query)
+
+    query = query.view(hidden_states.shape[0], -1, attn.heads, head_dim)
+    if query_rotary_emb is not None:
+        query = apply_rotary_emb(query, query_rotary_emb, use_real=False)
+    query = query.to(dtype)
+
+    key, value = _maybe_get_cached_crossattn_kv(
+        attn,
+        layer_idx,
+        total_layers,
+        encoder_hidden_states,
+        cond_cache=cond_cache,
+    )
+    key = key.to(dtype)
+
+    if attention_mask is not None:
+        attention_mask = attention_mask.bool().view(hidden_states.shape[0], 1, 1, -1)
+        attention_mask = attention_mask.expand(-1, attn.heads, hidden_states.shape[1], -1)
+
+    query = query.transpose(1, 2)
+    hidden_states = F.scaled_dot_product_attention(query, key, value, attn_mask=attention_mask, scale=None)
+    return hidden_states.transpose(1, 2).to(dtype)
 
 
 class LuminaNextDiTBlock(nn.Module):
@@ -174,6 +293,10 @@ class LuminaNextDiTBlock(nn.Module):
         temb: torch.Tensor,
         cross_attention_kwargs: Optional[Dict[str, Any]] = None,
         norm_encoder_hidden_states: Optional[torch.Tensor] = None,
+        cond_cache: Optional[Dict[str, Any]] = None,
+        layer_idx: Optional[int] = None,
+        total_layers: Optional[int] = None,
+        dit_crossattn_kv_cache_enabled: bool = False,
     ):
         """
         Perform a forward pass through the LuminaNextDiTBlock.
@@ -203,14 +326,29 @@ class LuminaNextDiTBlock(nn.Module):
         # Cross-attention
         if norm_encoder_hidden_states is None:
             norm_encoder_hidden_states = self.norm1_context(encoder_hidden_states)
-        cross_attn_output = self.attn2(
-            hidden_states=norm_hidden_states,
-            encoder_hidden_states=norm_encoder_hidden_states,
-            attention_mask=encoder_mask,
-            query_rotary_emb=image_rotary_emb,
-            key_rotary_emb=None,
-            **cross_attention_kwargs,
+        use_crossattn_kv_cache = bool(
+            dit_crossattn_kv_cache_enabled and cond_cache is not None and layer_idx is not None and total_layers is not None
         )
+        if use_crossattn_kv_cache:
+            cross_attn_output = _apply_cross_attention_with_cached_encoder_kv(
+                self.attn2,
+                hidden_states=norm_hidden_states,
+                encoder_hidden_states=norm_encoder_hidden_states,
+                attention_mask=encoder_mask,
+                query_rotary_emb=image_rotary_emb,
+                cond_cache=cond_cache,
+                layer_idx=layer_idx,
+                total_layers=total_layers,
+            )
+        else:
+            cross_attn_output = self.attn2(
+                hidden_states=norm_hidden_states,
+                encoder_hidden_states=norm_encoder_hidden_states,
+                attention_mask=encoder_mask,
+                query_rotary_emb=image_rotary_emb,
+                key_rotary_emb=None,
+                **cross_attention_kwargs,
+            )
         cross_attn_output = cross_attn_output * self.gate.tanh().view(1, 1, -1, 1)
         mixed_attn_output = self_attn_output + cross_attn_output
         mixed_attn_output = mixed_attn_output.flatten(-2)
@@ -418,6 +556,7 @@ class LuminaNextDiT2DModel(ModelMixin, ConfigMixin):
         image_rotary_emb: torch.Tensor,
         cross_attention_kwargs: Dict[str, Any] = None,
         cond_cache: Optional[Dict[str, Any]] = None,
+        dit_crossattn_kv_cache_enabled: bool = False,
         return_dict=True,
     ) -> torch.Tensor:
         """
@@ -434,6 +573,8 @@ class LuminaNextDiT2DModel(ModelMixin, ConfigMixin):
             hidden_states.shape[0], hidden_states.shape[1], dtype=torch.int32, device=hidden_states.device
         )
         cross_attention_kwargs = cross_attention_kwargs or {}
+        if dit_crossattn_kv_cache_enabled and cond_cache is None:
+            raise ValueError("dit_crossattn_kv_cache_enabled requires cond_cache. generate_traj() should supply it.")
         encoder_hidden_states = self._get_projected_encoder_hidden_states(
             encoder_hidden_states,
             cond_cache=cond_cache,
@@ -451,25 +592,42 @@ class LuminaNextDiT2DModel(ModelMixin, ConfigMixin):
             )
             if self.training and self.gradient_checkpointing:
 
-                def create_custom_forward(module, return_dict=None):
-                    def custom_forward(*inputs):
-                        if return_dict is not None:
-                            return module(*inputs, return_dict=return_dict)
-                        else:
-                            return module(*inputs)
+                def create_custom_forward(module, current_layer_idx: int):
+                    def custom_forward(
+                        hidden_states,
+                        attention_mask,
+                        image_rotary_emb,
+                        encoder_hidden_states,
+                        encoder_mask,
+                        temb,
+                        norm_encoder_hidden_states,
+                    ):
+                        return module(
+                            hidden_states,
+                            attention_mask,
+                            image_rotary_emb,
+                            encoder_hidden_states,
+                            encoder_mask,
+                            temb=temb,
+                            cross_attention_kwargs=cross_attention_kwargs,
+                            norm_encoder_hidden_states=norm_encoder_hidden_states,
+                            cond_cache=cond_cache,
+                            layer_idx=current_layer_idx,
+                            total_layers=len(self.layers),
+                            dit_crossattn_kv_cache_enabled=dit_crossattn_kv_cache_enabled,
+                        )
 
                     return custom_forward
 
                 ckpt_kwargs: Dict[str, Any] = {"use_reentrant": False} if is_torch_version(">=", "1.11.0") else {}
                 hidden_states = torch.utils.checkpoint.checkpoint(
-                    create_custom_forward(layer),
+                    create_custom_forward(layer, layer_idx),
                     hidden_states,
                     mask,
                     image_rotary_emb,
                     encoder_hidden_states,
                     encoder_mask,
                     temb,
-                    cross_attention_kwargs,
                     norm_encoder_hidden_states,
                     **ckpt_kwargs,
                 )
@@ -483,6 +641,10 @@ class LuminaNextDiT2DModel(ModelMixin, ConfigMixin):
                     temb=temb,
                     cross_attention_kwargs=cross_attention_kwargs,
                     norm_encoder_hidden_states=norm_encoder_hidden_states,
+                    cond_cache=cond_cache,
+                    layer_idx=layer_idx,
+                    total_layers=len(self.layers),
+                    dit_crossattn_kv_cache_enabled=dit_crossattn_kv_cache_enabled,
                 )
 
         hidden_states = self.norm_out(hidden_states, temb)
