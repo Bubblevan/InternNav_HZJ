@@ -8,3 +8,4 @@ eval_cfg.agent.model_settings["dualvln_single_vllm_timeout"] = 300.0
 eval_cfg.eval_settings["output_path"] = "./logs/habitat/test_dual_system_full_single_vllm"
 eval_cfg.eval_settings["max_eval_episodes"] = None
 eval_cfg.agent.model_settings["dit_cond_cache_enabled"] = True
+eval_cfg.agent.model_settings["dit_crossattn_kv_cache_enabled"] = True

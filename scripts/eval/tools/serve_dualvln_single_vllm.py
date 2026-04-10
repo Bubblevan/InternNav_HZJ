@@ -42,9 +42,14 @@ def dualvln_step_s2():
     messages = decode_messages(payload["messages"])
     server_decode_messages_ms = (time.perf_counter() - decode_start) * 1000.0
     max_new_tokens = int(payload.get("max_new_tokens", 128))
+    return_latents = bool(payload.get("return_latents", True))
 
     runner_start = time.perf_counter()
-    result = runner.step_s2(messages, max_new_tokens=max_new_tokens)
+    result = runner.step_s2(
+        messages,
+        max_new_tokens=max_new_tokens,
+        return_latents=return_latents,
+    )
     server_runner_step_s2_ms = (time.perf_counter() - runner_start) * 1000.0
 
     encode_start = time.perf_counter()

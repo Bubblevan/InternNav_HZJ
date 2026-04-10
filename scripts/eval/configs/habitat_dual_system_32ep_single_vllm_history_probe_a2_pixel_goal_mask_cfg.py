@@ -1,0 +1,8 @@
+from scripts.eval.configs.habitat_dual_system_32ep_single_vllm_cfg import eval_cfg
+
+eval_cfg.eval_settings["output_path"] = "./logs/habitat/test_dual_system_32ep_single_vllm_history_probe_a2_pixel_goal_mask"
+eval_cfg.agent.model_settings["enable_history_probe"] = True
+eval_cfg.agent.model_settings["history_probe_mode"] = "mask_one"
+eval_cfg.agent.model_settings["history_probe_target"] = "baseline_pixel_goal_only"
+eval_cfg.agent.model_settings["history_probe_max_steps"] = 2
+

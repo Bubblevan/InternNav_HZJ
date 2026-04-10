@@ -15,6 +15,7 @@ import itertools
 import random
 import re
 from collections import OrderedDict, defaultdict
+from typing import Optional, Tuple
 
 import cv2
 import habitat
@@ -33,7 +34,7 @@ from habitat.config.default_structured_configs import (
 from habitat.tasks.nav.shortest_path_follower import ShortestPathFollower
 from habitat.utils.visualizations.utils import images_to_video, observations_to_image
 from habitat_baselines.config.default import get_config as get_habitat_config
-from PIL import Image
+from PIL import Image, ImageFilter
 from transformers import AutoProcessor, Qwen2_5_VLForConditionalGeneration
 
 from internnav.configs.evaluator import EvalCfg
@@ -282,6 +283,82 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             print(
                 "[HabitatVLNEvaluator] Shadow diff enabled: "
                 f"primary=single-vLLM shadow=HF({shadow_model_path})"
+            )
+
+        self.history_probe_enabled = bool(getattr(self.model_args, "enable_history_probe", False))
+        self.history_probe_mode = str(getattr(self.model_args, "history_probe_mode", "mask_one")).strip()
+        self.history_probe_max_steps = max(0, int(getattr(self.model_args, "history_probe_max_steps", 4)))
+        self._history_probe_details_path = None
+        self.history_probe_target = str(
+            getattr(self.model_args, "history_probe_target", "history_conditioned_gateway_only")
+        ).strip()
+        self._history_probe_inventory_path = None
+        self._history_probe_pending_primary_events = OrderedDict()
+        self.history_probe_interventions = self._normalize_history_probe_interventions(
+            getattr(self.model_args, "history_probe_interventions", None)
+        )
+        self.history_probe_blur_radius = float(
+            getattr(self.model_args, "history_probe_blur_radius", 2.0)
+        )
+        self.history_probe_downsample_factor = max(
+            1,
+            int(getattr(self.model_args, "history_probe_downsample_factor", 4)),
+        )
+        if self.history_probe_enabled:
+            if not self.dualvln_single_vllm_url:
+                raise RuntimeError(
+                    "enable_history_probe=True currently requires dualvln_single_vllm_url so probe "
+                    "requests can reuse the single-vLLM S2 path."
+                )
+            if self.history_probe_mode not in {"mask_one", "keep_one", "score_only"}:
+                raise ValueError(
+                    f"Unsupported history_probe_mode={self.history_probe_mode!r}; "
+                    "expected one of {'mask_one', 'keep_one', 'score_only'}."
+                )
+            if self.history_probe_target not in {
+                "history_conditioned_gateway_only",
+                "baseline_pixel_goal_only",
+                "baseline_discrete_only",
+                "all_eligible",
+            }:
+                raise ValueError(
+                    f"Unsupported history_probe_target={self.history_probe_target!r}; "
+                    "expected one of {'history_conditioned_gateway_only', 'baseline_pixel_goal_only', "
+                    "'baseline_discrete_only', 'all_eligible'}."
+                )
+            history_probe_dump_path = getattr(self.model_args, "history_probe_dump_path", None)
+            if history_probe_dump_path:
+                history_probe_dump_path = str(history_probe_dump_path)
+                if "{rank}" in history_probe_dump_path:
+                    history_probe_dump_path = history_probe_dump_path.format(rank=self.local_rank)
+                elif history_probe_dump_path.endswith(".jsonl"):
+                    history_probe_dump_path = history_probe_dump_path[:-6] + f"_rank{self.local_rank}.jsonl"
+                else:
+                    history_probe_dump_path = os.path.join(
+                        history_probe_dump_path,
+                        f"history_probe_rank{self.local_rank}.jsonl",
+                    )
+            else:
+                history_probe_dump_path = os.path.join(
+                    self.output_path,
+                    f"history_probe_rank{self.local_rank}.jsonl",
+                )
+            os.makedirs(os.path.dirname(history_probe_dump_path), exist_ok=True)
+            self._history_probe_details_path = history_probe_dump_path
+            self._history_probe_inventory_path = os.path.join(
+                os.path.dirname(history_probe_dump_path),
+                f"history_probe_inventory_rank{self.local_rank}.jsonl",
+            )
+            for path in (self._history_probe_details_path, self._history_probe_inventory_path):
+                if not os.path.exists(self._progress_path) and os.path.exists(path):
+                    os.remove(path)
+            print(
+                "[HabitatVLNEvaluator] History probe enabled: "
+                f"mode={self.history_probe_mode} target={self.history_probe_target} "
+                f"interventions={self.history_probe_interventions} "
+                f"max_selected_steps_per_episode={self.history_probe_max_steps} "
+                f"dump={self._history_probe_details_path} "
+                f"inventory={self._history_probe_inventory_path}"
             )
 
         # refactor: this part used in three places
@@ -674,6 +751,641 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             json.dump(summary, f, indent=2, ensure_ascii=False)
 
     @staticmethod
+    def _build_null_history_image(image: Image.Image) -> Image.Image:
+        # Strong intervention: this preserves prompt/image slot structure but
+        # replaces history content with an OOD null frame. It is not equivalent
+        # to a neutral deletion of history information.
+        image_mode = image.mode if image.mode else "RGB"
+        return Image.new(image_mode, image.size, 0)
+
+    @staticmethod
+    def _normalize_history_probe_interventions(raw_value) -> list:
+        if raw_value is None:
+            return ["strong_null_history_image_replacement"]
+        if isinstance(raw_value, str):
+            values = [value.strip() for value in raw_value.split(",") if value.strip()]
+        else:
+            values = [str(value).strip() for value in raw_value if str(value).strip()]
+        if not values:
+            return ["strong_null_history_image_replacement"]
+        valid_values = {
+            "strong_null_history_image_replacement",
+            "replace_with_other_history",
+            "light_blur",
+            "downsample_then_upsample",
+        }
+        invalid_values = [value for value in values if value not in valid_values]
+        if invalid_values:
+            raise ValueError(
+                f"Unsupported history_probe_interventions={invalid_values!r}; "
+                f"expected subset of {sorted(valid_values)!r}."
+            )
+        return values
+
+    def _history_probe_intervention_metadata(self, intervention_variant: str) -> dict:
+        if intervention_variant == "strong_null_history_image_replacement":
+            return {
+                "intervention_type": intervention_variant,
+                "intervention_variant": intervention_variant,
+                "intervention_is_strong": True,
+                "intervention_note": (
+                    "History frames are replaced with black null images while preserving prompt slots; "
+                    "this is a strong OOD intervention, not a neutral deletion of history."
+                ),
+            }
+        if intervention_variant == "replace_with_other_history":
+            return {
+                "intervention_type": intervention_variant,
+                "intervention_variant": intervention_variant,
+                "intervention_is_strong": False,
+                "intervention_note": (
+                    "Targeted history slots are replaced with another real history frame from the same episode; "
+                    "this is a weaker content-preserving intervention, but still not a causal deletion."
+                ),
+            }
+        if intervention_variant == "light_blur":
+            return {
+                "intervention_type": intervention_variant,
+                "intervention_variant": intervention_variant,
+                "intervention_is_strong": False,
+                "intervention_note": (
+                    "Targeted history slots are mildly low-pass filtered with Gaussian blur; "
+                    "this is a weak visual degradation, not a causal deletion."
+                ),
+            }
+        if intervention_variant == "downsample_then_upsample":
+            return {
+                "intervention_type": intervention_variant,
+                "intervention_variant": intervention_variant,
+                "intervention_is_strong": False,
+                "intervention_note": (
+                    "Targeted history slots are downsampled and resized back up; "
+                    "this is a weak resolution degradation, not a causal deletion."
+                ),
+            }
+        raise ValueError(f"Unsupported intervention_variant={intervention_variant!r}")
+
+    def _summarize_s2_result(self, result: dict) -> dict:
+        llm_output = str((result or {}).get("llm_output") or "")
+        pixel_goal = (result or {}).get("pixel_goal")
+        if pixel_goal is None:
+            pixel_goal = self._parse_pixel_goal_from_text(llm_output)
+        pixel_goal = None if pixel_goal is None else [int(pixel_goal[0]), int(pixel_goal[1])]
+        action_seq = [] if pixel_goal is not None else [int(action) for action in self.parse_actions(llm_output)]
+        generated_token_ids = [int(token_id) for token_id in ((result or {}).get("generated_token_ids") or [])]
+        return {
+            "llm_output": llm_output,
+            "output_type": "pixel_goal" if pixel_goal is not None else "discrete_action",
+            "has_pixel_goal": bool(pixel_goal is not None),
+            "pixel_goal": pixel_goal,
+            "action_seq": action_seq,
+            "generated_token_ids": generated_token_ids,
+            "first_generated_token_id": (
+                int(generated_token_ids[0]) if generated_token_ids else None
+            ),
+            "runtime_metrics": dict((result or {}).get("runtime_metrics") or {}),
+        }
+
+    @staticmethod
+    def _history_probe_event_key(scene_id, episode_id, step_id) -> tuple:
+        return (str(scene_id), int(episode_id), int(step_id))
+
+    @staticmethod
+    def _history_probe_call_role(is_lookdown_followup: bool) -> str:
+        return "lookdown_followup" if is_lookdown_followup else "history_conditioned_primary"
+
+    def _is_single_lookdown_action(self, summary: dict) -> bool:
+        action_seq = [int(action) for action in (summary.get("action_seq") or [])]
+        if action_seq == [int(action_code.LOOKDOWN)]:
+            return True
+        return str(summary.get("llm_output") or "").strip() == "↓"
+
+    def _history_probe_target_matched(
+        self,
+        *,
+        has_history: bool,
+        is_lookdown_followup: bool,
+        baseline_summary: dict,
+        has_followup_same_step: bool = False,
+        followup_summary: Optional[dict] = None,
+    ) -> bool:
+        if self.history_probe_target == "history_conditioned_gateway_only":
+            return (
+                (not is_lookdown_followup)
+                and bool(has_history)
+                and baseline_summary["output_type"] == "discrete_action"
+                and self._is_single_lookdown_action(baseline_summary)
+                and bool(has_followup_same_step)
+                and bool(followup_summary is not None and followup_summary.get("has_pixel_goal"))
+            )
+        if self.history_probe_target == "baseline_pixel_goal_only":
+            return bool(baseline_summary["has_pixel_goal"])
+        if self.history_probe_target == "baseline_discrete_only":
+            return not bool(baseline_summary["has_pixel_goal"])
+        if self.history_probe_target == "all_eligible":
+            return True
+        raise ValueError(f"Unsupported history_probe_target={self.history_probe_target!r}")
+
+    def _select_history_probe_step(
+        self,
+        *,
+        has_history: bool,
+        is_lookdown_followup: bool,
+        baseline_summary: dict,
+        selected_steps_so_far: int,
+        has_followup_same_step: bool = False,
+        followup_summary: Optional[dict] = None,
+    ) -> Tuple[bool, Optional[str], Optional[str]]:
+        if not self.history_probe_enabled:
+            return False, None, "history_probe_disabled"
+        if self.history_probe_target == "history_conditioned_gateway_only":
+            if is_lookdown_followup:
+                return False, None, "lookdown_followup"
+            if not has_history:
+                return False, None, "no_history"
+            if baseline_summary["output_type"] != "discrete_action":
+                return False, None, "gateway_primary_not_discrete_action"
+            if not self._is_single_lookdown_action(baseline_summary):
+                return False, None, "gateway_primary_not_single_lookdown"
+            if not has_followup_same_step:
+                return False, None, "gateway_missing_followup_same_step"
+            if followup_summary is None:
+                return False, None, "gateway_followup_summary_missing"
+            if not bool(followup_summary.get("has_pixel_goal")):
+                return False, None, "gateway_followup_without_pixel_goal"
+            if selected_steps_so_far >= self.history_probe_max_steps:
+                return False, None, "selected_target_budget_exhausted"
+            return True, f"selected_target_matched:{self.history_probe_target}", None
+        if is_lookdown_followup:
+            return False, None, "lookdown_followup"
+        if not has_history:
+            return False, None, "no_history"
+        if not self._history_probe_target_matched(
+            has_history=has_history,
+            is_lookdown_followup=is_lookdown_followup,
+            baseline_summary=baseline_summary,
+            has_followup_same_step=has_followup_same_step,
+            followup_summary=followup_summary,
+        ):
+            return False, None, f"target_mismatch:{self.history_probe_target}"
+        if selected_steps_so_far >= self.history_probe_max_steps:
+            return False, None, "selected_target_budget_exhausted"
+        return True, f"selected_target_matched:{self.history_probe_target}", None
+
+    def _clone_probe_messages_for_history(
+        self,
+        messages,
+        *,
+        history_slot_count: int,
+        history_index: int,
+        probe_mode: str,
+        intervention_variant: str,
+    ):
+        if probe_mode not in {"mask_one", "keep_one"}:
+            raise ValueError(f"Unsupported probe_mode for image replacement: {probe_mode}")
+
+        history_images = []
+        for message in messages:
+            for item in message["content"]:
+                if item["type"] == "image":
+                    if len(history_images) >= history_slot_count:
+                        break
+                    history_images.append(item["image"])
+            if len(history_images) >= history_slot_count:
+                break
+
+        visual_slot = 0
+        probe_messages = []
+        for message in messages:
+            content = []
+            for item in message["content"]:
+                if item["type"] == "image":
+                    image = item["image"]
+                    should_mask = False
+                    if visual_slot < history_slot_count:
+                        if probe_mode == "mask_one":
+                            should_mask = visual_slot == history_index
+                        else:
+                            should_mask = visual_slot != history_index
+                    if should_mask:
+                        image = self._apply_history_probe_intervention(
+                            image=image,
+                            history_images=history_images,
+                            target_history_index=visual_slot,
+                            intervention_variant=intervention_variant,
+                        )
+                    content.append({"type": "image", "image": image})
+                    visual_slot += 1
+                else:
+                    content.append(dict(item))
+            probe_messages.append({"role": message["role"], "content": content})
+        return probe_messages
+
+    def _apply_history_probe_intervention(
+        self,
+        *,
+        image: Image.Image,
+        history_images,
+        target_history_index: int,
+        intervention_variant: str,
+    ) -> Image.Image:
+        if intervention_variant == "strong_null_history_image_replacement":
+            return self._build_null_history_image(image)
+        if intervention_variant == "replace_with_other_history":
+            donor_indices = [
+                index
+                for index in range(len(history_images))
+                if index != int(target_history_index)
+            ]
+            if not donor_indices:
+                return image.copy()
+            donor_index = min(
+                donor_indices,
+                key=lambda index: (abs(index - int(target_history_index)), index),
+            )
+            return history_images[donor_index].copy()
+        if intervention_variant == "light_blur":
+            return image.filter(ImageFilter.GaussianBlur(radius=self.history_probe_blur_radius))
+        if intervention_variant == "downsample_then_upsample":
+            width, height = image.size
+            resized_width = max(1, int(round(width / float(self.history_probe_downsample_factor))))
+            resized_height = max(1, int(round(height / float(self.history_probe_downsample_factor))))
+            return image.resize((resized_width, resized_height), Image.BILINEAR).resize(
+                (width, height),
+                Image.BICUBIC,
+            )
+        raise ValueError(f"Unsupported intervention_variant={intervention_variant!r}")
+
+    def _append_history_probe_record(self, record: dict) -> None:
+        if self._history_probe_details_path is None:
+            return
+        with open(self._history_probe_details_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def _append_history_probe_inventory_record(self, record: dict) -> None:
+        if self._history_probe_inventory_path is None:
+            return
+        with open(self._history_probe_inventory_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def _record_history_probe_inventory(
+        self,
+        *,
+        scene_id,
+        episode_id,
+        step_id,
+        call_role: str,
+        has_history: bool,
+        is_lookdown_followup: bool,
+        history_indices,
+        baseline_summary: dict,
+        has_followup_same_step: bool,
+        followup_summary: Optional[dict],
+        selected_for_probe: bool,
+        selected_reason: Optional[str],
+        skipped_reason: Optional[str],
+    ) -> None:
+        if not self.history_probe_enabled:
+            return
+        baseline_is_single_lookdown_action = self._is_single_lookdown_action(baseline_summary)
+        record = {
+            "scene_id": scene_id,
+            "episode_id": int(episode_id),
+            "step_id": int(step_id),
+            "history_probe_mode": self.history_probe_mode,
+            "history_probe_target": self.history_probe_target,
+            "call_role": str(call_role),
+            "has_history": bool(has_history),
+            "history_slot_count": int(len(history_indices)),
+            "history_indices": [int(idx) for idx in history_indices],
+            "is_lookdown_followup": bool(is_lookdown_followup),
+            "baseline_output_type": baseline_summary["output_type"],
+            "baseline_has_pixel_goal": baseline_summary["has_pixel_goal"],
+            "baseline_pixel_goal": baseline_summary["pixel_goal"],
+            "baseline_action_seq": baseline_summary["action_seq"],
+            "baseline_is_single_lookdown_action": bool(baseline_is_single_lookdown_action),
+            "baseline_llm_output": baseline_summary["llm_output"],
+            "baseline_generated_token_ids": baseline_summary["generated_token_ids"],
+            "baseline_first_generated_token_id": baseline_summary["first_generated_token_id"],
+            "baseline_generated_token_count": len(baseline_summary["generated_token_ids"]),
+            "has_followup_same_step": bool(has_followup_same_step),
+            "followup_output_type": (
+                followup_summary["output_type"] if followup_summary is not None else None
+            ),
+            "followup_has_pixel_goal": (
+                followup_summary["has_pixel_goal"] if followup_summary is not None else None
+            ),
+            "followup_pixel_goal": (
+                followup_summary["pixel_goal"] if followup_summary is not None else None
+            ),
+            "gateway_event_selected": bool(selected_for_probe),
+            "gateway_selected_reason": selected_reason,
+            "gateway_skipped_reason": skipped_reason,
+            "whether_selected_for_probe": bool(selected_for_probe),
+            "selected_reason": selected_reason,
+            "skipped_reason": skipped_reason,
+        }
+        self._append_history_probe_inventory_record(record)
+
+    def _store_history_probe_primary_candidate(
+        self,
+        *,
+        scene_id,
+        episode_id,
+        step_id,
+        history_indices,
+        messages,
+        baseline_result,
+        baseline_summary: dict,
+    ) -> None:
+        key = self._history_probe_event_key(scene_id, episode_id, step_id)
+        baseline_result_for_probe = {
+            "llm_output": (baseline_result or {}).get("llm_output"),
+            "pixel_goal": copy.deepcopy((baseline_result or {}).get("pixel_goal")),
+            "generated_token_ids": copy.deepcopy((baseline_result or {}).get("generated_token_ids")),
+            "runtime_metrics": copy.deepcopy((baseline_result or {}).get("runtime_metrics") or {}),
+        }
+        self._history_probe_pending_primary_events[key] = {
+            "scene_id": scene_id,
+            "episode_id": int(episode_id),
+            "step_id": int(step_id),
+            "history_indices": [int(idx) for idx in history_indices],
+            "messages": copy.deepcopy(messages),
+            "baseline_result": baseline_result_for_probe,
+            "baseline_summary": dict(baseline_summary),
+        }
+
+    def _finalize_history_probe_primary_candidate(
+        self,
+        key: tuple,
+        *,
+        followup_summary: Optional[dict],
+        selected_steps_so_far: int,
+    ) -> bool:
+        candidate = self._history_probe_pending_primary_events.pop(key, None)
+        if candidate is None:
+            return False
+
+        selected_for_probe, selected_reason, skipped_reason = self._select_history_probe_step(
+            has_history=bool(candidate["history_indices"]),
+            is_lookdown_followup=False,
+            baseline_summary=candidate["baseline_summary"],
+            selected_steps_so_far=selected_steps_so_far,
+            has_followup_same_step=bool(followup_summary is not None),
+            followup_summary=followup_summary,
+        )
+        self._record_history_probe_inventory(
+            scene_id=candidate["scene_id"],
+            episode_id=candidate["episode_id"],
+            step_id=candidate["step_id"],
+            call_role="history_conditioned_primary",
+            has_history=bool(candidate["history_indices"]),
+            is_lookdown_followup=False,
+            history_indices=candidate["history_indices"],
+            baseline_summary=candidate["baseline_summary"],
+            has_followup_same_step=bool(followup_summary is not None),
+            followup_summary=followup_summary,
+            selected_for_probe=selected_for_probe,
+            selected_reason=selected_reason,
+            skipped_reason=skipped_reason,
+        )
+        if selected_for_probe:
+            self._run_history_probe_for_step(
+                scene_id=candidate["scene_id"],
+                episode_id=candidate["episode_id"],
+                step_id=candidate["step_id"],
+                history_indices=candidate["history_indices"],
+                messages=candidate["messages"],
+                baseline_result=candidate["baseline_result"],
+            )
+        return bool(selected_for_probe)
+
+    def _flush_history_probe_pending_primary_candidates(
+        self,
+        *,
+        exclude_key: Optional[tuple] = None,
+        selected_steps_so_far: int,
+    ) -> int:
+        selected_count = 0
+        pending_keys = list(self._history_probe_pending_primary_events.keys())
+        for key in pending_keys:
+            if exclude_key is not None and key == exclude_key:
+                continue
+            selected = self._finalize_history_probe_primary_candidate(
+                key,
+                followup_summary=None,
+                selected_steps_so_far=selected_steps_so_far + selected_count,
+            )
+            if selected:
+                selected_count += 1
+        return selected_count
+
+    def _run_history_probe_for_step(
+        self,
+        *,
+        scene_id,
+        episode_id,
+        step_id,
+        history_indices,
+        messages,
+        baseline_result,
+    ) -> None:
+        if not self.history_probe_enabled or self._history_probe_details_path is None:
+            return
+
+        history_indices = [int(idx) for idx in history_indices]
+        if not history_indices:
+            return
+
+        baseline_summary = self._summarize_s2_result(baseline_result)
+        common_record = {
+            "scene_id": scene_id,
+            "episode_id": int(episode_id),
+            "step_id": int(step_id),
+            "history_slot_count": int(len(history_indices)),
+            "history_indices": history_indices,
+            "probe_mode": self.history_probe_mode,
+            "history_probe_target": self.history_probe_target,
+            "baseline_output_type": baseline_summary["output_type"],
+            "baseline_has_pixel_goal": baseline_summary["has_pixel_goal"],
+            "baseline_pixel_goal": baseline_summary["pixel_goal"],
+            "baseline_action_seq": baseline_summary["action_seq"],
+            "baseline_llm_output": baseline_summary["llm_output"],
+            "baseline_generated_token_ids": baseline_summary["generated_token_ids"],
+            "baseline_first_generated_token_id": baseline_summary["first_generated_token_id"],
+            "baseline_is_single_lookdown_action": self._is_single_lookdown_action(baseline_summary),
+            "baseline_runtime_total_ms": baseline_summary["runtime_metrics"].get("total_ms"),
+            "baseline_prompt_token_count": baseline_summary["runtime_metrics"].get("prompt_token_count"),
+            "baseline_generated_token_count": baseline_summary["runtime_metrics"].get("generated_token_count"),
+        }
+
+        if self.history_probe_mode == "score_only":
+            record = dict(common_record)
+            record.update(
+                {
+                    "history_index": -1,
+                    "history_source_step_id": None,
+                    "history_step_delta": None,
+                    "probe_output_type": baseline_summary["output_type"],
+                    "probe_has_pixel_goal": baseline_summary["has_pixel_goal"],
+                    "probe_pixel_goal": baseline_summary["pixel_goal"],
+                    "probe_action_seq": baseline_summary["action_seq"],
+                    "probe_llm_output": baseline_summary["llm_output"],
+                    "probe_generated_token_ids": baseline_summary["generated_token_ids"],
+                    "probe_first_generated_token_id": baseline_summary["first_generated_token_id"],
+                    "probe_runtime_total_ms": baseline_summary["runtime_metrics"].get("total_ms"),
+                    "probe_prompt_token_count": baseline_summary["runtime_metrics"].get("prompt_token_count"),
+                        "probe_generated_token_count": baseline_summary["runtime_metrics"].get("generated_token_count"),
+                        "probe_wall_time_ms": 0.0,
+                        "output_type_flipped": False,
+                        "pixel_goal_to_discrete": False,
+                        "discrete_to_pixel_goal": False,
+                        "pixel_goal_l2_shift": 0.0 if baseline_summary["has_pixel_goal"] else None,
+                        "discrete_action_changed": False,
+                        "probe_is_single_lookdown_action": self._is_single_lookdown_action(
+                            baseline_summary
+                        ),
+                        "gateway_action_preserved": self._is_single_lookdown_action(
+                            baseline_summary
+                        ),
+                        "gateway_action_changed": False,
+                        "first_generated_token_changed": False,
+                        "generated_token_count_delta": 0,
+                        "generated_token_count_abs_delta": 0,
+                        "probe_error": None,
+                    }
+                )
+            self._append_history_probe_record(record)
+            return
+
+        for intervention_variant in self.history_probe_interventions:
+            intervention_metadata = self._history_probe_intervention_metadata(
+                intervention_variant
+            )
+            for history_index, history_source_step_id in enumerate(history_indices):
+                record = dict(common_record)
+                record.update(intervention_metadata)
+                record.update(
+                    {
+                        "history_index": int(history_index),
+                        "history_source_step_id": int(history_source_step_id),
+                        "history_step_delta": int(step_id) - int(history_source_step_id),
+                    }
+                )
+                try:
+                    probe_messages = self._clone_probe_messages_for_history(
+                        messages,
+                        history_slot_count=len(history_indices),
+                        history_index=history_index,
+                        probe_mode=self.history_probe_mode,
+                        intervention_variant=intervention_variant,
+                    )
+                    probe_start = time.perf_counter()
+                    probe_result = self._single_vllm_step_s2(
+                        probe_messages,
+                        max_new_tokens=128,
+                        return_latents=False,
+                    )
+                    probe_wall_time_ms = (time.perf_counter() - probe_start) * 1000.0
+                    probe_summary = self._summarize_s2_result(probe_result)
+                    pixel_goal_l2_shift = None
+                    if baseline_summary["pixel_goal"] is not None and probe_summary["pixel_goal"] is not None:
+                        pixel_goal_l2_shift = float(
+                            np.linalg.norm(
+                                np.array(probe_summary["pixel_goal"], dtype=np.float32)
+                                - np.array(baseline_summary["pixel_goal"], dtype=np.float32)
+                            )
+                        )
+                    record.update(
+                        {
+                            "probe_output_type": probe_summary["output_type"],
+                            "probe_has_pixel_goal": probe_summary["has_pixel_goal"],
+                            "probe_pixel_goal": probe_summary["pixel_goal"],
+                            "probe_action_seq": probe_summary["action_seq"],
+                            "probe_llm_output": probe_summary["llm_output"],
+                            "probe_generated_token_ids": probe_summary["generated_token_ids"],
+                            "probe_first_generated_token_id": probe_summary["first_generated_token_id"],
+                            "probe_runtime_total_ms": probe_summary["runtime_metrics"].get("total_ms"),
+                            "probe_prompt_token_count": probe_summary["runtime_metrics"].get("prompt_token_count"),
+                            "probe_generated_token_count": probe_summary["runtime_metrics"].get("generated_token_count"),
+                            "probe_wall_time_ms": probe_wall_time_ms,
+                            "output_type_flipped": (
+                                baseline_summary["output_type"] != probe_summary["output_type"]
+                            ),
+                            "pixel_goal_to_discrete": (
+                                baseline_summary["output_type"] == "pixel_goal"
+                                and probe_summary["output_type"] == "discrete_action"
+                            ),
+                            "discrete_to_pixel_goal": (
+                                baseline_summary["output_type"] == "discrete_action"
+                                and probe_summary["output_type"] == "pixel_goal"
+                            ),
+                            "pixel_goal_l2_shift": pixel_goal_l2_shift,
+                            "discrete_action_changed": (
+                                baseline_summary["output_type"] == "discrete_action"
+                                and probe_summary["output_type"] == "discrete_action"
+                                and baseline_summary["action_seq"] != probe_summary["action_seq"]
+                            ),
+                            "probe_is_single_lookdown_action": self._is_single_lookdown_action(
+                                probe_summary
+                            ),
+                            "gateway_action_preserved": self._is_single_lookdown_action(probe_summary),
+                            "gateway_action_changed": (
+                                not self._is_single_lookdown_action(probe_summary)
+                            ),
+                            "first_generated_token_changed": (
+                                baseline_summary["first_generated_token_id"]
+                                != probe_summary["first_generated_token_id"]
+                            ),
+                            "generated_token_count_delta": (
+                                int(probe_summary["runtime_metrics"].get("generated_token_count") or 0)
+                                - int(baseline_summary["runtime_metrics"].get("generated_token_count") or 0)
+                            ),
+                            "generated_token_count_abs_delta": abs(
+                                int(probe_summary["runtime_metrics"].get("generated_token_count") or 0)
+                                - int(baseline_summary["runtime_metrics"].get("generated_token_count") or 0)
+                            ),
+                            "probe_error": None,
+                        }
+                    )
+                except Exception as exc:
+                    record.update(
+                        {
+                            "probe_output_type": "error",
+                            "probe_has_pixel_goal": None,
+                            "probe_pixel_goal": None,
+                            "probe_action_seq": None,
+                            "probe_llm_output": None,
+                            "probe_generated_token_ids": None,
+                            "probe_first_generated_token_id": None,
+                            "probe_runtime_total_ms": None,
+                            "probe_prompt_token_count": None,
+                            "probe_generated_token_count": None,
+                            "probe_wall_time_ms": None,
+                            "output_type_flipped": None,
+                            "pixel_goal_to_discrete": None,
+                            "discrete_to_pixel_goal": None,
+                            "pixel_goal_l2_shift": None,
+                            "discrete_action_changed": None,
+                            "probe_is_single_lookdown_action": None,
+                            "gateway_action_preserved": None,
+                            "gateway_action_changed": None,
+                            "first_generated_token_changed": None,
+                            "generated_token_count_delta": None,
+                            "generated_token_count_abs_delta": None,
+                            "probe_error": f"{type(exc).__name__}:{exc}",
+                        }
+                    )
+                    print(
+                        "[HabitatVLNEvaluator] History probe failed "
+                        f"scene={scene_id} episode={episode_id} step={step_id} "
+                        f"history_index={history_index} intervention={intervention_variant}: "
+                        f"{type(exc).__name__}: {exc}",
+                        flush=True,
+                    )
+                self._append_history_probe_record(record)
+
+    @staticmethod
     def _pil_to_data_url(image):
         buf = io.BytesIO()
         image.save(buf, format="PNG")
@@ -703,7 +1415,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         resp.raise_for_status()
         return resp.json()["choices"][0]["message"]["content"]
 
-    def _single_vllm_step_s2(self, messages, max_new_tokens=128):
+    def _single_vllm_step_s2(self, messages, max_new_tokens=128, return_latents=True):
         if self._dualvln_single_vllm_client is None:
             raise RuntimeError("Single-engine DualVLN vLLM client is not initialized")
         return self._dualvln_single_vllm_client.step_s2(
@@ -711,6 +1423,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             max_new_tokens=max_new_tokens,
             target_device=self.device,
             target_dtype=torch.bfloat16,
+            return_latents=return_latents,
         )
 
     def _generate_latents(self, output_ids, pixel_values, image_grid_thw, input_images):
@@ -1737,6 +2450,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             action = None
             messages = []
             local_actions = []
+            history_probe_selected_steps = 0
 
             done = False
             flag = False
@@ -1909,6 +2623,49 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             )
 
                     print('step_id:', step_id, 'output text:', llm_outputs)
+
+                    if single_vllm_result is not None and self.history_probe_enabled:
+                        baseline_summary = self._summarize_s2_result(single_vllm_result)
+                        current_probe_key = self._history_probe_event_key(scene_id, episode_id, step_id)
+                        history_probe_selected_steps += self._flush_history_probe_pending_primary_candidates(
+                            exclude_key=current_probe_key if is_lookdown_followup else None,
+                            selected_steps_so_far=history_probe_selected_steps,
+                        )
+                        if is_lookdown_followup:
+                            primary_selected = self._finalize_history_probe_primary_candidate(
+                                current_probe_key,
+                                followup_summary=baseline_summary,
+                                selected_steps_so_far=history_probe_selected_steps,
+                            )
+                            if primary_selected:
+                                history_probe_selected_steps += 1
+                            self._record_history_probe_inventory(
+                                scene_id=scene_id,
+                                episode_id=episode_id,
+                                step_id=step_id,
+                                call_role=self._history_probe_call_role(True),
+                                has_history=bool(len(history_id) > 0),
+                                is_lookdown_followup=True,
+                                history_indices=history_id,
+                                baseline_summary=baseline_summary,
+                                has_followup_same_step=False,
+                                followup_summary=None,
+                                selected_for_probe=False,
+                                selected_reason=None,
+                                skipped_reason="lookdown_followup_call",
+                            )
+                        else:
+                            self._store_history_probe_primary_candidate(
+                                scene_id=scene_id,
+                                episode_id=episode_id,
+                                step_id=step_id,
+                                history_indices=history_id,
+                                messages=messages,
+                                baseline_result=single_vllm_result,
+                                baseline_summary=baseline_summary,
+                            )
+                    else:
+                        pass
 
                     if bool(re.search(r'\d', llm_outputs)):  # output pixel goal
                         episode_runtime_state["pixel_goal_count"] += 1
@@ -2139,6 +2896,10 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
             # ---------- 3. End of episode -----------
             # collect the metric result of this episode and write progress to the output_path/progress.json
+            if self.history_probe_enabled:
+                history_probe_selected_steps += self._flush_history_probe_pending_primary_candidates(
+                    selected_steps_so_far=history_probe_selected_steps,
+                )
 
             process_bar.update(1)
 

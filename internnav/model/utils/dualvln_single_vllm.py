@@ -1,6 +1,7 @@
 import base64
 import functools
 import io
+import ipaddress
 import json
 import logging
 import os
@@ -10,6 +11,7 @@ from multiprocessing import shared_memory
 from pathlib import Path
 from typing import Optional
 import time
+from urllib.parse import urlparse
 
 import requests as http_requests
 import torch
@@ -788,7 +790,7 @@ class DualVLNSingleVLLMRunner:
             )
         return self._hidden_latents_runner
 
-    def step_s2(self, messages, *, max_new_tokens: int = 128):
+    def step_s2(self, messages, *, max_new_tokens: int = 128, return_latents: bool = True):
         from vllm import SamplingParams
         from vllm.outputs import RequestOutput
 
@@ -924,6 +926,12 @@ class DualVLNSingleVLLMRunner:
             runtime_metrics["total_ms"] = (time.perf_counter() - total_start) * 1000.0
             return result
 
+        result["pixel_goal"] = [int(coord[1]), int(coord[0])]
+        if not return_latents:
+            runtime_metrics["latent_path"] = "disabled_return_latents_false"
+            runtime_metrics["total_ms"] = (time.perf_counter() - total_start) * 1000.0
+            return result
+
         bundle_start = time.perf_counter()
         bundle = build_latents_request_bundle(
             processor=self.processor,
@@ -1024,7 +1032,6 @@ class DualVLNSingleVLLMRunner:
                 runtime_metrics["latent_prefill_ms"] / runtime_metrics["total_ms"]
             )
 
-        result["pixel_goal"] = [int(coord[1]), int(coord[0])]
         result["latents"] = latents
         result["debug_mm"] = mm_debug
         return result
@@ -1035,8 +1042,32 @@ class DualVLNSingleVLLMHTTPClient:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self.image_transport_mode = _get_image_transport_mode()
+        parsed = urlparse(self.base_url)
+        hostname = parsed.hostname or ""
+        disable_env_proxy = hostname in {"localhost", "::1"}
+        if not disable_env_proxy:
+            try:
+                disable_env_proxy = ipaddress.ip_address(hostname).is_loopback
+            except ValueError:
+                disable_env_proxy = False
+        self._disable_env_proxy = bool(disable_env_proxy)
+        self._session = http_requests.Session()
+        if self._disable_env_proxy:
+            self._session.trust_env = False
+            logger.info(
+                "DualVLNSingleVLLMHTTPClient disabling env proxy for local base_url=%s",
+                self.base_url,
+            )
 
-    def step_s2(self, messages, *, max_new_tokens: int = 128, target_device=None, target_dtype=None):
+    def step_s2(
+        self,
+        messages,
+        *,
+        max_new_tokens: int = 128,
+        target_device=None,
+        target_dtype=None,
+        return_latents: bool = True,
+    ):
         client_total_start = time.perf_counter()
         encode_start = client_total_start
         encoded_messages, encode_state = encode_messages(
@@ -1048,16 +1079,24 @@ class DualVLNSingleVLLMHTTPClient:
             "messages": encoded_messages,
             "max_new_tokens": int(max_new_tokens),
             "image_transport_mode": encode_state["image_transport_mode"],
+            "return_latents": bool(return_latents),
         }
         data = None
         try:
             http_start = time.perf_counter()
-            resp = http_requests.post(
+            resp = self._session.post(
                 f"{self.base_url}/dualvln/step_s2",
                 json=payload,
                 timeout=self.timeout,
             )
             client_http_post_ms = (time.perf_counter() - http_start) * 1000.0
+            if not resp.ok:
+                logger.error(
+                    "DualVLN step_s2 HTTP %s from %s/dualvln/step_s2; response body prefix=%r",
+                    resp.status_code,
+                    self.base_url,
+                    resp.text[:500],
+                )
             resp.raise_for_status()
             response_json_start = time.perf_counter()
             data = resp.json()
