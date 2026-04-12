@@ -297,6 +297,9 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         self.history_probe_interventions = self._normalize_history_probe_interventions(
             getattr(self.model_args, "history_probe_interventions", None)
         )
+        self.history_probe_run_followup_replay = bool(
+            getattr(self.model_args, "history_probe_run_followup_replay", False)
+        )
         self.history_probe_blur_radius = float(
             getattr(self.model_args, "history_probe_blur_radius", 2.0)
         )
@@ -356,6 +359,7 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 "[HabitatVLNEvaluator] History probe enabled: "
                 f"mode={self.history_probe_mode} target={self.history_probe_target} "
                 f"interventions={self.history_probe_interventions} "
+                f"followup_replay={self.history_probe_run_followup_replay} "
                 f"max_selected_steps_per_episode={self.history_probe_max_steps} "
                 f"dump={self._history_probe_details_path} "
                 f"inventory={self._history_probe_inventory_path}"
@@ -860,6 +864,51 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             return True
         return str(summary.get("llm_output") or "").strip() == "↓"
 
+    @staticmethod
+    def _is_exact_single_lookdown_action_seq(summary: Optional[dict]) -> bool:
+        if summary is None:
+            return False
+        action_seq = [int(action) for action in (summary.get("action_seq") or [])]
+        return action_seq == [int(action_code.LOOKDOWN)]
+
+    @staticmethod
+    def _history_probe_pixel_goal_l2_shift(
+        baseline_pixel_goal: Optional[list],
+        probe_pixel_goal: Optional[list],
+    ) -> Optional[float]:
+        if baseline_pixel_goal is None or probe_pixel_goal is None:
+            return None
+        return float(
+            np.linalg.norm(
+                np.array(probe_pixel_goal, dtype=np.float32)
+                - np.array(baseline_pixel_goal, dtype=np.float32)
+            )
+        )
+
+    @staticmethod
+    def _clone_followup_messages_with_probe_output(
+        followup_messages,
+        *,
+        probe_primary_llm_output: str,
+    ):
+        replay_messages = copy.deepcopy(followup_messages)
+        for message in reversed(replay_messages):
+            if message.get("role") != "assistant":
+                continue
+            new_content = []
+            replaced = False
+            for item in message.get("content", []):
+                if item.get("type") == "text" and not replaced:
+                    new_content.append({"type": "text", "text": str(probe_primary_llm_output or "")})
+                    replaced = True
+                else:
+                    new_content.append(dict(item))
+            if not replaced:
+                new_content.append({"type": "text", "text": str(probe_primary_llm_output or "")})
+            message["content"] = new_content
+            return replay_messages
+        raise ValueError("Follow-up replay requires an assistant turn in followup_messages")
+
     def _history_probe_target_matched(
         self,
         *,
@@ -1120,6 +1169,8 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         key: tuple,
         *,
         followup_summary: Optional[dict],
+        followup_result: Optional[dict] = None,
+        followup_messages=None,
         selected_steps_so_far: int,
     ) -> bool:
         candidate = self._history_probe_pending_primary_events.pop(key, None)
@@ -1157,6 +1208,8 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 history_indices=candidate["history_indices"],
                 messages=candidate["messages"],
                 baseline_result=candidate["baseline_result"],
+                baseline_followup_result=followup_result,
+                followup_messages=followup_messages,
             )
         return bool(selected_for_probe)
 
@@ -1189,6 +1242,8 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         history_indices,
         messages,
         baseline_result,
+        baseline_followup_result=None,
+        followup_messages=None,
     ) -> None:
         if not self.history_probe_enabled or self._history_probe_details_path is None:
             return
@@ -1198,6 +1253,11 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             return
 
         baseline_summary = self._summarize_s2_result(baseline_result)
+        baseline_followup_summary = (
+            self._summarize_s2_result(baseline_followup_result)
+            if baseline_followup_result is not None
+            else None
+        )
         common_record = {
             "scene_id": scene_id,
             "episode_id": int(episode_id),
@@ -1211,12 +1271,28 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             "baseline_pixel_goal": baseline_summary["pixel_goal"],
             "baseline_action_seq": baseline_summary["action_seq"],
             "baseline_llm_output": baseline_summary["llm_output"],
+            "baseline_primary_output_type": baseline_summary["output_type"],
+            "baseline_primary_action_seq": baseline_summary["action_seq"],
+            "baseline_primary_llm_output": baseline_summary["llm_output"],
             "baseline_generated_token_ids": baseline_summary["generated_token_ids"],
             "baseline_first_generated_token_id": baseline_summary["first_generated_token_id"],
             "baseline_is_single_lookdown_action": self._is_single_lookdown_action(baseline_summary),
             "baseline_runtime_total_ms": baseline_summary["runtime_metrics"].get("total_ms"),
             "baseline_prompt_token_count": baseline_summary["runtime_metrics"].get("prompt_token_count"),
             "baseline_generated_token_count": baseline_summary["runtime_metrics"].get("generated_token_count"),
+            "baseline_followup_output_type": (
+                baseline_followup_summary["output_type"] if baseline_followup_summary is not None else None
+            ),
+            "baseline_followup_has_pixel_goal": (
+                baseline_followup_summary["has_pixel_goal"] if baseline_followup_summary is not None else None
+            ),
+            "baseline_followup_pixel_goal": (
+                baseline_followup_summary["pixel_goal"] if baseline_followup_summary is not None else None
+            ),
+            "baseline_followup_llm_output": (
+                baseline_followup_summary["llm_output"] if baseline_followup_summary is not None else None
+            ),
+            "history_probe_run_followup_replay": bool(self.history_probe_run_followup_replay),
         }
 
         if self.history_probe_mode == "score_only":
@@ -1231,30 +1307,46 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     "probe_pixel_goal": baseline_summary["pixel_goal"],
                     "probe_action_seq": baseline_summary["action_seq"],
                     "probe_llm_output": baseline_summary["llm_output"],
+                    "probe_primary_output_type": baseline_summary["output_type"],
+                    "probe_primary_action_seq": baseline_summary["action_seq"],
+                    "probe_primary_llm_output": baseline_summary["llm_output"],
                     "probe_generated_token_ids": baseline_summary["generated_token_ids"],
                     "probe_first_generated_token_id": baseline_summary["first_generated_token_id"],
                     "probe_runtime_total_ms": baseline_summary["runtime_metrics"].get("total_ms"),
                     "probe_prompt_token_count": baseline_summary["runtime_metrics"].get("prompt_token_count"),
-                        "probe_generated_token_count": baseline_summary["runtime_metrics"].get("generated_token_count"),
-                        "probe_wall_time_ms": 0.0,
-                        "output_type_flipped": False,
-                        "pixel_goal_to_discrete": False,
-                        "discrete_to_pixel_goal": False,
-                        "pixel_goal_l2_shift": 0.0 if baseline_summary["has_pixel_goal"] else None,
-                        "discrete_action_changed": False,
-                        "probe_is_single_lookdown_action": self._is_single_lookdown_action(
-                            baseline_summary
-                        ),
-                        "gateway_action_preserved": self._is_single_lookdown_action(
-                            baseline_summary
-                        ),
-                        "gateway_action_changed": False,
-                        "first_generated_token_changed": False,
-                        "generated_token_count_delta": 0,
-                        "generated_token_count_abs_delta": 0,
-                        "probe_error": None,
-                    }
-                )
+                    "probe_generated_token_count": baseline_summary["runtime_metrics"].get("generated_token_count"),
+                    "probe_wall_time_ms": 0.0,
+                    "output_type_flipped": False,
+                    "pixel_goal_to_discrete": False,
+                    "discrete_to_pixel_goal": False,
+                    "pixel_goal_l2_shift": 0.0 if baseline_summary["has_pixel_goal"] else None,
+                    "discrete_action_changed": False,
+                    "probe_is_single_lookdown_action": self._is_single_lookdown_action(
+                        baseline_summary
+                    ),
+                    "gateway_action_preserved": self._is_single_lookdown_action(
+                        baseline_summary
+                    ),
+                    "gateway_action_changed": False,
+                    "followup_replay_attempted": False,
+                    "followup_replay_executed": False,
+                    "followup_replay_skip_reason": "score_only_mode",
+                    "probe_followup_output_type": None,
+                    "probe_followup_has_pixel_goal": None,
+                    "probe_followup_pixel_goal": None,
+                    "probe_followup_llm_output": None,
+                    "probe_followup_generated_token_count": None,
+                    "probe_followup_runtime_total_ms": None,
+                    "followup_pixel_goal_preserved": None,
+                    "followup_pixel_goal_to_discrete": None,
+                    "followup_pixel_goal_l2_shift": None,
+                    "end_to_end_gateway_and_followup_preserved": None,
+                    "first_generated_token_changed": False,
+                    "generated_token_count_delta": 0,
+                    "generated_token_count_abs_delta": 0,
+                    "probe_error": None,
+                }
+            )
             self._append_history_probe_record(record)
             return
 
@@ -1288,13 +1380,65 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     )
                     probe_wall_time_ms = (time.perf_counter() - probe_start) * 1000.0
                     probe_summary = self._summarize_s2_result(probe_result)
-                    pixel_goal_l2_shift = None
-                    if baseline_summary["pixel_goal"] is not None and probe_summary["pixel_goal"] is not None:
-                        pixel_goal_l2_shift = float(
-                            np.linalg.norm(
-                                np.array(probe_summary["pixel_goal"], dtype=np.float32)
-                                - np.array(baseline_summary["pixel_goal"], dtype=np.float32)
-                            )
+                    pixel_goal_l2_shift = self._history_probe_pixel_goal_l2_shift(
+                        baseline_summary["pixel_goal"],
+                        probe_summary["pixel_goal"],
+                    )
+                    followup_replay_attempted = bool(
+                        self.history_probe_run_followup_replay
+                        and baseline_followup_summary is not None
+                        and followup_messages is not None
+                    )
+                    followup_replay_executed = False
+                    followup_replay_skip_reason = None
+                    probe_followup_summary = None
+                    if followup_replay_attempted:
+                        if not self._is_exact_single_lookdown_action_seq(probe_summary):
+                            followup_replay_skip_reason = "gateway_action_not_preserved"
+                        else:
+                            try:
+                                replay_messages = self._clone_followup_messages_with_probe_output(
+                                    followup_messages,
+                                    probe_primary_llm_output=probe_summary["llm_output"],
+                                )
+                                probe_followup_result = self._single_vllm_step_s2(
+                                    replay_messages,
+                                    max_new_tokens=128,
+                                    return_latents=False,
+                                )
+                                probe_followup_summary = self._summarize_s2_result(probe_followup_result)
+                                followup_replay_executed = True
+                                followup_replay_skip_reason = None
+                            except Exception as followup_exc:
+                                followup_replay_executed = False
+                                followup_replay_skip_reason = (
+                                    f"followup_replay_error:{type(followup_exc).__name__}:{followup_exc}"
+                                )
+                    elif self.history_probe_run_followup_replay:
+                        followup_replay_skip_reason = "baseline_followup_missing"
+                    else:
+                        followup_replay_skip_reason = "followup_replay_disabled"
+                    followup_pixel_goal_l2_shift = self._history_probe_pixel_goal_l2_shift(
+                        None if baseline_followup_summary is None else baseline_followup_summary["pixel_goal"],
+                        None if probe_followup_summary is None else probe_followup_summary["pixel_goal"],
+                    )
+                    followup_pixel_goal_preserved = None
+                    followup_pixel_goal_to_discrete = None
+                    end_to_end_gateway_and_followup_preserved = None
+                    if baseline_followup_summary is not None and followup_replay_executed:
+                        followup_pixel_goal_preserved = bool(
+                            baseline_followup_summary["pixel_goal"] is not None
+                            and probe_followup_summary is not None
+                            and probe_followup_summary["pixel_goal"] is not None
+                            and baseline_followup_summary["pixel_goal"] == probe_followup_summary["pixel_goal"]
+                        )
+                        followup_pixel_goal_to_discrete = bool(
+                            baseline_followup_summary["output_type"] == "pixel_goal"
+                            and probe_followup_summary["output_type"] == "discrete_action"
+                        )
+                        end_to_end_gateway_and_followup_preserved = bool(
+                            self._is_exact_single_lookdown_action_seq(probe_summary)
+                            and probe_followup_summary["output_type"] == "pixel_goal"
                         )
                     record.update(
                         {
@@ -1303,6 +1447,9 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             "probe_pixel_goal": probe_summary["pixel_goal"],
                             "probe_action_seq": probe_summary["action_seq"],
                             "probe_llm_output": probe_summary["llm_output"],
+                            "probe_primary_output_type": probe_summary["output_type"],
+                            "probe_primary_action_seq": probe_summary["action_seq"],
+                            "probe_primary_llm_output": probe_summary["llm_output"],
                             "probe_generated_token_ids": probe_summary["generated_token_ids"],
                             "probe_first_generated_token_id": probe_summary["first_generated_token_id"],
                             "probe_runtime_total_ms": probe_summary["runtime_metrics"].get("total_ms"),
@@ -1333,6 +1480,45 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             "gateway_action_changed": (
                                 not self._is_single_lookdown_action(probe_summary)
                             ),
+                            "followup_replay_attempted": followup_replay_attempted,
+                            "followup_replay_executed": followup_replay_executed,
+                            "followup_replay_skip_reason": followup_replay_skip_reason,
+                            "probe_followup_output_type": (
+                                probe_followup_summary["output_type"]
+                                if probe_followup_summary is not None
+                                else None
+                            ),
+                            "probe_followup_has_pixel_goal": (
+                                probe_followup_summary["has_pixel_goal"]
+                                if probe_followup_summary is not None
+                                else None
+                            ),
+                            "probe_followup_pixel_goal": (
+                                probe_followup_summary["pixel_goal"]
+                                if probe_followup_summary is not None
+                                else None
+                            ),
+                            "probe_followup_llm_output": (
+                                probe_followup_summary["llm_output"]
+                                if probe_followup_summary is not None
+                                else None
+                            ),
+                            "probe_followup_generated_token_count": (
+                                probe_followup_summary["runtime_metrics"].get("generated_token_count")
+                                if probe_followup_summary is not None
+                                else None
+                            ),
+                            "probe_followup_runtime_total_ms": (
+                                probe_followup_summary["runtime_metrics"].get("total_ms")
+                                if probe_followup_summary is not None
+                                else None
+                            ),
+                            "followup_pixel_goal_preserved": followup_pixel_goal_preserved,
+                            "followup_pixel_goal_to_discrete": followup_pixel_goal_to_discrete,
+                            "followup_pixel_goal_l2_shift": followup_pixel_goal_l2_shift,
+                            "end_to_end_gateway_and_followup_preserved": (
+                                end_to_end_gateway_and_followup_preserved
+                            ),
                             "first_generated_token_changed": (
                                 baseline_summary["first_generated_token_id"]
                                 != probe_summary["first_generated_token_id"]
@@ -1356,6 +1542,9 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             "probe_pixel_goal": None,
                             "probe_action_seq": None,
                             "probe_llm_output": None,
+                            "probe_primary_output_type": None,
+                            "probe_primary_action_seq": None,
+                            "probe_primary_llm_output": None,
                             "probe_generated_token_ids": None,
                             "probe_first_generated_token_id": None,
                             "probe_runtime_total_ms": None,
@@ -1370,6 +1559,19 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             "probe_is_single_lookdown_action": None,
                             "gateway_action_preserved": None,
                             "gateway_action_changed": None,
+                            "followup_replay_attempted": bool(self.history_probe_run_followup_replay),
+                            "followup_replay_executed": False,
+                            "followup_replay_skip_reason": "probe_primary_error",
+                            "probe_followup_output_type": None,
+                            "probe_followup_has_pixel_goal": None,
+                            "probe_followup_pixel_goal": None,
+                            "probe_followup_llm_output": None,
+                            "probe_followup_generated_token_count": None,
+                            "probe_followup_runtime_total_ms": None,
+                            "followup_pixel_goal_preserved": None,
+                            "followup_pixel_goal_to_discrete": None,
+                            "followup_pixel_goal_l2_shift": None,
+                            "end_to_end_gateway_and_followup_preserved": None,
                             "first_generated_token_changed": None,
                             "generated_token_count_delta": None,
                             "generated_token_count_abs_delta": None,
@@ -2635,6 +2837,8 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             primary_selected = self._finalize_history_probe_primary_candidate(
                                 current_probe_key,
                                 followup_summary=baseline_summary,
+                                followup_result=single_vllm_result,
+                                followup_messages=messages,
                                 selected_steps_so_far=history_probe_selected_steps,
                             )
                             if primary_selected:

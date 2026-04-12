@@ -54,19 +54,19 @@ def safe_rate(num, den):
     return float(num) / float(den)
 
 
-def summarize_probe_output(row):
-    output_type = row.get("probe_output_type")
+def summarize_probe_output(row, prefix="probe"):
+    output_type = row.get(f"{prefix}_output_type")
     if output_type == "pixel_goal":
-        pixel_goal = row.get("probe_pixel_goal")
+        pixel_goal = row.get(f"{prefix}_pixel_goal")
         if pixel_goal is not None:
             return f"pixel_goal:{pixel_goal[0]},{pixel_goal[1]}"
         return "pixel_goal"
-    action_seq = row.get("probe_action_seq")
+    action_seq = row.get(f"{prefix}_action_seq")
     if action_seq:
         if list(action_seq) == [5]:
             return "lookdown"
         return f"discrete:{','.join(str(int(action)) for action in action_seq)}"
-    llm_output = str(row.get("probe_llm_output") or "").strip()
+    llm_output = str(row.get(f"{prefix}_llm_output") or "").strip()
     if llm_output:
         return f"text:{llm_output}"
     return str(output_type or "unknown")
@@ -95,10 +95,24 @@ def build_group_rows(rows):
         total = len(group)
         valid = [row for row in group if not row.get("probe_error")]
         valid_count = len(valid)
+        followup_metrics_enabled = any(
+            bool(row.get("history_probe_run_followup_replay"))
+            or row.get("followup_replay_attempted") is not None
+            or row.get("followup_replay_executed") is not None
+            for row in group
+        )
         changed_output_counts = Counter(
-            summarize_probe_output(row)
+            summarize_probe_output(row, prefix="probe")
             for row in valid
             if row.get("gateway_action_changed")
+        )
+        followup_executed = [row for row in valid if row.get("followup_replay_executed") is True]
+        followup_executed_count = len(followup_executed)
+        changed_followup_output_counts = Counter(
+            summarize_probe_output(row, prefix="probe_followup")
+            for row in followup_executed
+            if row.get("followup_pixel_goal_preserved") is False
+            or row.get("followup_pixel_goal_to_discrete") is True
         )
         out_rows.append(
             {
@@ -139,7 +153,46 @@ def build_group_rows(rows):
                 "mean_probe_runtime_total_ms": safe_mean(
                     [row.get("probe_runtime_total_ms") for row in valid]
                 ),
+                "followup_replay_attempted_rows": sum(
+                    1 for row in valid if row.get("followup_replay_attempted") is True
+                ),
+                "followup_replay_executed_rows": followup_executed_count,
+                "followup_replay_executed_rate": (
+                    safe_rate(followup_executed_count, total)
+                    if followup_metrics_enabled
+                    else None
+                ),
+                "conditional_followup_pixel_goal_preserved_rate": (
+                    safe_rate(
+                        sum(
+                            1
+                            for row in followup_executed
+                            if row.get("followup_pixel_goal_preserved") is True
+                        ),
+                        followup_executed_count,
+                    )
+                    if followup_metrics_enabled
+                    else None
+                ),
+                "unconditional_end_to_end_preserved_rate": (
+                    safe_rate(
+                        sum(
+                            1
+                            for row in valid
+                            if row.get("end_to_end_gateway_and_followup_preserved") is True
+                        ),
+                        total,
+                    )
+                    if followup_metrics_enabled
+                    else None
+                ),
+                "mean_followup_pixel_goal_l2_shift": (
+                    safe_mean([row.get("followup_pixel_goal_l2_shift") for row in followup_executed])
+                    if followup_metrics_enabled
+                    else None
+                ),
                 "changed_output_counts": dict(changed_output_counts),
+                "changed_followup_output_counts": dict(changed_followup_output_counts),
             }
         )
     return out_rows
@@ -234,7 +287,14 @@ def write_csv(path: Path, rows):
         "mean_abs_generated_token_count_delta",
         "mean_probe_wall_time_ms",
         "mean_probe_runtime_total_ms",
+        "followup_replay_attempted_rows",
+        "followup_replay_executed_rows",
+        "followup_replay_executed_rate",
+        "conditional_followup_pixel_goal_preserved_rate",
+        "unconditional_end_to_end_preserved_rate",
+        "mean_followup_pixel_goal_l2_shift",
         "changed_output_counts",
+        "changed_followup_output_counts",
     ]
     with path.open("w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -243,6 +303,11 @@ def write_csv(path: Path, rows):
             serialized = dict(row)
             serialized["changed_output_counts"] = json.dumps(
                 row.get("changed_output_counts") or {},
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            serialized["changed_followup_output_counts"] = json.dumps(
+                row.get("changed_followup_output_counts") or {},
                 ensure_ascii=False,
                 sort_keys=True,
             )
@@ -315,6 +380,37 @@ def maybe_plot(group_rows, output_dir: Path):
     plt.close(fig)
     plot_paths.append(str(token_path))
 
+    if any(
+        row.get("conditional_followup_pixel_goal_preserved_rate") is not None
+        for row in group_rows
+    ):
+        fig, ax = plt.subplots(figsize=(8, 4.5), dpi=140)
+        for (probe_mode, intervention_variant), rows in sorted(by_mode.items()):
+            rows = sorted(rows, key=lambda row: row["history_index"])
+            ax.plot(
+                [row["history_index"] for row in rows],
+                [
+                    0.0
+                    if row["conditional_followup_pixel_goal_preserved_rate"] is None
+                    else row["conditional_followup_pixel_goal_preserved_rate"]
+                    for row in rows
+                ],
+                marker="o",
+                label=f"{probe_mode}:{intervention_variant}",
+            )
+        ax.set_xlabel("History Index")
+        ax.set_ylabel("Conditional Follow-up Preserve Rate")
+        ax.set_title("Follow-up Replay: Preserve Pixel Goal")
+        ax.set_ylim(0.0, 1.0)
+        ax.grid(alpha=0.25)
+        if len(by_mode) > 1:
+            ax.legend()
+        followup_path = output_dir / "followup_pixel_goal_preserved_rate.png"
+        fig.tight_layout()
+        fig.savefig(followup_path)
+        plt.close(fig)
+        plot_paths.append(str(followup_path))
+
     return plot_paths, None
 
 
@@ -328,6 +424,9 @@ def write_markdown(path: Path, title: str, summary: dict):
     lines.append(f"- Intervention variants: {summary['intervention_variants']}")
     lines.append(
         f"- Strong intervention: {summary['intervention_is_strong']}"
+    )
+    lines.append(
+        f"- Follow-up replay enabled in probe rows: {summary['history_probe_run_followup_replay']}"
     )
     lines.append(f"- Intervention note: {summary['intervention_note']}")
     inv = summary["inventory_summary"]
@@ -353,14 +452,24 @@ def write_markdown(path: Path, title: str, summary: dict):
                 ensure_ascii=False,
                 sort_keys=True,
             )
+            changed_followup_output_counts = json.dumps(
+                row.get("changed_followup_output_counts") or {},
+                ensure_ascii=False,
+                sort_keys=True,
+            )
             lines.append(
                 f"- {row['probe_mode']} idx={row['history_index']}: "
                 f"intervention={row['intervention_variant']}, "
                 f"preserve={row['gateway_action_preserved_rate']}, "
                 f"changed={row['gateway_action_changed_rate']}, "
+                f"followup_exec={row['followup_replay_executed_rate']}, "
+                f"followup_preserve={row['conditional_followup_pixel_goal_preserved_rate']}, "
+                f"end_to_end={row['unconditional_end_to_end_preserved_rate']}, "
+                f"followup_l2={row['mean_followup_pixel_goal_l2_shift']}, "
                 f"first_token_changed={row['first_generated_token_change_rate']}, "
                 f"token_delta={row['mean_generated_token_count_delta']}, "
-                f"changed_outputs={changed_output_counts}"
+                f"changed_outputs={changed_output_counts}, "
+                f"changed_followups={changed_followup_output_counts}"
             )
 
     if summary["plots"]:
@@ -415,6 +524,9 @@ def main():
                 for row in probe_rows
                 if row.get("intervention_variant") or row.get("intervention_type")
             }
+        ),
+        "history_probe_run_followup_replay": any(
+            bool(row.get("history_probe_run_followup_replay")) for row in probe_rows
         ),
         "intervention_type": (
             probe_rows[0].get("intervention_type")
