@@ -14,7 +14,7 @@ eval_cfg.agent.model_settings["dualvln_single_vllm_url"] = "http://127.0.0.1:800
 eval_cfg.agent.model_settings["dualvln_single_vllm_timeout"] = 300.0
 
 # Fixed evaluation set
-eval_cfg.eval_settings["output_path"] = "./logs/habitat/test_dual_system_32ep_single_vllm"
+eval_cfg.eval_settings["output_path"] = "./logs/habitat/test_dual_system_32ep_single_vllm_continuation_spda"
 eval_cfg.eval_settings["allowed_scene_ids"] = TARGET_SCENE_IDS
 eval_cfg.eval_settings["allowed_episode_ids"] = TARGET_EPISODE_IDS
 eval_cfg.eval_settings["max_eval_episodes"] = len(TARGET_EPISODE_IDS)
@@ -24,4 +24,5 @@ eval_cfg.eval_settings["replay_num_episodes"] = len(TARGET_EPISODE_IDS)
 eval_cfg.agent.model_settings["dit_cond_cache_enabled"] = True
 eval_cfg.agent.model_settings["dit_crossattn_kv_cache_enabled"] = True
 
-
+eval_cfg.eval_settings["save_video"] = False
+eval_cfg.eval_settings["vis_debug"] = False

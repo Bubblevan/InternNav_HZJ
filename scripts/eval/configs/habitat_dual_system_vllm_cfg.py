@@ -9,3 +9,6 @@ eval_cfg.eval_settings["output_path"] = "./logs/habitat/test_dual_system_full_si
 eval_cfg.eval_settings["max_eval_episodes"] = None
 eval_cfg.agent.model_settings["dit_cond_cache_enabled"] = True
 eval_cfg.agent.model_settings["dit_crossattn_kv_cache_enabled"] = True
+
+eval_cfg.eval_settings["save_video"] = False
+eval_cfg.eval_settings["vis_debug"] = False

@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import time
+from datetime import datetime
 from enum import IntEnum
 
 sys.path.append('./src/diffusion-policy')
@@ -53,9 +54,7 @@ from internnav.model.basemodel.internvla_n1.internvla_n1 import (
 from internnav.model.basemodel.internvla_n1.system1_runner import (
     InternVLAN1System1Runner,
 )
-from internnav.model.utils.dualvln_single_vllm import (
-    DualVLNSingleVLLMHTTPClient,
-)
+from dualvln_runtime.http import DualVLNSingleVLLMHTTPClient
 from internnav.model.utils.vllm_hidden_latents import (
     VLLMHiddenLatentsHTTPClient,
     VLLMHiddenLatentsRunner,
@@ -97,6 +96,32 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             self.output_path,
             "unified_summary_meta.json",
         )
+        self.timeline_trace_enabled = bool(getattr(args, "timeline_trace_enabled", False))
+        self.timeline_trace_scene_id = getattr(args, "timeline_trace_scene_id", None)
+        if self.timeline_trace_scene_id is not None:
+            self.timeline_trace_scene_id = str(self.timeline_trace_scene_id)
+        self.timeline_trace_episode_id = getattr(args, "timeline_trace_episode_id", None)
+        if self.timeline_trace_episode_id is not None:
+            self.timeline_trace_episode_id = int(self.timeline_trace_episode_id)
+        provisional_local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        timeline_trace_path = getattr(args, "timeline_trace_dump_path", None)
+        if timeline_trace_path:
+            timeline_trace_path = str(timeline_trace_path)
+            if "{rank}" in timeline_trace_path:
+                timeline_trace_path = timeline_trace_path.format(rank=provisional_local_rank)
+            elif timeline_trace_path.endswith(".jsonl"):
+                timeline_trace_path = timeline_trace_path[:-6] + f"_rank{provisional_local_rank}.jsonl"
+            else:
+                timeline_trace_path = os.path.join(
+                    timeline_trace_path,
+                    f"timeline_trace_rank{provisional_local_rank}.jsonl",
+                )
+        else:
+            timeline_trace_path = os.path.join(
+                self.output_path,
+                f"timeline_trace_rank{provisional_local_rank}.jsonl",
+            )
+        self._timeline_trace_path = timeline_trace_path if self.timeline_trace_enabled else None
 
         # create habitat config
         self.config_path = cfg.env.env_settings['config_path']
@@ -172,6 +197,8 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             ):
                 if os.path.exists(path):
                     os.remove(path)
+            if self._timeline_trace_path and os.path.exists(self._timeline_trace_path):
+                os.remove(self._timeline_trace_path)
         self._init_env_capabilities()
         self.dualvln_single_vllm_url = getattr(self.model_args, "dualvln_single_vllm_url", None)
         if self.dualvln_single_vllm_url is not None:
@@ -269,6 +296,9 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             )
             self._shadow_diff_model.eval()
             os.makedirs(self.output_path, exist_ok=True)
+            self.shadow_diff_dump_images = bool(
+                getattr(self.model_args, "shadow_diff_dump_images", False)
+            )
             self._shadow_diff_details_path = os.path.join(
                 self.output_path,
                 f"shadow_diff_decisions_rank{self.local_rank}.jsonl",
@@ -277,9 +307,15 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 self.output_path,
                 f"shadow_diff_summary_rank{self.local_rank}.json",
             )
+            self._shadow_diff_image_dir = os.path.join(
+                self.output_path,
+                f"shadow_diff_inputs_rank{self.local_rank}",
+            )
             for path in (self._shadow_diff_details_path, self._shadow_diff_summary_path):
                 if os.path.exists(path):
                     os.remove(path)
+            if self.shadow_diff_dump_images:
+                os.makedirs(self._shadow_diff_image_dir, exist_ok=True)
             print(
                 "[HabitatVLNEvaluator] Shadow diff enabled: "
                 f"primary=single-vLLM shadow=HF({shadow_model_path})"
@@ -553,12 +589,19 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             "cosine_similarity": cosine,
         }
 
-    @staticmethod
-    def _serialize_shadow_messages(messages):
+    def _serialize_shadow_messages(
+        self,
+        messages,
+        *,
+        scene_id=None,
+        episode_id=None,
+        step_id=None,
+        is_lookdown_followup=False,
+    ):
         serialized = []
-        for message in messages:
+        for message_idx, message in enumerate(messages):
             content = []
-            for item in message["content"]:
+            for item_idx, item in enumerate(message["content"]):
                 if item["type"] == "text":
                     content.append({"type": "text", "text": item["text"]})
                     continue
@@ -566,13 +609,23 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 buf = io.BytesIO()
                 image.save(buf, format="PNG")
                 raw = buf.getvalue()
-                content.append(
-                    {
-                        "type": "image",
-                        "size": [int(image.width), int(image.height)],
-                        "sha256": hashlib.sha256(raw).hexdigest(),
-                    }
-                )
+                image_sha = hashlib.sha256(raw).hexdigest()
+                image_record = {
+                    "type": "image",
+                    "size": [int(image.width), int(image.height)],
+                    "sha256": image_sha,
+                }
+                if getattr(self, "shadow_diff_dump_images", False):
+                    image_name = (
+                        f"scene_{scene_id}_ep_{int(episode_id)}_step_{int(step_id)}"
+                        f"_lookdown_{int(bool(is_lookdown_followup))}"
+                        f"_msg_{message_idx}_item_{item_idx}_{image_sha[:12]}.png"
+                    )
+                    image_path = os.path.join(self._shadow_diff_image_dir, image_name)
+                    with open(image_path, "wb") as f:
+                        f.write(raw)
+                    image_record["path"] = image_path
+                content.append(image_record)
             serialized.append({"role": message["role"], "content": content})
         return serialized
 
@@ -713,7 +766,13 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             "step_id": int(step_id),
             "history_frame_indices": list(history_indices),
             "is_lookdown_followup": bool(is_lookdown_followup),
-            "messages": self._serialize_shadow_messages(messages),
+            "messages": self._serialize_shadow_messages(
+                messages,
+                scene_id=scene_id,
+                episode_id=episode_id,
+                step_id=step_id,
+                is_lookdown_followup=is_lookdown_followup,
+            ),
             "primary_backend": "single_vllm",
             "reference_backend": "hf",
             "primary": primary_record,
@@ -1075,6 +1134,40 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         if self._history_probe_inventory_path is None:
             return
         with open(self._history_probe_inventory_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    def _timeline_trace_matches_episode(self, scene_id: str, episode_id: int) -> bool:
+        if not self.timeline_trace_enabled or self._timeline_trace_path is None:
+            return False
+        if self.timeline_trace_scene_id is not None and str(scene_id) != self.timeline_trace_scene_id:
+            return False
+        if self.timeline_trace_episode_id is not None and int(episode_id) != self.timeline_trace_episode_id:
+            return False
+        return True
+
+    def _append_timeline_trace(
+        self,
+        *,
+        scene_id: str,
+        episode_id: int,
+        episode_start_time: float,
+        event_type: str,
+        **payload,
+    ) -> None:
+        if not self._timeline_trace_matches_episode(scene_id, episode_id):
+            return
+        record = {
+            "scene_id": str(scene_id),
+            "episode_id": int(episode_id),
+            "event_type": str(event_type),
+            "t_rel_ms": float((time.perf_counter() - episode_start_time) * 1000.0),
+            "wall_time": datetime.now().isoformat(timespec="microseconds"),
+        }
+        record.update(payload)
+        trace_parent = os.path.dirname(self._timeline_trace_path)
+        if trace_parent:
+            os.makedirs(trace_parent, exist_ok=True)
+        with open(self._timeline_trace_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     def _record_history_probe_inventory(
@@ -1841,6 +1934,10 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             "notes": [
                 "dit_cache_* fields are placeholders unless a real DiT cache implementation is enabled.",
                 "prefill_share_of_total and decode_share_of_total may be null when no faithful decomposition is available.",
+                "mm_processor_ms aliases preprocess_ms for single-vLLM System-2 requests.",
+                "vision_encode_ms comes from vLLM worker encoder-forward timing and only covers multimodal encoder forward, not processor work.",
+                "llm_prefill_ms/llm_decode_ms/llm_extend_ms come from worker-side per-request forward+sample timing classified by scheduler stage.",
+                "generate_residual_ms is generate_ms minus vision_encode_ms; it still mixes LLM prefill, decode, and engine scheduling.",
                 "pure system2 backends remain schema-compatible but are excluded from default comparison plots.",
                 "s1_trigger_rate is the recommended collaboration metric.",
                 "avg_s1_rollout_calls_per_trigger explains repeated local S1 replanning under one trigger.",
@@ -1977,10 +2074,36 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         if runtime_state["s2_runtime_samples"]:
             runtime_fields = (
                 "preprocess_ms",
+                "mm_processor_ms",
+                "image_collect_ms",
+                "prompt_build_ms",
+                "processor_ms",
+                "to_device_ms",
                 "generate_ms",
+                "vision_encode_ms",
+                "vision_encoder_calls",
+                "llm_prefill_ms",
+                "llm_prefill_forward_ms",
+                "llm_prefill_sample_ms",
+                "llm_prefill_forward_calls",
+                "llm_prefill_sample_calls",
+                "llm_decode_ms",
+                "llm_decode_forward_ms",
+                "llm_decode_sample_ms",
+                "llm_decode_forward_calls",
+                "llm_decode_sample_calls",
+                "llm_extend_ms",
+                "llm_extend_forward_ms",
+                "llm_extend_sample_ms",
+                "llm_extend_forward_calls",
+                "llm_extend_sample_calls",
+                "generate_residual_ms",
                 "bundle_build_ms",
                 "mm_attach_ms",
                 "latent_prefill_ms",
+                "continuation_prepare_ms",
+                "hidden_states_ms",
+                "output_parse_ms",
                 "total_ms",
                 "prefill_share_of_total",
                 "latent_prefill_share_of_total",
@@ -2208,10 +2331,36 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         runtime_breakdown = {}
         for field in (
             "preprocess_ms",
+            "mm_processor_ms",
+            "image_collect_ms",
+            "prompt_build_ms",
+            "processor_ms",
+            "to_device_ms",
             "generate_ms",
+            "vision_encode_ms",
+            "vision_encoder_calls",
+            "llm_prefill_ms",
+            "llm_prefill_forward_ms",
+            "llm_prefill_sample_ms",
+            "llm_prefill_forward_calls",
+            "llm_prefill_sample_calls",
+            "llm_decode_ms",
+            "llm_decode_forward_ms",
+            "llm_decode_sample_ms",
+            "llm_decode_forward_calls",
+            "llm_decode_sample_calls",
+            "llm_extend_ms",
+            "llm_extend_forward_ms",
+            "llm_extend_sample_ms",
+            "llm_extend_forward_calls",
+            "llm_extend_sample_calls",
+            "generate_residual_ms",
             "bundle_build_ms",
             "mm_attach_ms",
             "latent_prefill_ms",
+            "continuation_prepare_ms",
+            "hidden_states_ms",
+            "output_parse_ms",
             "total_ms",
             "prefill_share_of_total",
             "latent_prefill_share_of_total",
@@ -2225,6 +2374,16 @@ class HabitatVLNEvaluator(DistributedEvaluator):
         ):
             values = [sample.get(field) for sample in runtime_samples if sample.get(field) is not None]
             runtime_breakdown[field] = float(np.mean(values)) if values else None
+
+        same_request_continuation_attempt_count = int(
+            sum(bool(sample.get("same_request_continuation_attempted")) for sample in runtime_samples)
+        )
+        same_request_continuation_use_count = int(
+            sum(bool(sample.get("same_request_continuation_used")) for sample in runtime_samples)
+        )
+        reused_prefill_count = int(
+            sum(bool(sample.get("reused_prefill")) for sample in runtime_samples)
+        )
 
         transport_metrics = self._default_transport_metrics(backend_label == "dual_system_single_vllm")
         for field in transport_metrics.keys():
@@ -2408,6 +2567,21 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 "s2_discrete_action_rate": (
                     float(total_s2_discrete_action_count / total_s2_requests) if total_s2_requests > 0 else None
                 ),
+                "same_request_continuation_attempt_rate": (
+                    float(same_request_continuation_attempt_count / total_s2_requests)
+                    if total_s2_requests > 0
+                    else None
+                ),
+                "same_request_continuation_use_rate": (
+                    float(same_request_continuation_use_count / total_s2_requests)
+                    if total_s2_requests > 0
+                    else None
+                ),
+                "reused_prefill_rate": (
+                    float(reused_prefill_count / total_s2_requests)
+                    if total_s2_requests > 0
+                    else None
+                ),
                 "episode_wall_time_s": float(np.mean(episode_wall_times)) if episode_wall_times else None,
                 "effective_low_level_hz": float(np.mean(effective_low_level_hz)) if effective_low_level_hz else None,
             },
@@ -2435,6 +2609,13 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             summary["s2_metrics"]["s1_invocation_count"] = None
         summary["s2_metrics"]["s1_trigger_count"] = total_s1_trigger_count
         summary["s2_metrics"]["s1_rollout_call_count"] = total_s1_rollout_call_count
+        summary["s2_metrics"]["same_request_continuation_attempt_count"] = (
+            same_request_continuation_attempt_count
+        )
+        summary["s2_metrics"]["same_request_continuation_use_count"] = (
+            same_request_continuation_use_count
+        )
+        summary["s2_metrics"]["reused_prefill_count"] = reused_prefill_count
         summary["s2_metrics"]["s1_actions_total"] = total_s1_actions
         summary["s2_metrics"].update(
             self._latency_summary(
@@ -2631,6 +2812,13 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                 episode_id=episode_id,
                 episode_instruction=episode_instruction,
             )
+            self._append_timeline_trace(
+                scene_id=scene_id,
+                episode_id=episode_id,
+                episode_start_time=episode_start_time,
+                event_type="episode_start",
+                instruction=episode_instruction,
+            )
 
             # save first frame per rank to validate sim quality
             os.makedirs(os.path.join(self.output_path, f'check_sim_{self.epoch}'), exist_ok=True)
@@ -2653,6 +2841,9 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             messages = []
             local_actions = []
             history_probe_selected_steps = 0
+            timeline_request_seq = 0
+            timeline_rollout_seq = 0
+            timeline_action_seq = 0
 
             done = False
             flag = False
@@ -2666,6 +2857,16 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             # ---------- 2. Episode step loop -----------
             while (not done) and (step_id <= self.max_steps_per_episode):
                 control_gap_start = time.perf_counter()
+                self._append_timeline_trace(
+                    scene_id=scene_id,
+                    episode_id=episode_id,
+                    episode_start_time=episode_start_time,
+                    event_type="control_cycle_start",
+                    step_id=int(step_id),
+                    has_pending_pixel_goal=bool(pixel_goal is not None),
+                    pending_discrete_actions=int(len(action_seq)),
+                    pending_local_actions=int(len(local_actions)),
+                )
                 # refactor agent get action
                 rgb = observations["rgb"]
                 depth = observations["depth"]
@@ -2769,12 +2970,26 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     messages.append({'role': 'user', 'content': content})
                     inputs = None
                     traj_latents = None
+                    current_request_seq = None
                     if self.dualvln_single_vllm_url:
+                        timeline_request_seq += 1
+                        current_request_seq = timeline_request_seq
+                        self._append_timeline_trace(
+                            scene_id=scene_id,
+                            episode_id=episode_id,
+                            episode_start_time=episode_start_time,
+                            event_type="s2_request_sent",
+                            request_seq=int(current_request_seq),
+                            step_id=int(step_id),
+                            is_lookdown_followup=bool(is_lookdown_followup),
+                            history_len=int(len(history_id)),
+                            num_images=int(len(input_images)),
+                            prompt_variant="single_vllm_http",
+                        )
                         s2_start = time.perf_counter()
                         single_vllm_result = self._single_vllm_step_s2(messages, max_new_tokens=128)
-                        episode_runtime_state["s2_step_latency_ms"].append(
-                            (time.perf_counter() - s2_start) * 1000.0
-                        )
+                        s2_elapsed_ms = (time.perf_counter() - s2_start) * 1000.0
+                        episode_runtime_state["s2_step_latency_ms"].append(s2_elapsed_ms)
                         episode_runtime_state["s2_requests"] += 1
                         llm_outputs = single_vllm_result["llm_output"]
                         pixel_goal = single_vllm_result["pixel_goal"]
@@ -2789,6 +3004,26 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         if vllm_kv_cache is not None:
                             episode_runtime_state["vllm_kv_cache"] = vllm_kv_cache
                         output_ids = None
+                        self._append_timeline_trace(
+                            scene_id=scene_id,
+                            episode_id=episode_id,
+                            episode_start_time=episode_start_time,
+                            event_type="s2_response_received",
+                            request_seq=int(current_request_seq),
+                            step_id=int(step_id),
+                            is_lookdown_followup=bool(is_lookdown_followup),
+                            s2_elapsed_ms=float(s2_elapsed_ms),
+                            llm_output=llm_outputs,
+                            has_pixel_goal=bool(pixel_goal is not None),
+                            generated_token_count=int(len(single_vllm_result.get("generated_token_ids") or [])),
+                            same_request_continuation_used=bool(
+                                (runtime_metrics or {}).get("same_request_continuation_used")
+                            ),
+                            reused_prefill=bool((runtime_metrics or {}).get("reused_prefill")),
+                            runtime_total_ms=(runtime_metrics or {}).get("total_ms"),
+                            transport_server_total_ms=(transport_metrics or {}).get("server_total_ms"),
+                            transport_client_total_ms=(transport_metrics or {}).get("client_total_ms"),
+                        )
                     else:
                         text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
                         inputs = self.processor(text=[text], images=input_images, return_tensors="pt").to(self.device)
@@ -2825,6 +3060,17 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             )
 
                     print('step_id:', step_id, 'output text:', llm_outputs)
+                    self._append_timeline_trace(
+                        scene_id=scene_id,
+                        episode_id=episode_id,
+                        episode_start_time=episode_start_time,
+                        event_type="s2_output_ready",
+                        request_seq=(None if current_request_seq is None else int(current_request_seq)),
+                        step_id=int(step_id),
+                        is_lookdown_followup=bool(is_lookdown_followup),
+                        llm_output=llm_outputs,
+                        output_kind=("pixel_goal" if bool(re.search(r'\d', llm_outputs)) else "discrete_action"),
+                    )
 
                     if single_vllm_result is not None and self.history_probe_enabled:
                         baseline_summary = self._summarize_s2_result(single_vllm_result)
@@ -2878,6 +3124,16 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         if pixel_goal is None:
                             coord = [int(c) for c in re.findall(r'\d+', llm_outputs)]
                             pixel_goal = [int(coord[1]), int(coord[0])]
+                        self._append_timeline_trace(
+                            scene_id=scene_id,
+                            episode_id=episode_id,
+                            episode_start_time=episode_start_time,
+                            event_type="pixel_goal_ready",
+                            request_seq=(None if current_request_seq is None else int(current_request_seq)),
+                            step_id=int(step_id),
+                            pixel_goal=None if pixel_goal is None else [int(pixel_goal[0]), int(pixel_goal[1])],
+                            source=("followup_response" if bool(is_lookdown_followup) else "primary_response"),
+                        )
 
                         if not self.use_system1_local_policy:
                             if traj_latents is not None and not latent_success_recorded:
@@ -2916,6 +3172,18 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
                             episode_runtime_state["s1_trigger_count"] += 1
                             episode_runtime_state["s1_rollout_call_count"] += 1
+                            timeline_rollout_seq += 1
+                            current_rollout_seq = timeline_rollout_seq
+                            self._append_timeline_trace(
+                                scene_id=scene_id,
+                                episode_id=episode_id,
+                                episode_start_time=episode_start_time,
+                                event_type="s1_rollout_start",
+                                rollout_seq=int(current_rollout_seq),
+                                step_id=int(step_id),
+                                pixel_goal=None if pixel_goal is None else [int(pixel_goal[0]), int(pixel_goal[1])],
+                                rollout_reason="gateway_trigger",
+                            )
                             dp_actions = self._generate_traj(
                                 traj_latents,
                                 images_dp,
@@ -2923,6 +3191,15 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                                 scene_id=scene_id,
                                 episode_id=episode_id,
                                 step_id=step_id,
+                            )
+                            self._append_timeline_trace(
+                                scene_id=scene_id,
+                                episode_id=episode_id,
+                                episode_start_time=episode_start_time,
+                                event_type="s1_rollout_end",
+                                rollout_seq=int(current_rollout_seq),
+                                step_id=int(step_id),
+                                s1_metrics=dict(getattr(self, "_last_generate_traj_metrics", None) or {}),
                             )
 
                             action_list = traj_to_actions(dp_actions)
@@ -2953,11 +3230,27 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                                 messages = []
                                 continue
                             print('predicted goal', pixel_goal, flush=True)
+                            self._append_timeline_trace(
+                                scene_id=scene_id,
+                                episode_id=episode_id,
+                                episode_start_time=episode_start_time,
+                                event_type="predicted_goal_ready",
+                                step_id=int(step_id),
+                                pixel_goal=None if pixel_goal is None else [int(pixel_goal[0]), int(pixel_goal[1])],
+                            )
 
                     else:
                         episode_runtime_state["s2_discrete_action_count"] += 1
                         action_seq = self.parse_actions(llm_outputs)
                         print('actions', action_seq, flush=True)
+                        self._append_timeline_trace(
+                            scene_id=scene_id,
+                            episode_id=episode_id,
+                            episode_start_time=episode_start_time,
+                            event_type="discrete_action_chunk_ready",
+                            step_id=int(step_id),
+                            action_seq=[int(a) for a in action_seq],
+                        )
 
                     if self.shadow_diff_enabled and single_vllm_result is not None:
                         reference_record = self._run_shadow_hf_reference(messages)
@@ -3017,6 +3310,18 @@ class HabitatVLNEvaluator(DistributedEvaluator):
 
                         depths_dp = torch.stack([pix_goal_depth, depth_dp]).unsqueeze(0).to(self.device)
                         episode_runtime_state["s1_rollout_call_count"] += 1
+                        timeline_rollout_seq += 1
+                        current_rollout_seq = timeline_rollout_seq
+                        self._append_timeline_trace(
+                            scene_id=scene_id,
+                            episode_id=episode_id,
+                            episode_start_time=episode_start_time,
+                            event_type="s1_rollout_start",
+                            rollout_seq=int(current_rollout_seq),
+                            step_id=int(step_id),
+                            pixel_goal=None if pixel_goal is None else [int(pixel_goal[0]), int(pixel_goal[1])],
+                            rollout_reason="local_plan_refill",
+                        )
                         dp_actions = self._generate_traj(
                             traj_latents,
                             images_dp,
@@ -3024,6 +3329,15 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                             scene_id=scene_id,
                             episode_id=episode_id,
                             step_id=step_id,
+                        )
+                        self._append_timeline_trace(
+                            scene_id=scene_id,
+                            episode_id=episode_id,
+                            episode_start_time=episode_start_time,
+                            event_type="s1_rollout_end",
+                            rollout_seq=int(current_rollout_seq),
+                            step_id=int(step_id),
+                            s1_metrics=dict(getattr(self, "_last_generate_traj_metrics", None) or {}),
                         )
 
                         action_list = traj_to_actions(dp_actions)
@@ -3079,11 +3393,38 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                     vis_frames.append(frame)
 
                 print("step_id", step_id, "action", action)
+                timeline_action_seq += 1
+                current_action_seq = timeline_action_seq
+                action_source = "s1_local" if pixel_goal is not None else "s2_discrete"
+                control_gap_ms = (time.perf_counter() - control_gap_start) * 1000.0
+                self._append_timeline_trace(
+                    scene_id=scene_id,
+                    episode_id=episode_id,
+                    episode_start_time=episode_start_time,
+                    event_type="action_dispatch_start",
+                    action_seq_id=int(current_action_seq),
+                    step_id=int(step_id),
+                    action=int(action),
+                    action_source=action_source,
+                    control_gap_ms=float(control_gap_ms),
+                    has_pixel_goal=bool(pixel_goal is not None),
+                )
 
                 if self.has_pitch_actions and action == action_code.LOOKDOWN:
                     self.env.step(action)
                     observations, _, done, _ = self.env.step(action)
                     flag = True
+                    self._append_timeline_trace(
+                        scene_id=scene_id,
+                        episode_id=episode_id,
+                        episode_start_time=episode_start_time,
+                        event_type="action_dispatch_end",
+                        action_seq_id=int(current_action_seq),
+                        step_id=int(step_id),
+                        action=int(action),
+                        advanced_step_id=False,
+                        done=bool(done),
+                    )
                 else:
                     observations, _, done, _step_info = self.env.step(action)
                     step_id += 1
@@ -3097,6 +3438,17 @@ class HabitatVLNEvaluator(DistributedEvaluator):
                         _dist_h_count += 1
                         if _min_d < 1.2:
                             _psi_steps += 1
+                    self._append_timeline_trace(
+                        scene_id=scene_id,
+                        episode_id=episode_id,
+                        episode_start_time=episode_start_time,
+                        event_type="action_dispatch_end",
+                        action_seq_id=int(current_action_seq),
+                        step_id=int(step_id),
+                        action=int(action),
+                        advanced_step_id=True,
+                        done=bool(done),
+                    )
 
             # ---------- 3. End of episode -----------
             # collect the metric result of this episode and write progress to the output_path/progress.json
@@ -3125,6 +3477,19 @@ class HabitatVLNEvaluator(DistributedEvaluator):
             _psi_rate = _psi_steps / max(step_id, 1)
             _avg_min_dist_h = _sum_min_dist_h / _dist_h_count if _dist_h_count > 0 else -1.0
             collision_counts.append(float(_collision_count))
+            self._append_timeline_trace(
+                scene_id=scene_id,
+                episode_id=episode_id,
+                episode_start_time=episode_start_time,
+                event_type="episode_end",
+                step_id=int(step_id),
+                success=float(metrics['success']),
+                spl=float(metrics['spl']),
+                oracle_success=float(metrics['oracle_success']),
+                distance_to_goal=float(metrics["distance_to_goal"]),
+                collision_count=float(_collision_count),
+                psi_rate=float(_psi_rate),
+            )
             psi_rates.append(_psi_rate)
             episode_wall_time_s = time.perf_counter() - episode_start_time
 

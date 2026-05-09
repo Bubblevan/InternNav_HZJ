@@ -1,0 +1,3724 @@
+diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
+index 360f1c32f..4ecc1b8ef 100644
+--- a/vllm/config/speculative.py
++++ b/vllm/config/speculative.py
+@@ -423,15 +423,17 @@ class SpeculativeConfig:
+             # draft related config as None here.
+             self.draft_model_config = self.target_model_config
+             self.draft_parallel_config = self.target_parallel_config
++
+         elif self.method == "suffix":
+             self._validate_suffix_decoding()
++
+         elif self.method == "extract_hidden_states":
+             from vllm.transformers_utils.configs.extract_hidden_states import (
+                 ExtractHiddenStatesConfig,
+             )
+ 
+             # ExtractHiddenStatesModel is instantiated manually in load_model()
+-            # We just need to store the target model config for KV cache shape info
++            # We just need to store the target model config for KV cache shape info.
+             self.model = "extract_hidden_states"
+             self.prompt_lookup_max = 0
+             self.prompt_lookup_min = 0
+@@ -447,10 +449,44 @@ class SpeculativeConfig:
+                 hf_config = {}
+ 
+             self.draft_model_config = copy.copy(self.target_model_config)
+-            self.draft_model_config.hf_config = ExtractHiddenStatesConfig(
+-                self.draft_model_config.hf_config, **hf_config
++
++            base_hf_config = self.draft_model_config.hf_config
++            base_text_config = get_hf_text_config(base_hf_config)
++
++            wrapped_hf_config = ExtractHiddenStatesConfig(
++                base_hf_config,
++                **hf_config,
+             )
+-            self.update_arch_()
++
++            # Preserve the original typed text_config to avoid degenerating into dict / generic config.
++            if base_text_config is not base_hf_config:
++                wrapped_hf_config.text_config = copy.deepcopy(base_text_config)
++
++            self.draft_model_config.hf_config = wrapped_hf_config
++
++            # Critical: draft side should not continue to use transformers backend.
++            self.draft_model_config.model_impl = "auto"
++
++            # Critical: do not call self.update_arch_()
++            # It will recalculate the text config / arch from the wrapped config,
++            # which is easy to break the text config / arch.
++            if base_text_config is not base_hf_config:
++                self.draft_model_config.hf_text_config = copy.deepcopy(base_text_config)
++            else:
++                self.draft_model_config.hf_text_config = get_hf_text_config(
++                    self.draft_model_config.hf_config
++                )
++
++            self.draft_model_config.model_arch_config = (
++                self.draft_model_config.get_model_arch_config()
++            )
++            model_info, arch = self.draft_model_config.registry.inspect_model_cls(
++                self.draft_model_config.architectures,
++                self.draft_model_config,
++            )
++            self.draft_model_config._model_info = model_info
++            self.draft_model_config._architecture = arch
++
+             self.draft_parallel_config = self.target_parallel_config
+ 
+         else:
+@@ -754,6 +790,50 @@ class SpeculativeConfig:
+ 
+         return draft_parallel_config
+ 
++    @staticmethod
++    def _cfg_model_type(cfg) -> str:
++        if cfg is None:
++            return ""
++        if isinstance(cfg, dict):
++            return str(cfg.get("model_type", "") or "")
++        return str(getattr(cfg, "model_type", "") or "")
++
++    def _effective_aux_hidden_state_model_type(self) -> str:
++        if self.target_model_config is None:
++            return ""
++
++        hf_cfg = getattr(self.target_model_config, "hf_config", None)
++        hf_text_cfg = getattr(self.target_model_config, "hf_text_config", None)
++        nested_text_attr = getattr(hf_cfg, "text_config", None)
++
++        nested_text_dict = None
++        if hf_cfg is not None and hasattr(hf_cfg, "to_dict"):
++            try:
++                hf_cfg_dict = hf_cfg.to_dict()
++                nested_text_dict = hf_cfg_dict.get("text_config", None)
++            except Exception:
++                nested_text_dict = None
++
++        candidates = [
++            # Most reliable: text_config serialized from root hf_config
++            self._cfg_model_type(nested_text_dict),
++            # Secondly: text_config in attribute form
++            self._cfg_model_type(nested_text_attr),
++            # Thirdly: hf_text_config cached in ModelConfig
++            self._cfg_model_type(hf_text_cfg),
++            # Finally: root model_type
++            self._cfg_model_type(hf_cfg),
++        ]
++
++        # Wrapper model prioritizes falling back to the real text backbone.
++        for mt in candidates:
++            if "qwen" in mt:
++                return mt
++        for mt in candidates:
++            if mt:
++                return mt
++        return ""
++
+     @model_validator(mode="after")
+     def _verify_args(self) -> Self:
+         if self.tensor_parallel_size is not None:
+@@ -794,18 +874,25 @@ class SpeculativeConfig:
+             "kimi_k2",
+             "kimi_k25",
+         ]
++
++        effective_mt = self._effective_aux_hidden_state_model_type()
++
+         if (
+             self.method in ("eagle3", "extract_hidden_states")
+             and self.target_model_config
+             and not any(
+-                supported_model in self.target_model_config.hf_text_config.model_type
++                supported_model in effective_mt
+                 for supported_model in aux_hidden_states_supported
+             )
+         ):
+             raise ValueError(
+-                f"{self.method} is only supported for {aux_hidden_states_supported}"
+-                f" models. Got {self.target_model_config.hf_text_config.model_type=}"
++                f"{self.method} is only supported for "
++                f"{aux_hidden_states_supported} models. "
++                f"Got effective_model_type={effective_mt!r}, "
++                f"hf_text_config.model_type="
++                f"{getattr(self.target_model_config.hf_text_config, 'model_type', None)!r}"
+             )
++
+         self.verify_equal_vocab_size_if_draft_model()
+         return self
+ 
+diff --git a/vllm/debug_dump.py b/vllm/debug_dump.py
+new file mode 100644
+index 000000000..21d41d718
+--- /dev/null
++++ b/vllm/debug_dump.py
+@@ -0,0 +1,117 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import json
++import os
++import time
++from pathlib import Path
++from typing import Any
++
++import torch
++
++
++def _dump_dir() -> Path | None:
++    dump_dir = os.environ.get("VLLM_DEBUG_DUMP_DIR")
++    if not dump_dir:
++        return None
++    path = Path(dump_dir)
++    path.mkdir(parents=True, exist_ok=True)
++    return path
++
++
++def dump_enabled() -> bool:
++    return _dump_dir() is not None
++
++
++def _prefix() -> str:
++    return os.environ.get("VLLM_DEBUG_DUMP_PREFIX", "vllm")
++
++
++def _full_tensors() -> bool:
++    return os.environ.get("VLLM_DEBUG_DUMP_FULL_TENSORS", "0") == "1"
++
++
++def _slice_rows() -> int:
++    try:
++        return max(1, int(os.environ.get("VLLM_DEBUG_DUMP_SLICE_ROWS", "8")))
++    except Exception:
++        return 8
++
++
++def _path_for(tag: str, suffix: str) -> Path | None:
++    dump_dir = _dump_dir()
++    if dump_dir is None:
++        return None
++    safe_tag = tag.replace("/", "_").replace(" ", "_")
++    return dump_dir / f"{_prefix()}_{time.time_ns()}_{os.getpid()}_{safe_tag}{suffix}"
++
++
++def append_log(tag: str, payload: dict[str, Any]) -> Path | None:
++    path = _path_for(tag, ".log")
++    if path is None:
++        return None
++    record = {
++        "tag": tag,
++        "ts_ns": time.time_ns(),
++        **payload,
++    }
++    path.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
++    return path
++
++
++def _tensor_summary(tensor: torch.Tensor | None) -> dict[str, Any] | None:
++    if tensor is None:
++        return None
++    summary: dict[str, Any] = {
++        "shape": list(tensor.shape),
++        "dtype": str(tensor.dtype),
++        "device": str(tensor.device),
++    }
++    try:
++        view = tensor.detach().float()
++        summary["min"] = float(view.min().item())
++        summary["max"] = float(view.max().item())
++        summary["mean"] = float(view.mean().item())
++        summary["std"] = float(view.std().item()) if view.numel() > 1 else 0.0
++    except Exception:
++        pass
++    return summary
++
++
++def _tensor_payload(tensor: torch.Tensor | None) -> torch.Tensor | None:
++    if tensor is None:
++        return None
++    cpu = tensor.detach().to("cpu")
++    if _full_tensors() or cpu.ndim == 0:
++        return cpu
++    rows = _slice_rows()
++    if cpu.ndim >= 1 and cpu.shape[0] > rows:
++        return cpu[-rows:]
++    return cpu
++
++
++def save_tensors(
++    tag: str,
++    tensors: dict[str, Any],
++    meta: dict[str, Any] | None = None,
++) -> Path | None:
++    path = _path_for(tag, ".pt")
++    if path is None:
++        return None
++
++    payload: dict[str, Any] = {
++        "tag": tag,
++        "ts_ns": time.time_ns(),
++        "meta": meta or {},
++        "tensor_summaries": {},
++        "tensors": {},
++    }
++    for name, value in tensors.items():
++        if isinstance(value, torch.Tensor):
++            payload["tensor_summaries"][name] = _tensor_summary(value)
++            payload["tensors"][name] = _tensor_payload(value)
++        else:
++            payload["tensors"][name] = value
++
++    torch.save(payload, path)
++    return path
+diff --git a/vllm/entrypoints/llm.py b/vllm/entrypoints/llm.py
+index 5909b3043..4e04ca01f 100644
+--- a/vllm/entrypoints/llm.py
++++ b/vllm/entrypoints/llm.py
+@@ -7,6 +7,7 @@ from pathlib import Path
+ from typing import TYPE_CHECKING, Any
+ 
+ import cloudpickle
++import torch
+ import torch.nn as nn
+ from pydantic import ValidationError
+ from tqdm.auto import tqdm
+@@ -82,6 +83,7 @@ from vllm.renderers.inputs.preprocess import (
+     conversation_to_seq,
+     parse_model_prompt,
+     prompt_to_seq,
++    extract_prompt_components,
+ )
+ from vllm.sampling_params import BeamSearchParams, RequestOutputKind, SamplingParams
+ from vllm.tasks import PoolingTask
+@@ -90,7 +92,7 @@ from vllm.usage.usage_lib import UsageContext
+ from vllm.utils.counter import Counter
+ from vllm.utils.mistral import is_mistral_tokenizer
+ from vllm.utils.tqdm_utils import maybe_tqdm
+-from vllm.v1.engine import PauseMode
++from vllm.v1.engine import DualVLNLatentContinuation, PauseMode
+ from vllm.v1.engine.llm_engine import LLMEngine
+ from vllm.v1.sample.logits_processor import LogitsProcessor
+ 
+@@ -676,6 +678,27 @@ class LLM:
+         """
+         return self.llm_engine.apply_model(func)
+ 
++    def generate_latents_native_prefill(
++        self,
++        *,
++        prompt_token_ids: list[int],
++        prompt_embeds,
++        mm_features,
++        n_query: int,
++        prompt_embeds_soft_suffix_len: int | None = None,
++    ) -> list[torch.Tensor]:
++        """
++        Run a batch=1 native-context prefill on the current generate engine and
++        return the last `n_query` hidden states from each worker.
++        """
++        return self.llm_engine.generate_latents_native_prefill(
++            prompt_token_ids=prompt_token_ids,
++            prompt_embeds=prompt_embeds,
++            mm_features=mm_features,
++            n_query=n_query,
++            prompt_embeds_soft_suffix_len=prompt_embeds_soft_suffix_len,
++        )
++
+     def beam_search(
+         self,
+         prompts: list[TokensPrompt | TextPrompt],
+@@ -1953,6 +1976,64 @@ class LLM:
+             priority=priority,
+         )
+ 
++    def _run_request_with_dualvln_latent_continuation(
++        self,
++        *,
++        prompt: ProcessorInputs,
++        params: SamplingParams,
++        suffix_token_ids: Sequence[int],
++        lora_request: LoRARequest | None = None,
++        priority: int = 0,
++        use_tqdm: bool | Callable[..., tqdm] = False,
++    ) -> tuple[list[RequestOutput], Any]:
++        """Internal-only helper for DualVLN same-request latent continuation.
++
++        This intentionally avoids changing the public generate/chat APIs. It
++        mirrors the normal text generation path, but attaches a tiny
++        request-scoped continuation intent so EngineCore can, after the final
++        text token, append a short TRAJ suffix on the same live request and
++        collect the final hidden states before cleanup.
++        """
++        if params.n != 1:
++            raise ValueError(
++                "DualVLN latent continuation only supports SamplingParams.n == 1."
++            )
++        if params.output_kind != RequestOutputKind.FINAL_ONLY:
++            params = params.clone()
++            params.output_kind = RequestOutputKind.FINAL_ONLY
++
++        request_id = str(next(self.request_counter))
++        prompt_text, _, _ = extract_prompt_components(self.llm_engine.model_config, prompt)
++        request = self.llm_engine.input_processor.process_inputs(
++            request_id,
++            prompt,
++            params,
++            supported_tasks=self.llm_engine.get_supported_tasks(),
++            lora_request=self._resolve_mm_lora(prompt, lora_request),
++            priority=priority,
++        )
++        self.llm_engine.input_processor.assign_request_id(request)
++        request.dualvln_latent_continuation = DualVLNLatentContinuation(
++            suffix_token_ids=list(suffix_token_ids),
++            n_query=len(suffix_token_ids),
++        )
++        self.llm_engine._remember_debug_engine_core_request(request)
++
++        added_request_id = request.external_req_id or request_id
++        internal_request_id = request.request_id
++        try:
++            self.llm_engine.output_processor.add_request(request, prompt_text, None, 0)
++            self.llm_engine.engine_core.add_request(request)
++            outputs = self._run_engine(RequestOutput, use_tqdm=use_tqdm)
++        except Exception:
++            self.llm_engine.abort_request([internal_request_id], internal=True)
++            raise
++
++        continuation_result = self.llm_engine.pop_dualvln_latent_continuation_result(
++            added_request_id
++        )
++        return outputs, continuation_result
++
+     def _run_engine(
+         self,
+         output_type: type[_O] | tuple[type[_O], ...],
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 716810da1..5d23e0c06 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -599,6 +599,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
+     # Dump fx graphs to the given directory.
+     # It will override CompilationConfig.debug_dump_path if set.
+     "VLLM_DEBUG_DUMP_PATH": lambda: os.environ.get("VLLM_DEBUG_DUMP_PATH", None),
++    # Lightweight runtime tensor/log dumps used by local debugging helpers.
++    "VLLM_DEBUG_DUMP_DIR": lambda: os.environ.get("VLLM_DEBUG_DUMP_DIR", None),
++    "VLLM_DEBUG_DUMP_PREFIX": lambda: os.environ.get("VLLM_DEBUG_DUMP_PREFIX", None),
++    "VLLM_DEBUG_DUMP_FULL_TENSORS": lambda: os.environ.get(
++        "VLLM_DEBUG_DUMP_FULL_TENSORS", "0"
++    )
++    == "1",
++    "VLLM_DEBUG_DUMP_SLICE_ROWS": lambda: int(
++        os.environ.get("VLLM_DEBUG_DUMP_SLICE_ROWS", "8")
++    ),
+     # Feature flag to enable/disable AOT compilation. This will ensure
+     # compilation is done in warmup phase and the compilation will be
+     # reused in subsequent calls.
+@@ -1725,6 +1735,10 @@ def compile_factors() -> dict[str, object]:
+         "VLLM_USE_MODELSCOPE",
+         "VLLM_RINGBUFFER_WARNING_INTERVAL",
+         "VLLM_DEBUG_DUMP_PATH",
++        "VLLM_DEBUG_DUMP_DIR",
++        "VLLM_DEBUG_DUMP_PREFIX",
++        "VLLM_DEBUG_DUMP_FULL_TENSORS",
++        "VLLM_DEBUG_DUMP_SLICE_ROWS",
+         "VLLM_PORT",
+         "VLLM_CACHE_ROOT",
+         "LD_LIBRARY_PATH",
+diff --git a/vllm/forward_context.py b/vllm/forward_context.py
+index bf0f9da6e..04f9b2802 100644
+--- a/vllm/forward_context.py
++++ b/vllm/forward_context.py
+@@ -247,6 +247,7 @@ class ForwardContext:
+ 
+ 
+ _forward_context: ForwardContext | None = None
++_last_debug_forward_context: ForwardContext | None = None
+ 
+ 
+ def get_forward_context() -> ForwardContext:
+@@ -258,6 +259,11 @@ def get_forward_context() -> ForwardContext:
+     return _forward_context
+ 
+ 
++def get_last_debug_forward_context() -> ForwardContext | None:
++    """Return the most recently created forward context for debugging."""
++    return _last_debug_forward_context
++
++
+ def is_forward_context_available() -> bool:
+     return _forward_context is not None
+ 
+@@ -326,6 +332,7 @@ def set_forward_context(
+     can be attention metadata, etc.
+     Here we can inject common logic for every model forward pass.
+     """
++    global _last_debug_forward_context
+     global forward_start_time
+     need_to_track_batchsize = track_batchsize and attn_metadata is not None
+     if need_to_track_batchsize:
+@@ -383,6 +390,7 @@ def set_forward_context(
+         additional_kwargs,
+         skip_compiled,
+     )
++    _last_debug_forward_context = forward_context
+ 
+     try:
+         with override_forward_context(forward_context):
+diff --git a/vllm/inputs/data.py b/vllm/inputs/data.py
+index d9fb78b5c..13f848056 100644
+--- a/vllm/inputs/data.py
++++ b/vllm/inputs/data.py
+@@ -81,9 +81,22 @@ class EmbedsPrompt(_PromptOptions):
+     prompt_embeds: torch.Tensor
+     """The embeddings of the prompt."""
+ 
++    prompt_token_ids: NotRequired[list[int]]
++    """
++    Optional token IDs corresponding to the embeddings.
++
++    These are useful for models whose position construction depends on
++    token-level metadata (for example M-RoPE in Qwen2.5-VL), even when the
++    backbone input itself is provided via ``prompt_embeds``.
++    """
++
+     prompt: NotRequired[str]
+     """The prompt text corresponding to the token embeddings, if available."""
+ 
++    mm_kwargs: NotRequired[Any]
++    mm_hashes: NotRequired[Any]
++    mm_placeholders: NotRequired[Any]
++    """Explicit passthrough of prebuilt multimodal metadata."""
+ 
+ DecoderOnlyPrompt: TypeAlias = (
+     str | TextPrompt | list[int] | TokensPrompt | EmbedsPrompt
+@@ -234,13 +247,29 @@ class EmbedsInputs(_InputOptions):
+     prompt_embeds: torch.Tensor
+     """The embeddings of the prompt."""
+ 
++    prompt_token_ids: NotRequired[list[int]]
++    """Optional token IDs corresponding to the embeddings."""
++
+     prompt: NotRequired[str]
+     """The prompt text corresponding to the token IDs, if available."""
+ 
++    mm_kwargs: NotRequired[Any]
++    """Optional multimodal kwargs to be passed through the engine."""
++
++    mm_hashes: NotRequired[Any]
++    """Optional multimodal hashes matching ``mm_kwargs``."""
++
++    mm_placeholders: NotRequired[Any]
++    """Optional multimodal placeholder metadata matching ``mm_kwargs``."""
++
+ 
+ def embeds_inputs(
+     prompt_embeds: torch.Tensor,
+     *,
++    prompt_token_ids: list[int] | None = None,
++    mm_kwargs: Any | None = None,
++    mm_hashes: Any | None = None,
++    mm_placeholders: Any | None = None,
+     prompt: str | None = None,
+     cache_salt: str | None = None,
+ ) -> EmbedsInputs:
+@@ -248,6 +277,15 @@ def embeds_inputs(
+     values."""
+     inputs = EmbedsInputs(type="embeds", prompt_embeds=prompt_embeds)
+ 
++    if prompt_token_ids is not None:
++        inputs["prompt_token_ids"] = prompt_token_ids
++    if mm_kwargs is not None:
++        inputs["mm_kwargs"] = mm_kwargs
++    if mm_hashes is not None:
++        inputs["mm_hashes"] = mm_hashes
++    if mm_placeholders is not None:
++        inputs["mm_placeholders"] = mm_placeholders
++
+     if prompt is not None:
+         inputs["prompt"] = prompt
+     if cache_salt is not None:
+diff --git a/vllm/model_executor/model_loader/base_loader.py b/vllm/model_executor/model_loader/base_loader.py
+index 77fbb41f0..d45ff9092 100644
+--- a/vllm/model_executor/model_loader/base_loader.py
++++ b/vllm/model_executor/model_loader/base_loader.py
+@@ -49,17 +49,26 @@ class BaseModelLoader(ABC):
+             device_config.device if load_config.device is None else load_config.device
+         )
+         target_device = torch.device(load_device)
++        logger.info(
++            "Model loader start: model=%s load_device=%s dtype=%s",
++            model_config.model,
++            load_device,
++            model_config.dtype,
++        )
+         with set_default_torch_dtype(model_config.dtype):
+             with target_device:
++                logger.info("Model loader: initialize_model() begin")
+                 model = initialize_model(
+                     vllm_config=vllm_config, model_config=model_config, prefix=prefix
+                 )
++                logger.info("Model loader: initialize_model() done")
+ 
+             log_model_inspection(model)
+ 
+-            logger.debug("Loading weights on %s ...", load_device)
++            logger.info("Model loader: load_weights() begin on %s", load_device)
+             # Quantization does not happen in `load_weights` but after it
+             self.load_weights(model, model_config)
++            logger.info("Model loader: load_weights() done")
+ 
+             # Log peak GPU memory after loading weights. This is needed
+             # to have test coverage on peak memory for online quantization.
+@@ -71,7 +80,9 @@ class BaseModelLoader(ABC):
+                     scope="local",
+                 )
+ 
++            logger.info("Model loader: process_weights_after_loading() begin")
+             process_weights_after_loading(model, model_config, target_device)
++            logger.info("Model loader: process_weights_after_loading() done")
+ 
+         return model.eval()
+ 
+diff --git a/vllm/model_executor/models/qwen2_5_vl.py b/vllm/model_executor/models/qwen2_5_vl.py
+index 245748249..c9cdb5a9f 100644
+--- a/vllm/model_executor/models/qwen2_5_vl.py
++++ b/vllm/model_executor/models/qwen2_5_vl.py
+@@ -1519,3 +1519,30 @@ class Qwen2_5_VLForConditionalGeneration(
+         vision_config = hf_config.vision_config
+         merge_size = vision_config.spatial_merge_size
+         return num_vision_tokens // merge_size**2
++
++
++@MULTIMODAL_REGISTRY.register_processor(
++    Qwen2_5_VLMultiModalProcessor,
++    info=Qwen2_5_VLProcessingInfo,
++    dummy_inputs=Qwen2_5_VLDummyInputsBuilder,
++)
++class InternVLAN1ForCausalLM(Qwen2_5_VLForConditionalGeneration):
++    """InternVLA-N1 checkpoint adapter backed by native Qwen2.5-VL execution."""
++
++    _extra_unexpected_prefixes = [
++        "model.action_decoder.",
++        "model.action_encoder.",
++        "model.cond_projector.",
++        "model.latent_queries",
++        "model.memory_encoder.",
++        "model.rgb_model.",
++        "model.rgb_resampler.",
++        "model.traj_dit.",
++    ]
++
++    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
++        loader = AutoWeightsLoader(
++            self,
++            ignore_unexpected_prefixes=self._extra_unexpected_prefixes,
++        )
++        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+diff --git a/vllm/model_executor/models/registry.py b/vllm/model_executor/models/registry.py
+index d5d3bd265..b25840b8d 100644
+--- a/vllm/model_executor/models/registry.py
++++ b/vllm/model_executor/models/registry.py
+@@ -482,6 +482,10 @@ _MULTIMODAL_MODELS = {
+         "qwen2_5_vl",
+         "Qwen2_5_VLForConditionalGeneration",
+     ),
++    "InternVLAN1ForCausalLM": (
++        "qwen2_5_vl",
++        "InternVLAN1ForCausalLM",
++    ),
+     "Qwen2AudioForConditionalGeneration": (
+         "qwen2_audio",
+         "Qwen2AudioForConditionalGeneration",
+diff --git a/vllm/model_executor/models/transformers/base.py b/vllm/model_executor/models/transformers/base.py
+index e09452378..e3ba8c646 100644
+--- a/vllm/model_executor/models/transformers/base.py
++++ b/vllm/model_executor/models/transformers/base.py
+@@ -183,6 +183,10 @@ class Base(
+                 trust_remote_code=self.model_config.trust_remote_code,
+             )
+ 
++        extra_ignore_prefixes = getattr(self.model, "_vllm_ignore_unexpected_prefixes", None)
++        if extra_ignore_prefixes:
++            self.ignore_unexpected_prefixes.extend(extra_ignore_prefixes)
++
+         # Remove layers not on this pipeline parallel rank
+         self.pipeline_parallel()
+         # Substitute remaining layers with vLLM's layers as needed
+diff --git a/vllm/outputs.py b/vllm/outputs.py
+index 2c71d2afb..72994ec7d 100644
+--- a/vllm/outputs.py
++++ b/vllm/outputs.py
+@@ -72,14 +72,20 @@ class PoolingOutput:
+     """
+ 
+     data: torch.Tensor
++    hidden_states: torch.Tensor | None = None
+ 
+     def __repr__(self) -> str:
+-        return f"PoolingOutput(data={self.data})"
++        hidden_states = None if self.hidden_states is None else tuple(self.hidden_states.shape)
++        return f"PoolingOutput(data={self.data}, hidden_states_shape={hidden_states})"
+ 
+     def __eq__(self, other: object) -> bool:
+-        return isinstance(other, self.__class__) and bool(
+-            (self.data == other.data).all()
+-        )
++        if not isinstance(other, self.__class__):
++            return False
++        if not bool((self.data == other.data).all()):
++            return False
++        if self.hidden_states is None or other.hidden_states is None:
++            return self.hidden_states is None and other.hidden_states is None
++        return bool((self.hidden_states == other.hidden_states).all())
+ 
+ 
+ class RequestOutput:
+diff --git a/vllm/pooling_params.py b/vllm/pooling_params.py
+index 6b85506ab..90854526b 100644
+--- a/vllm/pooling_params.py
++++ b/vllm/pooling_params.py
+@@ -65,6 +65,7 @@ class PoolingParams(
+     ## Internal use only
+     task: PoolingTask | None = None
+     requires_token_ids: bool = False
++    return_raw_hidden_states: bool = False
+     skip_reading_prefix_cache: bool | None = None
+     late_interaction_params: LateInteractionParams | None = None
+     extra_kwargs: dict[str, Any] | None = None
+@@ -213,6 +214,7 @@ class PoolingParams(
+             f"step_tag_id={self.step_tag_id}, "
+             f"returned_token_ids={self.returned_token_ids}, "
+             f"requires_token_ids={self.requires_token_ids}, "
++            f"return_raw_hidden_states={self.return_raw_hidden_states}, "
+             f"skip_reading_prefix_cache={self.skip_reading_prefix_cache}, "
+             f"late_interaction_params={self.late_interaction_params}, "
+             f"extra_kwargs={self.extra_kwargs})"
+diff --git a/vllm/renderers/base.py b/vllm/renderers/base.py
+index 853a48945..657127faa 100644
+--- a/vllm/renderers/base.py
++++ b/vllm/renderers/base.py
+@@ -40,6 +40,10 @@ from .inputs import (
+ from .inputs.preprocess import extract_target_prompt
+ from .params import ChatParams, TokenizeParams
+ 
++import torch
++from vllm.multimodal import MultiModalKwargsItems
++from vllm.multimodal.inputs import MultiModalFieldConfig
++
+ if TYPE_CHECKING:
+     from vllm.config import VllmConfig
+     from vllm.entrypoints.chat_utils import (
+@@ -650,6 +654,37 @@ class BaseRenderer(ABC, Generic[_T]):
+ 
+         return inputs
+ 
++
++    def _normalize_explicit_mm_kwargs(self, mm_kwargs: Any):
++        # ÒÑ¾­ÊÇ´¦ÀíºÃµÄÄÚ²¿½á¹¹£¬Ö±½Ó·µ»Ø
++        if isinstance(mm_kwargs, MultiModalKwargsItems):
++            return mm_kwargs
++
++        # Ö§³ÖÒ»ÖÖ×îÐ¡ raw ÐÎÊ½£º
++        # {"image": [{"image_grid_thw": tensor([t,h,w])}, ...]}
++        if isinstance(mm_kwargs, dict):
++            image_items = mm_kwargs.get("image")
++            if isinstance(image_items, list) and all(
++                isinstance(item, dict) and "image_grid_thw" in item
++                for item in image_items
++            ):
++                image_grid_thw = torch.stack(
++                    [item["image_grid_thw"].long().cpu() for item in image_items],
++                    dim=0,
++                )
++                hf_inputs = {
++                    "image_grid_thw": image_grid_thw,
++                }
++                config_by_key = {
++                    "image_grid_thw": MultiModalFieldConfig.batched("image"),
++                }
++                return MultiModalKwargsItems.from_hf_inputs(hf_inputs, config_by_key)
++
++        raise TypeError(
++            "Unsupported explicit mm_kwargs for EmbedsPrompt. "
++            "Expected MultiModalKwargsItems or raw image_grid_thw items."
++        )
++
+     def _process_embeds(
+         self,
+         prompt: EmbedsPrompt,
+@@ -661,23 +696,172 @@ class BaseRenderer(ABC, Generic[_T]):
+ 
+         prompt_embeds = prompt["prompt_embeds"]
+ 
+-        # prompt_embeds must be (seq_len, hidden_size), but if the user
+-        # passes in a batch of size 1, i.e. (1, seq_len, hidden_size),
+-        # we can unambiguously process the intent by squeezing the batch
+-        # dimension.
+         if prompt_embeds.ndim == 3:
+             prompt_embeds = prompt_embeds.squeeze(dim=0)
+ 
+         if prompt_embeds.ndim != 2:
+             raise ValueError("prompt_embeds must be of shape (seq_len, hidden_size).")
+ 
+-        # Tensors must be on CPU for serialization between processes
+-        # in the MsgpackEncoder. Casting to CPU here ensures that there is no
+-        # hidden device transfer in the critical path of generation.
++        prompt_token_ids = prompt.get("prompt_token_ids")
++        if prompt_token_ids is not None and len(prompt_token_ids) != prompt_embeds.shape[0]:
++            raise ValueError(
++                "prompt_token_ids and prompt_embeds must have matching lengths. "
++                f"Got prompt_token_ids={len(prompt_token_ids)} "
++                f"prompt_embeds={prompt_embeds.shape[0]}"
++            )
++
++        # --- NEW: explicit passthrough support for prebuilt multimodal metadata ---
++        explicit_mm_kwargs = prompt.get("mm_kwargs")
++        explicit_mm_hashes = prompt.get("mm_hashes")
++        explicit_mm_placeholders = prompt.get("mm_placeholders")
++
++        mm_kwargs = None
++        mm_hashes = None
++        mm_placeholders = None
++
++        has_explicit_mm = any(
++            x is not None
++            for x in (explicit_mm_kwargs, explicit_mm_hashes, explicit_mm_placeholders)
++        )
++        has_raw_mm = prompt.get("multi_modal_data") is not None
++
++        if has_explicit_mm and has_raw_mm:
++            raise ValueError(
++                "EmbedsPrompt must provide either prebuilt multimodal metadata "
++                "(mm_kwargs/mm_hashes/mm_placeholders) or multi_modal_data, not both."
++            )
++
++        if has_explicit_mm:
++            if not all(
++                x is not None
++                for x in (explicit_mm_kwargs, explicit_mm_hashes, explicit_mm_placeholders)
++            ):
++                raise ValueError(
++                    "EmbedsPrompt with explicit multimodal metadata must provide "
++                    "mm_kwargs, mm_hashes, and mm_placeholders together."
++                )
++
++            if prompt_token_ids is None:
++                raise ValueError(
++                    "EmbedsPrompt with explicit multimodal metadata requires "
++                    "prompt_token_ids so M-RoPE positions can be built."
++                )
++
++            mm_kwargs = self._normalize_explicit_mm_kwargs(explicit_mm_kwargs)
++            mm_hashes = explicit_mm_hashes
++            mm_placeholders = explicit_mm_placeholders
++
++        elif multi_modal_data := prompt.get("multi_modal_data"):
++            from vllm.multimodal.inputs import PlaceholderRange
++
++            if prompt_token_ids is None:
++                raise ValueError(
++                    "EmbedsPrompt with multi_modal_data requires prompt_token_ids "
++                    "so multimodal placeholders and M-RoPE positions can be built."
++                )
++
++            mm_inputs = self._process_multimodal(
++                prompt_token_ids,
++                multi_modal_data,
++                mm_processor_kwargs=prompt.get("mm_processor_kwargs"),
++                tokenization_kwargs=None,
++                mm_uuids=prompt.get("multi_modal_uuids"),
++            )
++            mm_kwargs = mm_inputs["mm_kwargs"]
++            mm_hashes = mm_inputs["mm_hashes"]
++            original_mm_placeholders = mm_inputs["mm_placeholders"]
++            processed_prompt_token_ids = mm_inputs["prompt_token_ids"]
++
++            if len(processed_prompt_token_ids) == prompt_embeds.shape[0]:
++                prompt_token_ids = processed_prompt_token_ids
++                mm_placeholders = original_mm_placeholders
++            else:
++                hf_config = self.model_config.hf_config
++                vision_config = getattr(hf_config, "vision_config", None)
++                spatial_merge_size = getattr(vision_config, "spatial_merge_size", None)
++                image_token_id = getattr(hf_config, "image_token_id", None)
++                video_token_id = getattr(hf_config, "video_token_id", None)
++                if spatial_merge_size is None:
++                    raise ValueError(
++                        "Cannot rebuild multimodal placeholders for EmbedsPrompt "
++                        "because spatial_merge_size is unavailable."
++                    )
++
++                rebuilt_placeholders: dict[str, list[PlaceholderRange]] = {}
++                expected_lengths: dict[str, list[int]] = {}
++
++                def _extract_lengths(modality: str) -> list[int]:
++                    placeholders = original_mm_placeholders.get(modality)
++                    if not placeholders:
++                        return []
++                    return [placeholder.get_num_embeds() for placeholder in placeholders]
++
++                expected_lengths["image"] = _extract_lengths("image")
++                expected_lengths["video"] = _extract_lengths("video")
++                modality_state = {
++                    "image": {"token_id": image_token_id, "index": 0},
++                    "video": {"token_id": video_token_id, "index": 0},
++                }
++
++                idx = 0
++                while idx < len(prompt_token_ids):
++                    matched_modality = None
++                    for modality, state in modality_state.items():
++                        token_id = state["token_id"]
++                        expected = expected_lengths[modality]
++                        item_index = state["index"]
++                        if (
++                            token_id is not None
++                            and item_index < len(expected)
++                            and prompt_token_ids[idx] == token_id
++                        ):
++                            matched_modality = modality
++                            break
++
++                    if matched_modality is None:
++                        idx += 1
++                        continue
++
++                    run_end = idx
++                    token_id = modality_state[matched_modality]["token_id"]
++                    while run_end < len(prompt_token_ids) and prompt_token_ids[run_end] == token_id:
++                        run_end += 1
++
++                    run_len = run_end - idx
++                    item_index = modality_state[matched_modality]["index"]
++                    expected_len = expected_lengths[matched_modality][item_index]
++                    if run_len != expected_len:
++                        raise ValueError(
++                            "Failed to rebuild multimodal placeholder ranges for "
++                            "EmbedsPrompt because token run length does not match "
++                            f"expected embed length for {matched_modality}[{item_index}]: "
++                            f"run_len={run_len}, expected_len={expected_len}."
++                        )
++
++                    rebuilt_placeholders.setdefault(matched_modality, []).append(
++                        PlaceholderRange(offset=idx, length=run_len)
++                    )
++                    modality_state[matched_modality]["index"] += 1
++                    idx = run_end
++
++                for modality, expected in expected_lengths.items():
++                    if modality_state[modality]["index"] != len(expected):
++                        raise ValueError(
++                            "Failed to rebuild all multimodal placeholders for "
++                            f"EmbedsPrompt modality={modality}: rebuilt="
++                            f"{modality_state[modality]['index']} expected={len(expected)}."
++                        )
++
++                mm_placeholders = rebuilt_placeholders
++
+         prompt_embeds = prompt_embeds.cpu()
+ 
+         return embeds_inputs(
+             prompt_embeds=prompt_embeds,
++            prompt_token_ids=prompt_token_ids,
++            mm_kwargs=mm_kwargs,
++            mm_hashes=mm_hashes,
++            mm_placeholders=mm_placeholders,
+             cache_salt=prompt.get("cache_salt"),
+         )
+ 
+diff --git a/vllm/transformers_utils/configs/extract_hidden_states.py b/vllm/transformers_utils/configs/extract_hidden_states.py
+index 5391fbe1a..b071ab9bd 100644
+--- a/vllm/transformers_utils/configs/extract_hidden_states.py
++++ b/vllm/transformers_utils/configs/extract_hidden_states.py
+@@ -37,6 +37,19 @@ class ExtractHiddenStatesConfig(PretrainedConfig):
+ 
+         super().__init__(**combined)
+ 
++    def get_text_config(self, decoder: bool = False):
++        text_config = getattr(self, "text_config", None)
++        if isinstance(text_config, PretrainedConfig):
++            return text_config
++
++        # Some multimodal configs arrive here through to_dict(), which turns
++        # the nested text config into a plain dict. In that case the top-level
++        # config still carries the language-model shape attributes we need.
++        if isinstance(text_config, dict) and hasattr(self, "num_attention_heads"):
++            return self
++
++        return super().get_text_config(decoder=decoder)
++
+     @classmethod
+     def from_pretrained(
+         cls,
+diff --git a/vllm/v1/core/sched/output.py b/vllm/v1/core/sched/output.py
+index bdb97deca..bda2e417d 100644
+--- a/vllm/v1/core/sched/output.py
++++ b/vllm/v1/core/sched/output.py
+@@ -38,6 +38,7 @@ class NewRequestData:
+     num_computed_tokens: int
+     lora_request: LoRARequest | None
+     prompt_embeds: "torch.Tensor | None" = None
++    prompt_embeds_soft_suffix_len: int | None = None
+ 
+     # Only used for v2 model runner.
+     prefill_token_ids: list[int] | None = None
+@@ -59,6 +60,7 @@ class NewRequestData:
+             num_computed_tokens=request.num_computed_tokens,
+             lora_request=request.lora_request,
+             prompt_embeds=request.prompt_embeds,
++            prompt_embeds_soft_suffix_len=request.prompt_embeds_soft_suffix_len,
+             prefill_token_ids=prefill_token_ids,
+         )
+ 
+@@ -76,6 +78,7 @@ class NewRequestData:
+             f"block_ids={self.block_ids},"
+             f"num_computed_tokens={self.num_computed_tokens},"
+             f"lora_request={self.lora_request},"
++            f"prompt_embeds_soft_suffix_len={self.prompt_embeds_soft_suffix_len},"
+             f"prompt_embeds_shape={prompt_embeds_shape}"
+             ")"
+         )
+@@ -101,6 +104,7 @@ class NewRequestData:
+             f"block_ids={self.block_ids},"
+             f"num_computed_tokens={self.num_computed_tokens},"
+             f"lora_request={self.lora_request},"
++            f"prompt_embeds_soft_suffix_len={self.prompt_embeds_soft_suffix_len},"
+             f"prompt_embeds_shape={prompt_embeds_shape}"
+             ")"
+         )
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index ea2c2a6cd..41a84e1bb 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -4,7 +4,7 @@ import itertools
+ import time
+ from collections import defaultdict, deque
+ from collections.abc import Iterable
+-from dataclasses import replace
++from dataclasses import dataclass, replace
+ from typing import Any
+ 
+ import numpy as np
+@@ -64,6 +64,19 @@ from vllm.v1.utils import record_function_or_nullcontext
+ logger = init_logger(__name__)
+ 
+ 
++@dataclass
++class DualVLNContinuationAttempt:
++    external_request_id: str
++    internal_request_id: str
++    suffix_token_ids: list[int]
++    n_query: int
++    continuation_used: bool = False
++    fallback_reason: str | None = None
++    new_block_ids: tuple[list[int], ...] | None = None
++    num_computed_tokens: int = 0
++    num_output_tokens: int = 0
++
++
+ class Scheduler(SchedulerInterface):
+     def __init__(
+         self,
+@@ -100,6 +113,9 @@ class Scheduler(SchedulerInterface):
+             defaultdict(set) if include_finished_set else None
+         )
+         self.prev_step_scheduled_req_ids: set[str] = set()
++        self._pending_dualvln_continuation_attempts: list[
++            DualVLNContinuationAttempt
++        ] = []
+ 
+         # Scheduling constraints.
+         self.max_num_running_reqs = self.scheduler_config.max_num_seqs
+@@ -1282,6 +1298,7 @@ class Scheduler(SchedulerInterface):
+         prompt_logprobs_dict = model_runner_output.prompt_logprobs_dict
+         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
+         pooler_outputs = model_runner_output.pooler_output
++        pooling_hidden_states = model_runner_output.pooling_hidden_states
+         num_nans_in_logits = model_runner_output.num_nans_in_logits
+         kv_connector_output = model_runner_output.kv_connector_output
+         cudagraph_stats = model_runner_output.cudagraph_stats
+@@ -1365,6 +1382,9 @@ class Scheduler(SchedulerInterface):
+             new_logprobs = None
+             new_token_ids = generated_token_ids
+             pooler_output = pooler_outputs[req_index] if pooler_outputs else None
++            request_hidden_states = (
++                pooling_hidden_states[req_index] if pooling_hidden_states else None
++            )
+             kv_transfer_params = None
+             status_before_stop = request.status
+ 
+@@ -1387,7 +1407,18 @@ class Scheduler(SchedulerInterface):
+                 # reset the status to WAITING for streaming requests that continue.
+                 finish_reason = request.get_finished_reason()
+                 finished = self._handle_stopped_request(request)
+-                if finished:
++                continuation_attempt = None
++                if finished and request.dualvln_latent_continuation is not None:
++                    continuation_attempt = self._plan_dualvln_continuation_attempt(
++                        request
++                    )
++                if finished and continuation_attempt is not None:
++                    self._pending_dualvln_continuation_attempts.append(
++                        continuation_attempt
++                    )
++                    if not continuation_attempt.continuation_used:
++                        kv_transfer_params = self._free_request(request)
++                elif finished:
+                     kv_transfer_params = self._free_request(request)
+ 
+                 if status_before_stop == RequestStatus.RUNNING:
+@@ -1435,6 +1466,7 @@ class Scheduler(SchedulerInterface):
+                         new_logprobs=new_logprobs,
+                         new_prompt_logprobs_tensors=prompt_logprobs_tensors,
+                         pooling_output=pooler_output,
++                        pooling_hidden_states=request_hidden_states,
+                         stop_reason=request.stop_reason,
+                         events=request.take_events(),
+                         kv_transfer_params=kv_transfer_params,
+@@ -1571,6 +1603,99 @@ class Scheduler(SchedulerInterface):
+         self._enqueue_waiting_request(request)
+         return False
+ 
++    def _restore_dualvln_continuation_request_state(
++        self,
++        request: Request,
++        *,
++        num_output_tokens: int,
++        num_tokens: int,
++        num_block_hashes: int,
++    ) -> None:
++        del request._output_token_ids[num_output_tokens:]
++        del request._all_token_ids[num_tokens:]
++        del request.block_hashes[num_block_hashes:]
++
++    def _plan_dualvln_continuation_attempt(
++        self, request: Request
++    ) -> DualVLNContinuationAttempt | None:
++        cfg = request.dualvln_latent_continuation
++        if cfg is None:
++            return None
++
++        external_request_id = request.external_req_id or request.request_id
++        suffix_token_ids = list(cfg.suffix_token_ids or [])
++        attempt = DualVLNContinuationAttempt(
++            external_request_id=external_request_id,
++            internal_request_id=request.request_id,
++            suffix_token_ids=suffix_token_ids,
++            n_query=int(cfg.n_query),
++        )
++
++        if not suffix_token_ids:
++            attempt.fallback_reason = "empty_suffix_token_ids"
++            return attempt
++        if len(suffix_token_ids) != int(cfg.n_query):
++            attempt.fallback_reason = (
++                "suffix_token_count_mismatch:"
++                f"{len(suffix_token_ids)}!={int(cfg.n_query)}"
++            )
++            return attempt
++        if self.parallel_config.pipeline_parallel_size > 1:
++            attempt.fallback_reason = "pipeline_parallel_not_supported"
++            return attempt
++        if self.scheduler_config.async_scheduling:
++            attempt.fallback_reason = "async_scheduling_not_supported"
++            return attempt
++        if len(self.running) > 1 or len(self.requests) > 1:
++            attempt.fallback_reason = (
++                "batch_size_not_supported:"
++                f"running={len(self.running)},requests={len(self.requests)}"
++            )
++            return attempt
++
++        old_num_output_tokens = request.num_output_tokens
++        old_num_tokens = request.num_tokens
++        old_num_block_hashes = len(request.block_hashes)
++
++        request.append_output_token_ids(suffix_token_ids)
++        new_blocks = self.kv_cache_manager.allocate_slots(
++            request,
++            len(suffix_token_ids),
++        )
++        if new_blocks is None:
++            self._restore_dualvln_continuation_request_state(
++                request,
++                num_output_tokens=old_num_output_tokens,
++                num_tokens=old_num_tokens,
++                num_block_hashes=old_num_block_hashes,
++            )
++            attempt.fallback_reason = "kv_allocation_failed"
++            return attempt
++
++        attempt.continuation_used = True
++        attempt.new_block_ids = new_blocks.get_block_ids(allow_none=True)
++        attempt.num_computed_tokens = old_num_tokens
++        attempt.num_output_tokens = request.num_output_tokens
++        return attempt
++
++    def take_pending_dualvln_continuation_attempts(
++        self,
++    ) -> list[DualVLNContinuationAttempt]:
++        attempts = self._pending_dualvln_continuation_attempts
++        self._pending_dualvln_continuation_attempts = []
++        return attempts
++
++    def free_finished_request(self, request_id: str) -> None:
++        request = self.requests.get(request_id)
++        if request is None:
++            return
++        if not request.is_finished():
++            raise RuntimeError(
++                "free_finished_request requires a finished request, got "
++                f"status={request.status!r} for req_id={request_id}."
++            )
++        self._free_request(request)
++
+     def _get_routed_experts(self, request: Request) -> np.ndarray | None:
+         if not self.vllm_config.model_config.enable_return_routed_experts:
+             return None
+diff --git a/vllm/v1/engine/__init__.py b/vllm/v1/engine/__init__.py
+index 33e39a359..1624bf2b9 100644
+--- a/vllm/v1/engine/__init__.py
++++ b/vllm/v1/engine/__init__.py
+@@ -63,6 +63,24 @@ class FinishReason(enum.IntEnum):
+         return FINISH_REASON_STRINGS[self.value]
+ 
+ 
++class DualVLNLatentContinuation(
++    msgspec.Struct,
++    array_like=True,  # type: ignore[call-arg]
++    omit_defaults=True,  # type: ignore[call-arg]
++    gc=False,
++):  # type: ignore[call-arg]
++    """Internal-only same-request suffix continuation for DualVLN.
++
++    The old native latent prefill path rebuilds a synthetic request and runs a
++    second prefill. This struct keeps the continuation intent on the original
++    live request so the engine can append a short TRAJ suffix immediately after
++    text generation finishes, using the same request-local KV state.
++    """
++
++    suffix_token_ids: list[int]
++    n_query: int
++
++
+ class EngineCoreRequest(
+     msgspec.Struct,
+     array_like=True,  # type: ignore[call-arg]
+@@ -79,6 +97,7 @@ class EngineCoreRequest(
+     cache_salt: str | None
+     data_parallel_rank: int | None
+     prompt_embeds: torch.Tensor | None = None
++    prompt_embeds_soft_suffix_len: int | None = None
+ 
+     # Index of the client, used to ensure outputs are sent back to the same
+     # client for this request when scaling out the front-end.
+@@ -100,6 +119,7 @@ class EngineCoreRequest(
+     external_req_id: str | None = None
+ 
+     reasoning_ended: bool | None = None
++    dualvln_latent_continuation: DualVLNLatentContinuation | None = None
+ 
+     @property
+     def params(self) -> SamplingParams | PoolingParams:
+@@ -150,6 +170,7 @@ class EngineCoreOutput(
+     new_prompt_logprobs_tensors: LogprobsTensors | None = None
+ 
+     pooling_output: torch.Tensor | None = None
++    pooling_hidden_states: torch.Tensor | None = None
+ 
+     finish_reason: FinishReason | None = None
+     stop_reason: int | str | None = None
+@@ -183,6 +204,20 @@ class UtilityOutput(
+     result: UtilityResult | None = None
+ 
+ 
++class DualVLNLatentContinuationResult(
++    msgspec.Struct,
++    array_like=True,  # type: ignore[call-arg]
++    omit_defaults=True,  # type: ignore[call-arg]
++    gc=False,
++):  # type: ignore[call-arg]
++    external_request_id: str
++    internal_request_id: str
++    continuation_used: bool = False
++    suffix_token_count: int = 0
++    fallback_reason: str | None = None
++    latents: torch.Tensor | None = None
++
++
+ class EngineCoreOutputs(
+     msgspec.Struct,
+     array_like=True,  # type: ignore[call-arg]
+diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
+index 11f24cb19..af1e46894 100644
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import os
++import pickle
+ import queue
+ import signal
+ import threading
+@@ -15,6 +16,7 @@ from logging import DEBUG
+ from typing import Any, TypeVar, cast
+ 
+ import msgspec
++import torch
+ import zmq
+ 
+ import vllm.envs as envs
+@@ -25,6 +27,7 @@ from vllm.logger import init_logger
+ from vllm.logging_utils.dump_input import dump_engine_exception
+ from vllm.lora.request import LoRARequest
+ from vllm.multimodal import MULTIMODAL_REGISTRY
++from vllm.sampling_params import SamplingParams
+ from vllm.tasks import POOLING_TASKS, SupportedTask
+ from vllm.tracing import instrument, maybe_init_worker_tracer
+ from vllm.transformers_utils.config import maybe_register_config_serialize_by_value
+@@ -43,8 +46,13 @@ from vllm.v1.core.kv_cache_utils import (
+     init_none_hash,
+ )
+ from vllm.v1.core.sched.interface import PauseState, SchedulerInterface
+-from vllm.v1.core.sched.output import SchedulerOutput
++from vllm.v1.core.sched.output import (
++    CachedRequestData,
++    NewRequestData,
++    SchedulerOutput,
++)
+ from vllm.v1.engine import (
++    DualVLNLatentContinuationResult,
+     EEP_NOTIFICATION_CALL_ID,
+     EEPNotificationType,
+     EngineCoreOutput,
+@@ -211,6 +219,9 @@ class EngineCore:
+         self.aborts_queue = queue.Queue[list[str]]()
+ 
+         self._idle_state_callbacks: list[Callable] = []
++        self._dualvln_latent_continuation_results: dict[
++            str, DualVLNLatentContinuationResult
++        ] = {}
+ 
+         # Mark the startup heap as static so that it's ignored by GC.
+         # Reduces pause times of oldest generation collections.
+@@ -401,9 +412,74 @@ class EngineCore:
+         engine_core_outputs = self.scheduler.update_from_output(
+             scheduler_output, model_output
+         )
++        self._run_dualvln_latent_continuations()
+ 
+         return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
+ 
++    def _record_dualvln_latent_continuation_result(
++        self, result: DualVLNLatentContinuationResult
++    ) -> None:
++        external_request_id = result.external_request_id
++        self._dualvln_latent_continuation_results[external_request_id] = result
++        while len(self._dualvln_latent_continuation_results) > 32:
++            oldest_key = next(iter(self._dualvln_latent_continuation_results))
++            del self._dualvln_latent_continuation_results[oldest_key]
++
++    def _run_dualvln_latent_continuations(self) -> None:
++        attempts = self.scheduler.take_pending_dualvln_continuation_attempts()
++        for attempt in attempts:
++            result = DualVLNLatentContinuationResult(
++                external_request_id=attempt.external_request_id,
++                internal_request_id=attempt.internal_request_id,
++                continuation_used=False,
++                suffix_token_count=len(attempt.suffix_token_ids),
++                fallback_reason=attempt.fallback_reason,
++            )
++            try:
++                if not attempt.continuation_used:
++                    logger.info(
++                        "DualVLN latent continuation falling back for request "
++                        "%s (internal=%s): %s",
++                        attempt.external_request_id,
++                        attempt.internal_request_id,
++                        attempt.fallback_reason,
++                    )
++                    continue
++
++                logger.info(
++                    "DualVLN latent continuation using same-request suffix path "
++                    "for request %s (internal=%s, suffix_len=%d).",
++                    attempt.external_request_id,
++                    attempt.internal_request_id,
++                    len(attempt.suffix_token_ids),
++                )
++                latents = self.model_executor.collective_rpc(
++                    "collect_hidden_states_for_traj_suffix_continuation",
++                    args=(
++                        attempt.internal_request_id,
++                        attempt.suffix_token_ids,
++                        attempt.new_block_ids,
++                        attempt.num_computed_tokens,
++                        attempt.num_output_tokens,
++                    ),
++                )[0]
++                result.continuation_used = True
++                result.latents = latents
++            except Exception as exc:
++                result.fallback_reason = (
++                    "continuation_runtime_error:" f"{type(exc).__name__}:{exc}"
++                )
++                logger.warning(
++                    "DualVLN latent continuation failed for request %s "
++                    "(internal=%s); falling back to native latent prefill: %s",
++                    attempt.external_request_id,
++                    attempt.internal_request_id,
++                    result.fallback_reason,
++                )
++            finally:
++                self.scheduler.free_finished_request(attempt.internal_request_id)
++                self._record_dualvln_latent_continuation_result(result)
++
+     def post_step(self, model_executed: bool) -> None:
+         # When using async scheduling we can't get draft token ids in advance,
+         # so we update draft token ids in the worker process and don't
+@@ -505,6 +581,7 @@ class EngineCore:
+         engine_core_outputs = self.scheduler.update_from_output(
+             scheduler_output, model_output
+         )
++        self._run_dualvln_latent_continuations()
+ 
+         # NOTE(nick): We can either handle the deferred tasks here or save
+         # in a field and do it immediately once step_with_batch_queue is
+@@ -730,6 +807,133 @@ class EngineCore:
+     ) -> list[_R]:
+         return self.model_executor.collective_rpc(method, timeout, args, kwargs)
+ 
++    def _drain_finished_requests_for_native_prefill(self) -> None:
++        # è¿˜æœ‰çœŸæ­£æ´»ç€çš„è¯·æ±‚æ—¶ï¼Œä»ç„¶ä¸å…è®¸æ’å…¥ native latent prefill
++        if self.scheduler.has_unfinished_requests():
++            raise RuntimeError(
++                "generate_latents_native_prefill requires no unfinished requests; "
++                "the engine still has active generation work."
++            )
++
++        # è¿™é‡Œåªæ¸…ç† finished-but-not-yet-removed çš„æ®‹ç•™
++        for _ in range(8):
++            if not self.scheduler.has_requests():
++                return
++
++            outputs, model_executed = self.step_fn()
++            self.post_step(model_executed)
++
++        if self.scheduler.has_requests():
++            raise RuntimeError(
++                "generate_latents_native_prefill could not drain finished requests "
++                "to an idle engine state."
++            )
++
++    def generate_latents_native_prefill(
++        self,
++        prompt_token_ids: list[int],
++        prompt_embeds,
++        mm_features,
++        n_query: int,
++        prompt_embeds_soft_suffix_len: int | None = None,
++    ) -> list[Any]:
++        if self.scheduler.has_requests():
++            self._drain_finished_requests_for_native_prefill()
++
++        if self.scheduler.has_requests():
++            raise RuntimeError(
++                "generate_latents_native_prefill requires the engine to be idle."
++            )
++        if n_query <= 0:
++            raise ValueError(f"n_query must be positive, got {n_query}.")
++        if prompt_embeds is None:
++            raise ValueError("prompt_embeds is required for native latent prefill.")
++        if isinstance(prompt_embeds, (bytes, bytearray, memoryview)):
++            prompt_embeds = pickle.loads(bytes(prompt_embeds))
++        if isinstance(mm_features, (bytes, bytearray, memoryview)):
++            mm_features = pickle.loads(bytes(mm_features))
++        if not torch.is_tensor(prompt_embeds):
++            prompt_embeds = torch.tensor(
++                prompt_embeds,
++                dtype=self.vllm_config.model_config.dtype,
++            )
++        else:
++            prompt_embeds = prompt_embeds.detach().cpu()
++        mm_features = list(mm_features or [])
++        if len(prompt_token_ids) == 0:
++            raise ValueError("prompt_token_ids must be non-empty.")
++        if prompt_embeds.ndim != 2:
++            raise ValueError(
++                "prompt_embeds must be rank-2, got "
++                f"shape={tuple(prompt_embeds.shape)}."
++            )
++        if prompt_embeds_soft_suffix_len is None:
++            expected_prompt_embeds_len = len(prompt_token_ids)
++        else:
++            if prompt_embeds_soft_suffix_len <= 0:
++                raise ValueError(
++                    "prompt_embeds_soft_suffix_len must be positive, got "
++                    f"{prompt_embeds_soft_suffix_len}."
++                )
++            if prompt_embeds_soft_suffix_len > len(prompt_token_ids):
++                raise ValueError(
++                    "prompt_embeds_soft_suffix_len exceeds prompt length: "
++                    f"{prompt_embeds_soft_suffix_len} > {len(prompt_token_ids)}."
++                )
++            expected_prompt_embeds_len = prompt_embeds_soft_suffix_len
++        if int(prompt_embeds.shape[0]) != expected_prompt_embeds_len:
++            raise ValueError(
++                "prompt_embeds/token length mismatch: "
++                f"{int(prompt_embeds.shape[0])} != {expected_prompt_embeds_len}."
++            )
++
++        engine_request = EngineCoreRequest(
++            request_id=f"latent_prefill_{time.time_ns()}",
++            prompt_token_ids=list(prompt_token_ids),
++            prompt_embeds=prompt_embeds.detach().cpu().contiguous(),
++            prompt_embeds_soft_suffix_len=prompt_embeds_soft_suffix_len,
++            mm_features=mm_features,
++            sampling_params=SamplingParams(
++                max_tokens=1,
++                temperature=0.0,
++            ),
++            pooling_params=None,
++            arrival_time=time.time(),
++            lora_request=None,
++            cache_salt=None,
++            data_parallel_rank=None,
++        )
++        request, request_wave = self.preprocess_add_request(engine_request)
++        self.add_request(request, request_wave)
++        scheduler_output = self.scheduler.schedule()
++        if request.request_id not in scheduler_output.num_scheduled_tokens:
++            raise RuntimeError(
++                "Native latent prefill request was not scheduled by the normal "
++                "scheduler path."
++            )
++
++        try:
++            return self.model_executor.collective_rpc(
++                "generate_latents_native_prefill",
++                args=(scheduler_output, n_query),
++            )
++        finally:
++            self.scheduler.finish_requests(
++                request.request_id,
++                RequestStatus.FINISHED_ABORTED,
++            )
++            # The worker-side native-prefill helper performs its own request
++            # cleanup, so do not leak this synthetic utility request into the
++            # next normal scheduler step.
++            self.scheduler.finished_req_ids = set()
++
++    def pop_dualvln_latent_continuation_result(
++        self, external_request_id: str
++    ) -> DualVLNLatentContinuationResult | None:
++        return self._dualvln_latent_continuation_results.pop(
++            external_request_id, None
++        )
++
+     def preprocess_add_request(self, request: EngineCoreRequest) -> tuple[Request, int]:
+         """Preprocess the request.
+ 
+diff --git a/vllm/v1/engine/core_client.py b/vllm/v1/engine/core_client.py
+index f199e3b8d..39b0b0155 100644
+--- a/vllm/v1/engine/core_client.py
++++ b/vllm/v1/engine/core_client.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import asyncio
++import pickle
+ import contextlib
+ import multiprocessing
+ import queue
+@@ -16,6 +17,7 @@ from threading import Thread
+ from typing import Any, TypeAlias, TypeVar
+ 
+ import msgspec.msgpack
++import torch
+ import zmq
+ import zmq.asyncio
+ 
+@@ -197,6 +199,21 @@ class EngineCoreClient(ABC):
+     ) -> list[_R]:
+         raise NotImplementedError
+ 
++    def generate_latents_native_prefill(
++        self,
++        prompt_token_ids: list[int],
++        prompt_embeds,
++        mm_features,
++        n_query: int,
++        prompt_embeds_soft_suffix_len: int | None = None,
++    ) -> list[Any]:
++        raise NotImplementedError
++
++    def pop_dualvln_latent_continuation_result(
++        self, external_request_id: str
++    ) -> Any:
++        raise NotImplementedError
++
+     def dp_engines_running(self) -> bool:
+         """Returns True if data parallel engines are collectively in a
+         running state."""
+@@ -358,6 +375,29 @@ class InprocClient(EngineCoreClient):
+     ) -> list[_R]:
+         return self.engine_core.collective_rpc(method, timeout, args, kwargs)
+ 
++    def generate_latents_native_prefill(
++        self,
++        prompt_token_ids: list[int],
++        prompt_embeds,
++        mm_features,
++        n_query: int,
++        prompt_embeds_soft_suffix_len: int | None = None,
++    ) -> list[Any]:
++        return self.engine_core.generate_latents_native_prefill(
++            prompt_token_ids=prompt_token_ids,
++            prompt_embeds=prompt_embeds,
++            mm_features=mm_features,
++            n_query=n_query,
++            prompt_embeds_soft_suffix_len=prompt_embeds_soft_suffix_len,
++        )
++
++    def pop_dualvln_latent_continuation_result(
++        self, external_request_id: str
++    ) -> Any:
++        return self.engine_core.pop_dualvln_latent_continuation_result(
++            external_request_id
++        )
++
+     def dp_engines_running(self) -> bool:
+         return False
+ 
+@@ -702,6 +742,19 @@ class MPClient(EngineCoreClient):
+             target=monitor_engine_cores, daemon=True, name="MPClientEngineMonitor"
+         ).start()
+ 
++    def generate_latents_native_prefill(
++        self,
++        prompt_token_ids: list[int],
++        prompt_embeds,
++        mm_features,
++        n_query: int,
++        prompt_embeds_soft_suffix_len: int | None = None,
++    ) -> list[Any]:
++        raise NotImplementedError(
++            "generate_latents_native_prefill is only available on the "
++            "synchronous LLM client."
++        )
++
+ 
+ def _process_utility_output(
+     output: UtilityOutput, utility_results: dict[int, AnyFuture]
+@@ -890,6 +943,41 @@ class SyncMPClient(MPClient):
+     ) -> list[_R]:
+         return self.call_utility("collective_rpc", method, timeout, args, kwargs)
+ 
++    def generate_latents_native_prefill(
++        self,
++        prompt_token_ids: list[int],
++        prompt_embeds,
++        mm_features,
++        n_query: int,
++        prompt_embeds_soft_suffix_len: int | None = None,
++    ) -> list[Any]:
++        if torch.is_tensor(prompt_embeds):
++            prompt_embeds = pickle.dumps(
++                prompt_embeds.detach().cpu().contiguous(),
++                protocol=pickle.HIGHEST_PROTOCOL,
++            )
++        if mm_features is not None:
++            mm_features = pickle.dumps(
++                mm_features,
++                protocol=pickle.HIGHEST_PROTOCOL,
++            )
++        return self.call_utility(
++            "generate_latents_native_prefill",
++            prompt_token_ids,
++            prompt_embeds,
++            mm_features,
++            n_query,
++            prompt_embeds_soft_suffix_len,
++        )
++
++    def pop_dualvln_latent_continuation_result(
++        self, external_request_id: str
++    ) -> Any:
++        return self.call_utility(
++            "pop_dualvln_latent_continuation_result",
++            external_request_id,
++        )
++
+     def save_sharded_state(
+         self, path: str, pattern: str | None = None, max_size: int | None = None
+     ) -> None:
+diff --git a/vllm/v1/engine/input_processor.py b/vllm/v1/engine/input_processor.py
+index aab560544..a1e02c5ab 100644
+--- a/vllm/v1/engine/input_processor.py
++++ b/vllm/v1/engine/input_processor.py
+@@ -6,7 +6,9 @@ from collections.abc import Mapping
+ from typing import Any, Literal
+ 
+ import vllm.envs as envs
++import torch
+ from vllm.config import VllmConfig
++from vllm.debug_dump import append_log, dump_enabled, save_tensors
+ from vllm.inputs.data import (
+     ProcessorInputs,
+     PromptType,
+@@ -35,6 +37,98 @@ from vllm.v1.engine import EngineCoreRequest
+ logger = init_logger(__name__)
+ 
+ 
++def _summarize_mm_feature_data(data: Any) -> dict[str, Any]:
++    summary: dict[str, Any] = {
++        "data_is_none": data is None,
++        "data_type": type(data).__name__ if data is not None else "NoneType",
++    }
++    if isinstance(data, Mapping):
++        try:
++            summary["mapping_keys"] = [str(key) for key in data.keys()]
++        except Exception:
++            summary["mapping_keys"] = None
++    elif isinstance(data, torch.Tensor):
++        summary["tensor_shape"] = list(data.shape)
++        summary["tensor_dtype"] = str(data.dtype)
++    return summary
++
++
++def _summarize_mm_feature(mm_feature: MultiModalFeatureSpec) -> dict[str, Any]:
++    position = mm_feature.mm_position
++    is_embed = getattr(position, "is_embed", None)
++    is_embed_true = None
++    is_embed_numel = None
++    if is_embed is not None:
++        is_embed_tensor = torch.as_tensor(is_embed, dtype=torch.bool).view(-1)
++        is_embed_true = int(is_embed_tensor.sum().item())
++        is_embed_numel = int(is_embed_tensor.numel())
++
++    return {
++        "modality": mm_feature.modality,
++        "identifier": getattr(mm_feature, "identifier", None),
++        "mm_hash": getattr(mm_feature, "mm_hash", None),
++        "offset": int(position.offset),
++        "length": int(position.length),
++        "is_embed_true": is_embed_true,
++        "is_embed_numel": is_embed_numel,
++        **_summarize_mm_feature_data(mm_feature.data),
++    }
++
++
++def _dump_engine_core_request(
++    *,
++    request_id: str,
++    processed_inputs: ProcessorInputs,
++    decoder_inputs: SingletonInputs,
++    supported_tasks: tuple[SupportedTask, ...],
++    params: SamplingParams | PoolingParams,
++    prompt_token_ids: list[int] | None,
++    prompt_embeds: torch.Tensor | None,
++    mm_features: list[MultiModalFeatureSpec] | None,
++) -> None:
++    if not dump_enabled():
++        return
++
++    mm_features_list = list(mm_features or [])
++    append_log(
++        "input_processor_engine_core_request",
++        {
++            "request_id": request_id,
++            "supported_tasks": list(supported_tasks),
++            "params_type": type(params).__name__,
++            "processed_inputs_type": processed_inputs.get("type"),
++            "decoder_inputs_type": decoder_inputs.get("type"),
++            "prompt_token_ids_len": (
++                len(prompt_token_ids) if prompt_token_ids is not None else None
++            ),
++            "has_prompt_embeds": prompt_embeds is not None,
++            "mm_feature_count": len(mm_features_list),
++            "mm_features": [
++                _summarize_mm_feature(mm_feature)
++                for mm_feature in mm_features_list
++            ],
++        },
++    )
++    prompt_token_ids_tensor = None
++    if prompt_token_ids is not None:
++        prompt_token_ids_tensor = torch.tensor(prompt_token_ids, dtype=torch.int64)
++    save_tensors(
++        "input_processor_engine_core_request",
++        {
++            "prompt_token_ids": prompt_token_ids_tensor,
++            "prompt_embeds": prompt_embeds,
++        },
++        meta={
++            "request_id": request_id,
++            "supported_tasks": list(supported_tasks),
++            "params_type": type(params).__name__,
++            "processed_inputs_type": processed_inputs.get("type"),
++            "decoder_inputs_type": decoder_inputs.get("type"),
++            "mm_feature_count": len(mm_features_list),
++        },
++    )
++
++
+ class InputProcessor:
+     def __init__(
+         self,
+@@ -245,7 +339,7 @@ class InputProcessor:
+ 
+         # Mypy can be conservative for TypedDict unions; normalize access.
+         if decoder_inputs["type"] == "embeds":
+-            prompt_token_ids = None
++            prompt_token_ids = decoder_inputs.get("prompt_token_ids")
+             prompt_embeds = decoder_inputs["prompt_embeds"]
+         else:
+             prompt_token_ids = decoder_inputs["prompt_token_ids"]
+@@ -274,11 +368,31 @@ class InputProcessor:
+ 
+         # Multimodal related.
+         mm_features: list[MultiModalFeatureSpec] | None = None
++        decoder_mm_inputs = None
++        decoder_mm_positions = None
++        decoder_mm_hashes = None
+ 
+         if decoder_inputs["type"] == "multimodal":
+             decoder_mm_inputs = decoder_inputs["mm_kwargs"]
+             decoder_mm_positions = decoder_inputs["mm_placeholders"]
+             decoder_mm_hashes = decoder_inputs["mm_hashes"]
++        elif decoder_inputs["type"] == "embeds":
++            decoder_mm_inputs = decoder_inputs.get("mm_kwargs")
++            decoder_mm_positions = decoder_inputs.get("mm_placeholders")
++            decoder_mm_hashes = decoder_inputs.get("mm_hashes")
++
++        if any(
++            value is not None
++            for value in (decoder_mm_inputs, decoder_mm_positions, decoder_mm_hashes)
++        ):
++            if not all(
++                value is not None
++                for value in (decoder_mm_inputs, decoder_mm_positions, decoder_mm_hashes)
++            ):
++                raise ValueError(
++                    "Embeddings-based prompts with multimodal metadata must provide "
++                    "mm_kwargs, mm_placeholders, and mm_hashes together."
++                )
+ 
+             if not all(
+                 isinstance(leaf, str) for leaf in json_iter_leaves(decoder_mm_hashes)
+@@ -310,6 +424,17 @@ class InputProcessor:
+                     )
+                 )
+ 
++        _dump_engine_core_request(
++            request_id=request_id,
++            processed_inputs=processed_inputs,
++            decoder_inputs=decoder_inputs,
++            supported_tasks=supported_tasks,
++            params=params,
++            prompt_token_ids=prompt_token_ids,
++            prompt_embeds=prompt_embeds,
++            mm_features=mm_features,
++        )
++
+         return EngineCoreRequest(
+             request_id=request_id,
+             prompt_token_ids=prompt_token_ids,
+@@ -395,10 +520,15 @@ class InputProcessor:
+         prompt_len = length_from_prompt_token_ids_or_embeds(prompt_ids, prompt_embeds)
+         self._validate_prompt_len(prompt_len, prompt_type)
+ 
++        mm_positions = None
+         if prompt_inputs["type"] == "multimodal":
+-            decoder_mm_positions = prompt_inputs["mm_placeholders"]
+-            for modality, mm_positions in decoder_mm_positions.items():
+-                for mm_position in mm_positions:
++            mm_positions = prompt_inputs["mm_placeholders"]
++        elif prompt_inputs["type"] == "embeds":
++            mm_positions = prompt_inputs.get("mm_placeholders")
++
++        if mm_positions is not None:
++            for modality, modality_positions in mm_positions.items():
++                for mm_position in modality_positions:
+                     embed_length = mm_position.get_num_embeds()
+                     if embed_length > self.mm_encoder_cache_size:
+                         raise ValueError(
+diff --git a/vllm/v1/engine/llm_engine.py b/vllm/v1/engine/llm_engine.py
+index 0d9279331..4abe339e8 100644
+--- a/vllm/v1/engine/llm_engine.py
++++ b/vllm/v1/engine/llm_engine.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
+ import time
++from collections import OrderedDict
+ from collections.abc import Callable, Mapping
+ from copy import copy
+ from typing import Any
+@@ -137,6 +138,9 @@ class LLMEngine:
+ 
+         # Don't keep the dummy data in memory
+         self.reset_mm_cache()
++        self._debug_recent_engine_core_requests: OrderedDict[
++            str, EngineCoreRequest
++        ] = OrderedDict()
+ 
+     @classmethod
+     def from_vllm_config(
+@@ -213,6 +217,21 @@ class LLMEngine:
+         request_ids = self.output_processor.abort_requests(request_ids, internal)
+         self.engine_core.abort_requests(request_ids)
+ 
++    def _remember_debug_engine_core_request(self, request: EngineCoreRequest) -> None:
++        external_req_id = request.external_req_id
++        if external_req_id is None:
++            return
++
++        self._debug_recent_engine_core_requests[external_req_id] = copy(request)
++        self._debug_recent_engine_core_requests.move_to_end(external_req_id)
++        while len(self._debug_recent_engine_core_requests) > 32:
++            self._debug_recent_engine_core_requests.popitem(last=False)
++
++    def pop_debug_engine_core_request(
++        self, external_request_id: str
++    ) -> EngineCoreRequest | None:
++        return self._debug_recent_engine_core_requests.pop(external_request_id, None)
++
+     def add_request(
+         self,
+         request_id: str,
+@@ -259,6 +278,7 @@ class LLMEngine:
+             prompt_text, _, _ = extract_prompt_components(self.model_config, prompt)
+ 
+         self.input_processor.assign_request_id(request)
++        self._remember_debug_engine_core_request(request)
+ 
+         req_id = request.request_id
+ 
+@@ -424,6 +444,30 @@ class LLMEngine:
+     def apply_model(self, func: Callable[[nn.Module], _R]) -> list[_R]:
+         return self.collective_rpc("apply_model", args=(func,))
+ 
++    def generate_latents_native_prefill(
++        self,
++        *,
++        prompt_token_ids: list[int],
++        prompt_embeds,
++        mm_features,
++        n_query: int,
++        prompt_embeds_soft_suffix_len: int | None = None,
++    ) -> list[Any]:
++        return self.engine_core.generate_latents_native_prefill(
++            prompt_token_ids=prompt_token_ids,
++            prompt_embeds=prompt_embeds,
++            mm_features=mm_features,
++            n_query=n_query,
++            prompt_embeds_soft_suffix_len=prompt_embeds_soft_suffix_len,
++        )
++
++    def pop_dualvln_latent_continuation_result(
++        self, external_request_id: str
++    ) -> Any:
++        return self.engine_core.pop_dualvln_latent_continuation_result(
++            external_request_id
++        )
++
+     def __del__(self):
+         dp_group = getattr(self, "dp_group", None)
+         if dp_group is not None and not self.external_launcher_dp:
+diff --git a/vllm/v1/engine/output_processor.py b/vllm/v1/engine/output_processor.py
+index f9e965092..69ddc73b3 100644
+--- a/vllm/v1/engine/output_processor.py
++++ b/vllm/v1/engine/output_processor.py
+@@ -270,6 +270,7 @@ class RequestState:
+         self,
+         new_token_ids: list[int],
+         pooling_output: torch.Tensor | None,
++        pooling_hidden_states: torch.Tensor | None,
+         finish_reason: FinishReason | None,
+         stop_reason: int | str | None,
+         kv_transfer_params: dict[str, Any] | None = None,
+@@ -310,7 +311,7 @@ class RequestState:
+         if pooling_output is not None:
+             return self._new_request_output(
+                 external_req_id,
+-                [self._new_pooling_output(pooling_output)],
++                [self._new_pooling_output(pooling_output, pooling_hidden_states)],
+                 finished,
+             )
+ 
+@@ -406,8 +407,15 @@ class RequestState:
+             stop_reason=stop_reason if finished else None,
+         )
+ 
+-    def _new_pooling_output(self, pooling_output: torch.Tensor) -> PoolingOutput:
+-        return PoolingOutput(data=pooling_output)
++    def _new_pooling_output(
++        self,
++        pooling_output: torch.Tensor,
++        pooling_hidden_states: torch.Tensor | None,
++    ) -> PoolingOutput:
++        return PoolingOutput(
++            data=pooling_output,
++            hidden_states=pooling_hidden_states,
++        )
+ 
+ 
+ class OutputProcessor:
+@@ -490,6 +498,7 @@ class OutputProcessor:
+                         pooling_output=EMPTY_CPU_TENSOR
+                         if req_state.detokenizer is None
+                         else None,
++                        pooling_hidden_states=None,
+                         finish_reason=FinishReason.ABORT,
+                         stop_reason=None,
+                         kv_transfer_params=None,
+@@ -613,6 +622,7 @@ class OutputProcessor:
+ 
+             new_token_ids = engine_core_output.new_token_ids
+             pooling_output = engine_core_output.pooling_output
++            pooling_hidden_states = engine_core_output.pooling_hidden_states
+             finish_reason = engine_core_output.finish_reason
+             stop_reason = engine_core_output.stop_reason
+             kv_transfer_params = engine_core_output.kv_transfer_params
+@@ -639,6 +649,7 @@ class OutputProcessor:
+             if request_output := req_state.make_request_output(
+                 new_token_ids,
+                 pooling_output,
++                pooling_hidden_states,
+                 finish_reason,
+                 stop_reason,
+                 kv_transfer_params,
+diff --git a/vllm/v1/outputs.py b/vllm/v1/outputs.py
+index 8eb58de4f..736c477aa 100644
+--- a/vllm/v1/outputs.py
++++ b/vllm/v1/outputs.py
+@@ -242,6 +242,7 @@ class ModelRunnerOutput:
+ 
+     # [num_reqs, hidden_size]
+     pooler_output: list[torch.Tensor | None] | None = None
++    pooling_hidden_states: list[torch.Tensor | None] | None = None
+ 
+     kv_connector_output: KVConnectorOutput | None = None
+ 
+diff --git a/vllm/v1/request.py b/vllm/v1/request.py
+index f2ee33b49..22d3ea8ba 100644
+--- a/vllm/v1/request.py
++++ b/vllm/v1/request.py
+@@ -15,6 +15,7 @@ from vllm.pooling_params import PoolingParams
+ from vllm.sampling_params import SamplingParams
+ from vllm.utils import length_from_prompt_token_ids_or_embeds
+ from vllm.v1.engine import (
++    DualVLNLatentContinuation,
+     EngineCoreEvent,
+     EngineCoreEventType,
+     EngineCoreRequest,
+@@ -28,6 +29,60 @@ if TYPE_CHECKING:
+     from vllm.v1.core.kv_cache_utils import BlockHash
+ 
+ 
++def get_num_prompt_tokens(
++    prompt_token_ids: list[int] | torch.Tensor | None,
++    prompt_embeds: torch.Tensor | None,
++    prompt_embeds_soft_suffix_len: int | None = None,
++) -> int:
++    prompt_token_len = None if prompt_token_ids is None else len(prompt_token_ids)
++    prompt_embeds_len = None if prompt_embeds is None else len(prompt_embeds)
++
++    if prompt_embeds_soft_suffix_len is None:
++        return length_from_prompt_token_ids_or_embeds(
++            prompt_token_ids,
++            prompt_embeds,
++        )
++
++    if prompt_embeds is None:
++        raise ValueError(
++            "prompt_embeds_soft_suffix_len requires prompt_embeds to be set."
++        )
++    if prompt_token_len is None:
++        raise ValueError(
++            "prompt_embeds_soft_suffix_len requires prompt_token_ids to be set."
++        )
++    if prompt_embeds_soft_suffix_len <= 0:
++        raise ValueError(
++            "prompt_embeds_soft_suffix_len must be positive, got "
++            f"{prompt_embeds_soft_suffix_len}."
++        )
++    if prompt_embeds_len != prompt_embeds_soft_suffix_len:
++        raise ValueError(
++            "prompt_embeds_soft_suffix_len/prompt_embeds length mismatch: "
++            f"{prompt_embeds_soft_suffix_len} != {prompt_embeds_len}."
++        )
++    if prompt_embeds_soft_suffix_len > prompt_token_len:
++        raise ValueError(
++            "prompt_embeds_soft_suffix_len exceeds prompt length: "
++            f"{prompt_embeds_soft_suffix_len} > {prompt_token_len}."
++        )
++    return prompt_token_len
++
++
++def get_prompt_embeds_range(
++    *,
++    num_prompt_tokens: int,
++    prompt_embeds: torch.Tensor | None,
++    prompt_embeds_soft_suffix_len: int | None = None,
++) -> tuple[int, int] | None:
++    if prompt_embeds is None:
++        return None
++    if prompt_embeds_soft_suffix_len is None:
++        return (0, num_prompt_tokens)
++    start = num_prompt_tokens - prompt_embeds_soft_suffix_len
++    return (start, num_prompt_tokens)
++
++
+ @dataclass
+ class StreamingUpdate:
+     """Lightweight data for streaming session continuation.
+@@ -65,6 +120,7 @@ class Request:
+         client_index: int = 0,
+         arrival_time: float | None = None,
+         prompt_embeds: torch.Tensor | None = None,
++        prompt_embeds_soft_suffix_len: int | None = None,
+         mm_features: list[MultiModalFeatureSpec] | None = None,
+         lora_request: "LoRARequest | None" = None,
+         cache_salt: str | None = None,
+@@ -73,8 +129,11 @@ class Request:
+         block_hasher: Callable[["Request"], list["BlockHash"]] | None = None,
+         resumable: bool = False,
+         reasoning_ended: bool | None = None,
++        external_req_id: str | None = None,
++        dualvln_latent_continuation: DualVLNLatentContinuation | None = None,
+     ) -> None:
+         self.request_id = request_id
++        self.external_req_id = external_req_id
+         self.client_index = client_index
+         self.priority = priority
+         self.sampling_params = sampling_params
+@@ -113,11 +172,14 @@ class Request:
+ 
+         self.prompt_token_ids = prompt_token_ids
+         self.prompt_embeds = prompt_embeds
++        self.prompt_embeds_soft_suffix_len = prompt_embeds_soft_suffix_len
+         # Cache per-block prompt-embed hashes to avoid rehashing the same
+         # tensor slices when generating extra keys.
+         self._prompt_embeds_per_block_hashes: dict[tuple[int, int], bytes] = {}
+-        self.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
+-            prompt_token_ids, prompt_embeds
++        self.num_prompt_tokens = get_num_prompt_tokens(
++            prompt_token_ids,
++            prompt_embeds,
++            prompt_embeds_soft_suffix_len,
+         )
+         self._output_token_ids: list[int] = []
+         self._all_token_ids: list[int] = (
+@@ -175,6 +237,7 @@ class Request:
+         self.resumable = resumable
+         # None entry in the queue means finished.
+         self.streaming_queue: deque[StreamingUpdate | None] | None = None
++        self.dualvln_latent_continuation = dualvln_latent_continuation
+ 
+     @classmethod
+     def from_engine_core_request(
+@@ -187,6 +250,7 @@ class Request:
+             client_index=request.client_index,
+             prompt_token_ids=request.prompt_token_ids,
+             prompt_embeds=request.prompt_embeds,
++            prompt_embeds_soft_suffix_len=request.prompt_embeds_soft_suffix_len,
+             mm_features=request.mm_features,
+             sampling_params=request.sampling_params,
+             pooling_params=request.pooling_params,
+@@ -198,6 +262,8 @@ class Request:
+             block_hasher=block_hasher,
+             resumable=request.resumable,
+             reasoning_ended=request.reasoning_ended,
++            external_req_id=request.external_req_id,
++            dualvln_latent_continuation=request.dualvln_latent_continuation,
+         )
+ 
+     def append_output_token_ids(
+diff --git a/vllm/v1/spec_decode/extract_hidden_states.py b/vllm/v1/spec_decode/extract_hidden_states.py
+index 38a54f016..6bc50b640 100644
+--- a/vllm/v1/spec_decode/extract_hidden_states.py
++++ b/vllm/v1/spec_decode/extract_hidden_states.py
+@@ -157,9 +157,20 @@ class ExtractHiddenStatesProposer:
+                 hidden_states=self.hidden_states[:num_input_tokens],
+             )
+ 
+-        # Return the sampled tokens as "draft" tokens
+-        # Shape: [batch_size, 1] to match num_speculative_tokens=1
+-        return sampled_token_ids.unsqueeze(-1), kv_connector_output
++        # Return the sampled tokens as "draft" tokens.
++        # Older call sites may pass [batch_size], while newer ones already pass
++        # [batch_size, 1] for num_speculative_tokens=1.
++        if sampled_token_ids.ndim == 1:
++            draft_token_ids = sampled_token_ids.unsqueeze(-1)
++        elif sampled_token_ids.ndim == 2 and sampled_token_ids.shape[1] == 1:
++            draft_token_ids = sampled_token_ids
++        else:
++            raise ValueError(
++                f"Unexpected sampled_token_ids shape for extract_hidden_states: "
++                f"{tuple(sampled_token_ids.shape)}"
++            )
++
++        return draft_token_ids, kv_connector_output
+ 
+     def _get_slot_mapping(
+         self,
+@@ -364,7 +375,9 @@ class ExtractHiddenStatesProposer:
+ 
+         with set_model_tag("extract_hidden_states"):
+             self.model = get_model(
+-                vllm_config=self.vllm_config, model_config=draft_model_config
++                vllm_config=self.vllm_config,
++                model_config=draft_model_config,
++                prefix="extract_hidden_states_draft",
+             )
+ 
+         # Identify draft model's attention layers (difference from target)
+diff --git a/vllm/v1/utils.py b/vllm/v1/utils.py
+index 3d065927e..ea37e978e 100644
+--- a/vllm/v1/utils.py
++++ b/vllm/v1/utils.py
+@@ -113,8 +113,17 @@ class CpuGpuBuffer:
+         pin_memory: bool,
+         with_numpy: bool = True,
+     ) -> None:
+-        self.cpu = torch.zeros(*size, dtype=dtype, device="cpu", pin_memory=pin_memory)
+-        self.gpu = torch.zeros_like(self.cpu, device=device)
++        effective_pin_memory = pin_memory and dtype != torch.bfloat16
++        self.cpu = torch.zeros(
++            *size,
++            dtype=dtype,
++            device="cpu",
++            pin_memory=effective_pin_memory,
++        )
++        if dtype == torch.bfloat16 and not with_numpy:
++            self.gpu = torch.empty(*size, dtype=dtype, device=device)
++        else:
++            self.gpu = torch.zeros(*size, dtype=dtype, device=device)
+         self.np: np.ndarray
+         # To keep type hints simple (avoiding generics and subclasses), we
+         # only conditionally create the numpy array attribute. This can cause
+diff --git a/vllm/v1/worker/gpu_input_batch.py b/vllm/v1/worker/gpu_input_batch.py
+index 579c9b7a5..3f9db3df2 100644
+--- a/vllm/v1/worker/gpu_input_batch.py
++++ b/vllm/v1/worker/gpu_input_batch.py
+@@ -2,20 +2,22 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ # Datastructures defining a GPU input batch
+ 
++import os
+ from dataclasses import dataclass
+ from typing import cast
+ 
+ import numpy as np
+ import torch
+ 
++from vllm.debug_dump import append_log, dump_enabled, save_tensors
+ from vllm.lora.request import LoRARequest
+ from vllm.multimodal.inputs import MultiModalFeatureSpec
+ from vllm.pooling_params import PoolingParams
+ from vllm.sampling_params import SamplingParams, SamplingType
+-from vllm.utils import length_from_prompt_token_ids_or_embeds
+ from vllm.utils.collection_utils import swap_dict_values
+ from vllm.v1.outputs import LogprobsTensors
+ from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
++from vllm.v1.request import get_num_prompt_tokens, get_prompt_embeds_range
+ from vllm.v1.sample.logits_processor import (
+     BatchUpdateBuilder,
+     LogitsProcessors,
+@@ -45,6 +47,7 @@ class CachedRequestState:
+ 
+     lora_request: LoRARequest | None = None
+     prompt_embeds: torch.Tensor | None = None
++    prompt_embeds_soft_suffix_len: int | None = None
+ 
+     # Used when both async_scheduling and spec_decode are enabled.
+     prev_num_draft_len: int = 0
+@@ -54,8 +57,10 @@ class CachedRequestState:
+     pooling_states: PoolingStates | None = None
+ 
+     def __post_init__(self):
+-        self.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
+-            self.prompt_token_ids, self.prompt_embeds
++        self.num_prompt_tokens = get_num_prompt_tokens(
++            self.prompt_token_ids,
++            self.prompt_embeds,
++            self.prompt_embeds_soft_suffix_len,
+         )
+ 
+         if self.pooling_params is not None:
+@@ -127,6 +132,7 @@ class InputBatch:
+         # allocation if max_model_len is big.
+         # Maps req_index -> tensor of shape (num_prompt_tokens, hidden_size)
+         self.req_prompt_embeds: dict[int, torch.Tensor] = {}
++        self.req_prompt_embeds_soft_suffix_lens: dict[int, int] = {}
+         self.num_tokens_no_spec_cpu_tensor = torch.zeros(
+             (max_num_reqs,),
+             device="cpu",
+@@ -326,19 +332,69 @@ class InputBatch:
+         self.req_id_to_index[req_id] = req_index
+ 
+         # Copy the prompt token ids and output token ids.
+-        num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
+-            request.prompt_token_ids, request.prompt_embeds
++        num_prompt_tokens = get_num_prompt_tokens(
++            request.prompt_token_ids,
++            request.prompt_embeds,
++            request.prompt_embeds_soft_suffix_len,
+         )
+         self.num_prompt_tokens[req_index] = num_prompt_tokens
+         start_idx = num_prompt_tokens
+         end_idx = start_idx + len(request.output_token_ids)
+         if request.prompt_token_ids is not None:
+             self.token_ids_cpu[req_index, :num_prompt_tokens] = request.prompt_token_ids
+-            self.is_token_ids[req_index, :num_prompt_tokens] = True
+-        else:
+-            self.is_token_ids[req_index, :num_prompt_tokens] = False
++        self.is_token_ids[req_index, :num_prompt_tokens] = (
++            request.prompt_token_ids is not None
++        )
+         if request.prompt_embeds is not None:
++            prompt_embeds_range = get_prompt_embeds_range(
++                num_prompt_tokens=num_prompt_tokens,
++                prompt_embeds=request.prompt_embeds,
++                prompt_embeds_soft_suffix_len=request.prompt_embeds_soft_suffix_len,
++            )
++            assert prompt_embeds_range is not None
++            prompt_embeds_start, prompt_embeds_end = prompt_embeds_range
++            self.is_token_ids[req_index, prompt_embeds_start:prompt_embeds_end] = False
+             self.req_prompt_embeds[req_index] = request.prompt_embeds
++            if request.prompt_embeds_soft_suffix_len is not None:
++                self.req_prompt_embeds_soft_suffix_lens[req_index] = (
++                    request.prompt_embeds_soft_suffix_len
++                )
++            else:
++                self.req_prompt_embeds_soft_suffix_lens.pop(req_index, None)
++            if os.environ.get("INTERNNAV_DEBUG_PROMPT_EMBEDS", "0") == "1":
++                false_indices = np.flatnonzero(
++                    ~self.is_token_ids[req_index, :num_prompt_tokens]
++                ).tolist()
++                expected_false_indices = list(
++                    range(prompt_embeds_start, prompt_embeds_end)
++                )
++                append_log(
++                    "gpu_input_batch_prompt_embeds_debug",
++                    {
++                        "req_id": req_id,
++                        "req_index": int(req_index),
++                        "prompt_len": int(num_prompt_tokens),
++                        "soft_suffix_len": (
++                            int(request.prompt_embeds_soft_suffix_len)
++                            if request.prompt_embeds_soft_suffix_len is not None
++                            else None
++                        ),
++                        "num_false_prompt_entries": int(len(false_indices)),
++                        "false_prompt_indices": false_indices,
++                        "false_prompt_exact_suffix": (
++                            false_indices == expected_false_indices
++                        ),
++                        "req_prompt_embeds_shape": list(request.prompt_embeds.shape),
++                        "req_prompt_embeds_storage": (
++                            "suffix_only"
++                            if request.prompt_embeds_soft_suffix_len is not None
++                            else "full_prompt"
++                        ),
++                    },
++                )
++        else:
++            self.req_prompt_embeds.pop(req_index, None)
++            self.req_prompt_embeds_soft_suffix_lens.pop(req_index, None)
+         self.token_ids_cpu[req_index, start_idx:end_idx] = request.output_token_ids
+         self.is_token_ids[req_index, start_idx:end_idx] = True
+         # Number of tokens without spec decode tokens.
+@@ -347,6 +403,39 @@ class InputBatch:
+         self.num_computed_tokens_cpu[req_index] = request.num_computed_tokens
+         self.block_table.add_row(request.block_ids, req_index)
+ 
++        if dump_enabled() and request.prompt_embeds is not None:
++            append_log(
++                "gpu_input_batch_add_request",
++                {
++                    "req_id": req_id,
++                    "req_index": int(req_index),
++                    "num_prompt_tokens": int(num_prompt_tokens),
++                    "has_prompt_token_ids": request.prompt_token_ids is not None,
++                    "has_prompt_embeds": True,
++                    "num_output_token_ids": int(len(request.output_token_ids)),
++                },
++            )
++            prompt_token_ids_tensor = None
++            if request.prompt_token_ids is not None:
++                prompt_token_ids_tensor = torch.tensor(
++                    request.prompt_token_ids, dtype=torch.int64
++                )
++            save_tensors(
++                "gpu_input_batch_add_request",
++                {
++                    "prompt_token_ids": prompt_token_ids_tensor,
++                    "prompt_embeds": request.prompt_embeds,
++                    "is_token_ids_prompt_segment": torch.from_numpy(
++                        self.is_token_ids[req_index, :num_prompt_tokens].copy()
++                    ),
++                },
++                meta={
++                    "req_id": req_id,
++                    "req_index": int(req_index),
++                    "num_prompt_tokens": int(num_prompt_tokens),
++                },
++            )
++
+         if sampling_params := request.sampling_params:
+             if sampling_params.sampling_type == SamplingType.GREEDY:
+                 # Should avoid division by zero later when apply_temperature.
+@@ -578,6 +667,16 @@ class InputBatch:
+             self.req_prompt_embeds[i1] = embeds_i2
+         else:
+             self.req_prompt_embeds.pop(i1, None)
++        suffix_len_i1 = self.req_prompt_embeds_soft_suffix_lens.get(i1)
++        suffix_len_i2 = self.req_prompt_embeds_soft_suffix_lens.get(i2)
++        if suffix_len_i1 is not None:
++            self.req_prompt_embeds_soft_suffix_lens[i2] = suffix_len_i1
++        else:
++            self.req_prompt_embeds_soft_suffix_lens.pop(i2, None)
++        if suffix_len_i2 is not None:
++            self.req_prompt_embeds_soft_suffix_lens[i1] = suffix_len_i2
++        else:
++            self.req_prompt_embeds_soft_suffix_lens.pop(i1, None)
+ 
+         self.block_table.swap_row(i1, i2)
+ 
+@@ -650,6 +749,7 @@ class InputBatch:
+             self._req_ids.clear()
+             self.req_output_token_ids.clear()
+             self.spec_token_ids.clear()
++            self.req_prompt_embeds_soft_suffix_lens.clear()
+             return
+ 
+         # NOTE(woosuk): This function assumes that the empty_req_indices
+@@ -698,6 +798,10 @@ class InputBatch:
+                 self.req_prompt_embeds[empty_index] = self.req_prompt_embeds.pop(
+                     last_req_index
+                 )
++            if last_req_index in self.req_prompt_embeds_soft_suffix_lens:
++                self.req_prompt_embeds_soft_suffix_lens[empty_index] = (
++                    self.req_prompt_embeds_soft_suffix_lens.pop(last_req_index)
++                )
+             self.num_tokens_no_spec[empty_index] = self.num_tokens_no_spec[
+                 last_req_index
+             ]
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index b53bd71a1..ffd7cdf79 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -4,6 +4,7 @@
+ import functools
+ import gc
+ import itertools
++import os
+ import threading
+ import time
+ from collections import defaultdict
+@@ -21,6 +22,7 @@ import torch.nn as nn
+ from tqdm import tqdm
+ 
+ import vllm.envs as envs
++from vllm.debug_dump import append_log, dump_enabled, save_tensors
+ from vllm.compilation.counter import compilation_counter
+ from vllm.compilation.cuda_graph import CUDAGraphStat, CUDAGraphWrapper
+ from vllm.compilation.monitor import set_cudagraph_capturing_enabled
+@@ -102,7 +104,6 @@ from vllm.sampling_params import SamplingType
+ from vllm.sequence import IntermediateTensors
+ from vllm.tasks import GenerationTask, PoolingTask, SupportedTask
+ from vllm.tracing import instrument
+-from vllm.utils import length_from_prompt_token_ids_or_embeds
+ from vllm.utils.math_utils import cdiv, round_up
+ from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
+ from vllm.utils.nvtx_pytorch_hooks import PytHooks
+@@ -126,7 +127,7 @@ from vllm.v1.attention.backends.utils import (
+     get_dcp_local_seq_lens,
+     reorder_batch_to_split_decodes_and_prefills,
+ )
+-from vllm.v1.core.sched.output import NewRequestData
++from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
+ from vllm.v1.cudagraph_dispatcher import CudagraphDispatcher
+ from vllm.v1.kv_cache_interface import (
+     AttentionSpec,
+@@ -155,6 +156,7 @@ from vllm.v1.outputs import (
+     make_empty_encoder_model_runner_output,
+ )
+ from vllm.v1.pool.metadata import PoolingMetadata, PoolingStates
++from vllm.v1.request import get_num_prompt_tokens, get_prompt_embeds_range
+ from vllm.v1.sample.logits_processor import LogitsProcessors, build_logitsprocs
+ from vllm.v1.sample.logits_processor.interface import LogitsProcessor
+ from vllm.v1.sample.metadata import SamplingMetadata
+@@ -329,11 +331,28 @@ def _copy_pooler_output_to_cpu(
+     return pooler_output
+ 
+ 
++def _copy_hidden_states_to_cpu(
++    raw_hidden_states: list[torch.Tensor | None], finished_mask: list[bool]
++) -> list[torch.Tensor | None]:
++    if len(raw_hidden_states) != len(finished_mask):
++        raise ValueError(
++            "Raw hidden-state batch size does not match finished mask size: "
++            f"{len(raw_hidden_states)} != {len(finished_mask)}."
++        )
++
++    hidden_states: list[torch.Tensor | None] = [None] * len(finished_mask)
++    for i, (out, include) in enumerate(zip(raw_hidden_states, finished_mask)):
++        if include and out is not None:
++            hidden_states[i] = out.to("cpu", non_blocking=True)
++    return hidden_states
++
++
+ class AsyncGPUPoolingModelRunnerOutput(AsyncModelRunnerOutput):
+     def __init__(
+         self,
+         model_runner_output: ModelRunnerOutput,
+         raw_pooler_output: PoolerOutput,
++        raw_hidden_states: list[torch.Tensor | None],
+         finished_mask: list[bool],
+         async_output_copy_stream: torch.cuda.Stream,
+     ):
+@@ -345,6 +364,7 @@ class AsyncGPUPoolingModelRunnerOutput(AsyncModelRunnerOutput):
+         # Keep a reference to the device tensors to avoid them being
+         # deallocated until we finish copying it to the host.
+         self._raw_pooler_output = raw_pooler_output
++        self._raw_hidden_states = raw_hidden_states
+ 
+         # Initiate the copy on a separate stream, but do not synchronize it.
+         default_stream = torch.cuda.current_stream()
+@@ -354,6 +374,10 @@ class AsyncGPUPoolingModelRunnerOutput(AsyncModelRunnerOutput):
+                 raw_pooler_output=self._raw_pooler_output,
+                 finished_mask=finished_mask,
+             )
++            self._model_runner_output.pooling_hidden_states = _copy_hidden_states_to_cpu(
++                raw_hidden_states=self._raw_hidden_states,
++                finished_mask=finished_mask,
++            )
+             self.async_copy_ready_event.record()
+ 
+     def get_output(self) -> ModelRunnerOutput:
+@@ -364,6 +388,7 @@ class AsyncGPUPoolingModelRunnerOutput(AsyncModelRunnerOutput):
+ 
+         # Release the device tensors once the copy has completed.
+         del self._raw_pooler_output
++        del self._raw_hidden_states
+         return self._model_runner_output
+ 
+ 
+@@ -391,6 +416,7 @@ class GPUModelRunner(
+         vllm_config: VllmConfig,
+         device: torch.device,
+     ):
++        logger.info("GPUModelRunner.__init__: begin")
+         self.vllm_config = vllm_config
+         self.model_config = vllm_config.model_config
+         self.cache_config = vllm_config.cache_config
+@@ -410,6 +436,7 @@ class GPUModelRunner(
+         self.device = device
+         self.pin_memory = is_pin_memory_available()
+         self.dtype = self.model_config.dtype
++        logger.info("GPUModelRunner.__init__: basic config captured")
+ 
+         self.kv_cache_dtype = kv_cache_dtype_str_to_dtype(
+             cache_config.cache_dtype, self.model_config
+@@ -473,6 +500,7 @@ class GPUModelRunner(
+ 
+         # Sampler
+         self.sampler = Sampler(logprobs_mode=self.model_config.logprobs_mode)
++        logger.info("GPUModelRunner.__init__: sampler initialized")
+ 
+         self.eplb_state: EplbState | None = None
+         # NOTE(yongji): flag to temporarily disable EPLB during scaling up/down
+@@ -563,6 +591,7 @@ class GPUModelRunner(
+                     f"{self.speculative_config.method}"
+                 )
+             self.rejection_sampler = RejectionSampler(self.sampler)
++        logger.info("GPUModelRunner.__init__: speculative setup done")
+ 
+         self.num_spec_tokens = 0
+         if self.speculative_config:
+@@ -579,6 +608,7 @@ class GPUModelRunner(
+         # that are currently in the prefill phase.
+         self.num_prompt_logprobs: dict[str, int] = {}
+         self.comm_stream = torch.cuda.Stream()
++        logger.info("GPUModelRunner.__init__: comm_stream created")
+ 
+         # Input Batch
+         # NOTE(Chen): Ideally, we should initialize the input batch inside
+@@ -623,6 +653,7 @@ class GPUModelRunner(
+             is_pooling_model=self.is_pooling_model,
+             cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
+         )
++        logger.info("GPUModelRunner.__init__: input_batch created")
+ 
+         # Separate cuda stream for overlapping transfer of sampled token ids from
+         # GPU to CPU when async scheduling is enabled.
+@@ -633,6 +664,7 @@ class GPUModelRunner(
+         if self.use_async_scheduling:
+             self.async_output_copy_stream = torch.cuda.Stream()
+             self.prepare_inputs_event = torch.Event()
++        logger.info("GPUModelRunner.__init__: async scheduling buffers done")
+ 
+         # self.cudagraph_batch_sizes sorts in ascending order.
+         if (
+@@ -647,6 +679,7 @@ class GPUModelRunner(
+ 
+         # Cache the device properties.
+         self._init_device_properties()
++        logger.info("GPUModelRunner.__init__: device properties initialized")
+ 
+         # Encoder timing registry for observability
+         self.encoder_timing_registry: dict[str, EncoderTimingStats] = {}
+@@ -680,6 +713,7 @@ class GPUModelRunner(
+         self.num_accepted_tokens = self._make_buffer(
+             self.max_num_reqs, dtype=torch.int64
+         )
++        logger.info("GPUModelRunner.__init__: core persistent buffers allocated")
+ 
+         # Only relevant for multimodal models
+         if self.supports_mm_inputs:
+@@ -706,6 +740,7 @@ class GPUModelRunner(
+             self.mrope_positions = self._make_buffer(
+                 (3, self.max_num_tokens + 1), dtype=torch.int64
+             )
++            logger.info("GPUModelRunner.__init__: mrope buffer allocated")
+ 
+         # Only relevant for models using XD-RoPE (e.g, HunYuan-VL)
+         if self.uses_xdrope_dim > 0:
+@@ -713,6 +748,7 @@ class GPUModelRunner(
+             self.xdrope_positions = self._make_buffer(
+                 (self.uses_xdrope_dim, self.max_num_tokens + 1), dtype=torch.int64
+             )
++            logger.info("GPUModelRunner.__init__: xdrope buffer allocated")
+ 
+         # None in the first PP rank. The rest are set after load_model.
+         self.intermediate_tensors: IntermediateTensors | None = None
+@@ -736,6 +772,7 @@ class GPUModelRunner(
+             self.kv_sharing_fast_prefill_logits_indices = torch.zeros(
+                 self.max_num_tokens, dtype=torch.int32, device=self.device
+             )
++        logger.info("GPUModelRunner.__init__: kv sharing setup done")
+ 
+         self.uniform_decode_query_len = 1 + self.num_spec_tokens
+ 
+@@ -815,6 +852,7 @@ class GPUModelRunner(
+         # Model weight offloader
+         # Make sure this is called before any get_offloader call
+         set_offloader(create_offloader(self.offload_config))
++        logger.info("GPUModelRunner.__init__: offloader initialized")
+ 
+         # Ephemeral state transferred between execute_model() and sample_tokens().
+         self.execute_model_state: ExecuteModelState | None = None
+@@ -822,6 +860,7 @@ class GPUModelRunner(
+         self.mamba_state_idx: dict[str, int] = {}
+         self._mamba_copy_bufs: mamba_utils.MambaCopyBuffers | None = None
+         self.layerwise_nvtx_hooks_registered = False
++        logger.info("GPUModelRunner.__init__: done")
+ 
+     def update_max_model_len(self, max_model_len: int) -> None:
+         self.max_model_len = max_model_len
+@@ -909,6 +948,12 @@ class GPUModelRunner(
+     def _make_buffer(
+         self, *size: int | torch.SymInt, dtype: torch.dtype, numpy: bool = True
+     ) -> CpuGpuBuffer:
++        logger.info(
++            "GPUModelRunner._make_buffer: size=%s dtype=%s numpy=%s",
++            size,
++            dtype,
++            numpy,
++        )
+         return CpuGpuBuffer(
+             *size,
+             dtype=dtype,
+@@ -1115,6 +1160,9 @@ class GPUModelRunner(
+                 req_id=req_id,
+                 prompt_token_ids=new_req_data.prompt_token_ids,
+                 prompt_embeds=new_req_data.prompt_embeds,
++                prompt_embeds_soft_suffix_len=(
++                    new_req_data.prompt_embeds_soft_suffix_len
++                ),
+                 mm_features=new_req_data.mm_features,
+                 sampling_params=sampling_params,
+                 pooling_params=pooling_params,
+@@ -1395,13 +1443,18 @@ class GPUModelRunner(
+         req_state.prompt_token_ids = new_req_data.prompt_token_ids
+         req_state.mm_features = new_req_data.mm_features
+         req_state.prompt_embeds = new_req_data.prompt_embeds
++        req_state.prompt_embeds_soft_suffix_len = (
++            new_req_data.prompt_embeds_soft_suffix_len
++        )
+         req_state.sampling_params = new_req_data.sampling_params
+         req_state.pooling_params = new_req_data.pooling_params
+         self.late_interaction_runner.register_request(req_id, req_state.pooling_params)
+         req_state.block_ids = new_req_data.block_ids
+         req_state.num_computed_tokens = new_req_data.num_computed_tokens
+-        req_state.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
+-            req_state.prompt_token_ids, req_state.prompt_embeds
++        req_state.num_prompt_tokens = get_num_prompt_tokens(
++            req_state.prompt_token_ids,
++            req_state.prompt_embeds,
++            req_state.prompt_embeds_soft_suffix_len,
+         )
+ 
+         # Clear `output_token_ids` as previous output tokens are now part of
+@@ -1509,11 +1562,14 @@ class GPUModelRunner(
+         Carefully handles the `prev_sampled_token_ids` which can be cached
+         from the previous engine iteration, in which case those tokens on the
+         GPU need to be copied into the corresponding slots into input_ids."""
++        runtime_prompt_embeds_enabled = (
++            self.enable_prompt_embeds or bool(self.input_batch.req_prompt_embeds)
++        )
+ 
+         if self.input_batch.prev_sampled_token_ids is None:
+             # Normal scheduling case
+             self.input_ids.copy_to_gpu(total_num_scheduled_tokens)
+-            if self.enable_prompt_embeds:
++            if runtime_prompt_embeds_enabled:
+                 self.inputs_embeds.copy_to_gpu(total_num_scheduled_tokens)
+                 self.is_token_ids.copy_to_gpu(total_num_scheduled_tokens)
+             return
+@@ -1563,7 +1619,7 @@ class GPUModelRunner(
+             # If not all requests are decodes from the last iteration,
+             # We need to copy the input_ids_cpu to the GPU first.
+             self.input_ids.copy_to_gpu(total_num_scheduled_tokens)
+-            if self.enable_prompt_embeds:
++            if runtime_prompt_embeds_enabled:
+                 self.inputs_embeds.copy_to_gpu(total_num_scheduled_tokens)
+                 self.is_token_ids.copy_to_gpu(total_num_scheduled_tokens)
+         if num_common_tokens == 0:
+@@ -1579,7 +1635,7 @@ class GPUModelRunner(
+                 self.input_batch.prev_sampled_token_ids[:num_common_tokens, 0],
+                 non_blocking=True,
+             )
+-            if self.enable_prompt_embeds:
++            if runtime_prompt_embeds_enabled:
+                 self.is_token_ids.gpu[:num_common_tokens] = True
+             return
+         # Upload the index tensors asynchronously so the scatter can be non-blocking.
+@@ -1681,6 +1737,9 @@ class GPUModelRunner(
+         assert total_num_scheduled_tokens > 0
+         num_reqs = self.input_batch.num_reqs
+         assert num_reqs > 0
++        runtime_prompt_embeds_enabled = (
++            self.enable_prompt_embeds or bool(self.input_batch.req_prompt_embeds)
++        )
+ 
+         # OPTIMIZATION: Start copying the block table first.
+         # This way, we can overlap the copy with the following CPU operations.
+@@ -1730,7 +1789,7 @@ class GPUModelRunner(
+             token_indices_tensor,
+             out=self.input_ids.cpu[:total_num_scheduled_tokens],
+         )
+-        if self.enable_prompt_embeds:
++        if runtime_prompt_embeds_enabled:
+             is_token_ids = self.input_batch.is_token_ids_tensor.flatten()
+             torch.index_select(
+                 is_token_ids,
+@@ -1759,21 +1818,80 @@ class GPUModelRunner(
+ 
+                 req_embeds = self.input_batch.req_prompt_embeds[req_idx]
+                 start_pos = self.input_batch.num_computed_tokens_cpu[req_idx]
++                prompt_len = int(self.input_batch.num_prompt_tokens[req_idx])
++                soft_suffix_len = self.input_batch.req_prompt_embeds_soft_suffix_lens.get(
++                    req_idx
++                )
++                prompt_embeds_range = get_prompt_embeds_range(
++                    num_prompt_tokens=prompt_len,
++                    prompt_embeds=req_embeds,
++                    prompt_embeds_soft_suffix_len=soft_suffix_len,
++                )
++                assert prompt_embeds_range is not None
++                prompt_embeds_start, prompt_embeds_end = prompt_embeds_range
+ 
+-                # Skip if trying to read beyond available embeddings
+-                if start_pos >= req_embeds.shape[0]:
++                sched_start = int(start_pos)
++                sched_end = sched_start + int(num_sched)
++                overlap_start = max(sched_start, prompt_embeds_start)
++                overlap_end = min(sched_end, prompt_embeds_end)
++
++                if overlap_start >= overlap_end:
+                     output_idx += num_sched
+                     continue
+ 
+-                # Copy available embeddings
+-                end_pos = start_pos + num_sched
+-                actual_end = min(end_pos, req_embeds.shape[0])
+-                actual_num_sched = actual_end - start_pos
++                src_start = overlap_start - prompt_embeds_start
++                src_end = overlap_end - prompt_embeds_start
++                dst_start = output_idx + (overlap_start - sched_start)
++                dst_end = dst_start + (overlap_end - overlap_start)
++                self.inputs_embeds.cpu[dst_start:dst_end].copy_(
++                    req_embeds[src_start:src_end]
++                )
+ 
+-                if actual_num_sched > 0:
+-                    self.inputs_embeds.cpu[
+-                        output_idx : output_idx + actual_num_sched
+-                    ].copy_(req_embeds[start_pos:actual_end])
++                if os.environ.get("INTERNNAV_DEBUG_PROMPT_EMBEDS", "0") == "1":
++                    false_indices = torch.nonzero(
++                        ~self.is_token_ids.cpu[output_idx : output_idx + num_sched],
++                        as_tuple=False,
++                    ).squeeze(1)
++                    false_indices_list = (
++                        false_indices.detach().cpu().tolist()
++                        if false_indices.numel() > 0
++                        else []
++                    )
++                    expected_false_indices = list(
++                        range(overlap_start - sched_start, overlap_end - sched_start)
++                    )
++                    append_log(
++                        "gpu_model_runner_prompt_embeds_debug",
++                        {
++                            "req_id": self.input_batch.req_ids[req_idx],
++                            "req_index": int(req_idx),
++                            "prompt_len": int(prompt_len),
++                            "soft_suffix_len": (
++                                int(soft_suffix_len)
++                                if soft_suffix_len is not None
++                                else None
++                            ),
++                            "num_scheduled_tokens": int(num_sched),
++                            "scheduled_prompt_start": int(sched_start),
++                            "scheduled_prompt_end": int(sched_end),
++                            "num_false_scheduled_entries": int(
++                                len(false_indices_list)
++                            ),
++                            "false_scheduled_indices": false_indices_list,
++                            "false_scheduled_exact_override": (
++                                false_indices_list == expected_false_indices
++                            ),
++                            "scheduled_prompt_override_positions": list(
++                                range(overlap_start, overlap_end)
++                            ),
++                            "req_prompt_embeds_shape": list(req_embeds.shape),
++                            "req_prompt_embeds_storage": (
++                                "suffix_only"
++                                if soft_suffix_len is not None
++                                else "full_prompt"
++                            ),
++                        },
++                    )
+ 
+                 output_idx += num_sched
+ 
+@@ -2274,8 +2392,10 @@ class GPUModelRunner(
+ 
+             num_computed_tokens = self.input_batch.num_computed_tokens_cpu[index]
+             num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
+-            num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
+-                req.prompt_token_ids, req.prompt_embeds
++            num_prompt_tokens = get_num_prompt_tokens(
++                req.prompt_token_ids,
++                req.prompt_embeds,
++                req.prompt_embeds_soft_suffix_len,
+             )
+ 
+             if num_computed_tokens + num_scheduled_tokens > num_prompt_tokens:
+@@ -2323,8 +2443,10 @@ class GPUModelRunner(
+ 
+             num_computed_tokens = self.input_batch.num_computed_tokens_cpu[index]
+             num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
+-            num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
+-                req.prompt_token_ids, req.prompt_embeds
++            num_prompt_tokens = get_num_prompt_tokens(
++                req.prompt_token_ids,
++                req.prompt_embeds,
++                req.prompt_embeds_soft_suffix_len,
+             )
+ 
+             if num_computed_tokens + num_scheduled_tokens > num_prompt_tokens:
+@@ -2497,15 +2619,22 @@ class GPUModelRunner(
+         mm_lora_refs = list[tuple[str, PlaceholderRange]]()
+         for req_id, encoder_input_ids in scheduled_encoder_inputs.items():
+             req_state = self.requests[req_id]
+-
+             for mm_input_id in encoder_input_ids:
+                 mm_feature = req_state.mm_features[mm_input_id]
+                 if mm_feature.data is None:
+                     continue
+ 
++                pos_info = mm_feature.mm_position
++
++                # Metadata-only multimodal item:
++                # keep it in req_state.mm_features for M-RoPE position construction,
++                # but do not send it through the multimodal encoder again.
++                if pos_info.get_num_embeds() == 0:
++                    continue
++
+                 mm_hashes.append(mm_feature.identifier)
+                 mm_kwargs.append((mm_feature.modality, mm_feature.data))
+-                mm_lora_refs.append((req_id, mm_feature.mm_position))
++                mm_lora_refs.append((req_id, pos_info))
+ 
+         return mm_hashes, mm_kwargs, mm_lora_refs
+ 
+@@ -2911,6 +3040,39 @@ class GPUModelRunner(
+             hidden_states=hidden_states, pooling_metadata=pooling_metadata
+         )
+ 
++        if dump_enabled():
++            append_log(
++                "gpu_model_runner_pooler_output",
++                {
++                    "req_ids": list(self.input_batch.req_ids),
++                    "num_reqs": int(num_reqs),
++                    "output_type": type(raw_pooler_output).__name__,
++                },
++            )
++            if isinstance(raw_pooler_output, list):
++                tensors = {
++                    f"pooler_output_{i}": out
++                    for i, out in enumerate(raw_pooler_output)
++                    if isinstance(out, torch.Tensor)
++                }
++                save_tensors(
++                    "gpu_model_runner_pooler_output",
++                    tensors,
++                    meta={
++                        "req_ids": list(self.input_batch.req_ids),
++                        "num_reqs": int(num_reqs),
++                    },
++                )
++            elif isinstance(raw_pooler_output, torch.Tensor):
++                save_tensors(
++                    "gpu_model_runner_pooler_output",
++                    {"pooler_output": raw_pooler_output},
++                    meta={
++                        "req_ids": list(self.input_batch.req_ids),
++                        "num_reqs": int(num_reqs),
++                    },
++                )
++
+         finished_mask = [
+             seq_len == prompt_len
+             for seq_len, prompt_len in zip(seq_lens_cpu, pooling_metadata.prompt_lens)
+@@ -2921,6 +3083,21 @@ class GPUModelRunner(
+             req_ids=self.input_batch.req_ids,
+             finished_mask=finished_mask,
+         )
++        raw_hidden_states: list[torch.Tensor | None] = [None] * num_reqs
++        if any(
++            pooling_params is not None and pooling_params.return_raw_hidden_states
++            for pooling_params in pooling_metadata.pooling_params
++        ):
++            cursor = 0
++            for req_index, scheduled_tokens in enumerate(num_scheduled_tokens_np):
++                scheduled_len = int(scheduled_tokens)
++                req_hidden_states = hidden_states[cursor : cursor + scheduled_len]
++                cursor += scheduled_len
++                if (
++                    finished_mask[req_index]
++                    and pooling_metadata.pooling_params[req_index].return_raw_hidden_states
++                ):
++                    raw_hidden_states[req_index] = req_hidden_states
+ 
+         model_runner_output = ModelRunnerOutput(
+             req_ids=self.input_batch.req_ids.copy(),
+@@ -2930,12 +3107,14 @@ class GPUModelRunner(
+ 
+         if raw_pooler_output is None or not any(finished_mask):
+             model_runner_output.pooler_output = [None] * num_reqs
++            model_runner_output.pooling_hidden_states = [None] * num_reqs
+             return model_runner_output
+ 
+         if self.use_async_scheduling:
+             return AsyncGPUPoolingModelRunnerOutput(
+                 model_runner_output=model_runner_output,
+                 raw_pooler_output=raw_pooler_output,
++                raw_hidden_states=raw_hidden_states,
+                 finished_mask=finished_mask,
+                 async_output_copy_stream=self.async_output_copy_stream,
+             )
+@@ -2944,6 +3123,10 @@ class GPUModelRunner(
+             raw_pooler_output=raw_pooler_output,
+             finished_mask=finished_mask,
+         )
++        model_runner_output.pooling_hidden_states = _copy_hidden_states_to_cpu(
++            raw_hidden_states=raw_hidden_states,
++            finished_mask=finished_mask,
++        )
+         self._sync_device()
+ 
+         return model_runner_output
+@@ -2981,6 +3164,9 @@ class GPUModelRunner(
+         ECConnectorOutput | None,
+     ]:
+         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
++        runtime_prompt_embeds_enabled = (
++            self.enable_prompt_embeds or bool(self.input_batch.req_prompt_embeds)
++        )
+         is_first_rank = get_pp_group().is_first_rank
+         is_encoder_decoder = self.model_config.is_encoder_decoder
+ 
+@@ -2997,6 +3183,15 @@ class GPUModelRunner(
+                 self._execute_mm_encoder(scheduler_output)
+                 mm_embeds, is_mm_embed = self._gather_mm_embeddings(scheduler_output)
+ 
++            preserved_prompt_embeds = None
++            preserved_prompt_mask = None
++            if runtime_prompt_embeds_enabled and self.input_batch.req_prompt_embeds:
++                preserved_prompt_mask = ~self.is_token_ids.gpu[:num_scheduled_tokens]
++                if preserved_prompt_mask.any():
++                    preserved_prompt_embeds = self.inputs_embeds.gpu[
++                        :num_scheduled_tokens
++                    ][preserved_prompt_mask].clone()
++
+             # NOTE(woosuk): To unify token ids and soft tokens (vision
+             # embeddings), we always use embeddings (rather than token ids)
+             # as input to the multimodal model, even when the input is text.
+@@ -3008,13 +3203,17 @@ class GPUModelRunner(
+ 
+             # TODO(woosuk): Avoid the copy. Optimize.
+             self.inputs_embeds.gpu[:num_scheduled_tokens].copy_(inputs_embeds_scheduled)
++            if preserved_prompt_embeds is not None and preserved_prompt_mask is not None:
++                self.inputs_embeds.gpu[:num_scheduled_tokens][
++                    preserved_prompt_mask
++                ] = preserved_prompt_embeds
+ 
+             input_ids, inputs_embeds = self._prepare_mm_inputs(num_input_tokens)
+             model_kwargs = {
+                 **self._init_model_kwargs(),
+                 **self._extract_mm_kwargs(scheduler_output),
+             }
+-        elif self.enable_prompt_embeds and is_first_rank:
++        elif runtime_prompt_embeds_enabled and is_first_rank:
+             # Get the input embeddings for the tokens that are not input embeds,
+             # then put them into the appropriate positions.
+             # TODO(qthequartermasterman): Since even when prompt embeds are
+@@ -3074,6 +3273,38 @@ class GPUModelRunner(
+             encoder_outputs = self._execute_mm_encoder(scheduler_output)
+             model_kwargs.update({"encoder_outputs": encoder_outputs})
+ 
++        if dump_enabled():
++            num_reqs = self.input_batch.num_reqs
++            save_tensors(
++                "gpu_model_runner_prepare_inputs",
++                {
++                    "input_ids_gpu": self.input_ids.gpu[:num_input_tokens],
++                    "positions_gpu": positions,
++                    "is_token_ids_gpu": (
++                        self.is_token_ids.gpu[:num_input_tokens]
++                        if runtime_prompt_embeds_enabled
++                        else None
++                    ),
++                    "inputs_embeds_gpu": (
++                        self.inputs_embeds.gpu[:num_input_tokens]
++                        if runtime_prompt_embeds_enabled
++                        else None
++                    ),
++                },
++                meta={
++                    "num_input_tokens": int(num_input_tokens),
++                    "num_reqs": int(num_reqs),
++                    "num_scheduled_tokens_per_req": scheduler_output.num_scheduled_tokens,
++                    "req_ids": list(self.input_batch.req_ids),
++                    "uses_mrope": bool(self.uses_mrope),
++                    "supports_mm_inputs": bool(self.supports_mm_inputs),
++                    "enable_prompt_embeds": bool(self.enable_prompt_embeds),
++                    "runtime_prompt_embeds_enabled": bool(
++                        runtime_prompt_embeds_enabled
++                    ),
++                },
++            )
++
+         return (
+             input_ids,
+             inputs_embeds,
+@@ -3287,6 +3518,429 @@ class GPUModelRunner(
+             **model_kwargs,
+         )
+ 
++    def _cleanup_after_native_latent_prefill(self, req_id: str) -> None:
++        self.requests.pop(req_id, None)
++        self.num_prompt_logprobs.pop(req_id, None)
++        self.late_interaction_runner.on_requests_finished({req_id})
++
++        removed = self.input_batch.remove_request(req_id)
++        if removed is not None:
++            self.input_batch.condense()
++            self.input_batch.refresh_metadata()
++
++        self.input_batch.req_prompt_embeds.clear()
++        self.input_batch.req_prompt_embeds_soft_suffix_lens.clear()
++        self.input_batch.prev_sampled_token_ids = None
++        self.input_batch.prev_req_id_to_index = None
++
++        if self.input_batch.num_reqs == 0:
++            self.input_batch.block_table.clear()
++
++    @torch.inference_mode()
++    def generate_latents_native_prefill(
++        self,
++        scheduler_output: "SchedulerOutput",
++        n_query: int,
++    ) -> torch.Tensor:
++        if self.execute_model_state is not None:
++            raise RuntimeError(
++                "State error: sample_tokens() must be called before "
++                "generate_latents_native_prefill()."
++            )
++        if self.requests or self.input_batch.num_reqs > 0:
++            raise RuntimeError(
++                "generate_latents_native_prefill requires an idle model runner."
++            )
++        if get_pp_group().world_size > 1:
++            raise NotImplementedError(
++                "generate_latents_native_prefill does not yet support PP>1."
++            )
++        if len(scheduler_output.scheduled_new_reqs) != 1:
++            raise ValueError(
++                "generate_latents_native_prefill expects exactly one new request."
++            )
++
++        req_id = scheduler_output.scheduled_new_reqs[0].req_id
++        try:
++            with (
++                record_function_or_nullcontext(
++                    "gpu_model_runner: latent_prefill_preprocess"
++                ),
++                self.synchronize_input_prep(),
++            ):
++                self._update_states(scheduler_output)
++
++                num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
++                if num_scheduled_tokens <= 0:
++                    raise ValueError(
++                        "generate_latents_native_prefill requires scheduled tokens."
++                    )
++                if n_query > num_scheduled_tokens:
++                    raise ValueError(
++                        f"n_query {n_query} exceeds scheduled token count "
++                        f"{num_scheduled_tokens}."
++                    )
++
++                num_reqs = self.input_batch.num_reqs
++                req_ids = self.input_batch.req_ids
++                num_scheduled_tokens_np = np.array(
++                    [scheduler_output.num_scheduled_tokens[req_id] for req_id in req_ids],
++                    dtype=np.int32,
++                )
++                max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
++
++                logits_indices, spec_decode_metadata = self._prepare_inputs(
++                    scheduler_output,
++                    num_scheduled_tokens_np,
++                )
++                if spec_decode_metadata is not None:
++                    raise RuntimeError(
++                        "Spec decode is not supported in native latent prefill."
++                    )
++
++                cascade_attn_prefix_lens = None
++                if self.cascade_attn_enabled and not self.parallel_config.use_ubatching:
++                    cascade_attn_prefix_lens = (
++                        self._compute_cascade_attn_prefix_lens(
++                            num_scheduled_tokens_np,
++                            self.input_batch.num_computed_tokens_cpu[:num_reqs],
++                            scheduler_output.num_common_prefix_blocks,
++                        )
++                    )
++
++                (
++                    cudagraph_mode,
++                    batch_desc,
++                    should_ubatch,
++                    num_tokens_across_dp,
++                    _,
++                ) = self._determine_batch_execution_and_padding(
++                    num_tokens=num_scheduled_tokens,
++                    num_reqs=num_reqs,
++                    num_scheduled_tokens_np=num_scheduled_tokens_np,
++                    max_num_scheduled_tokens=max_num_scheduled_tokens,
++                    use_cascade_attn=cascade_attn_prefix_lens is not None,
++                    num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
++                )
++
++                num_tokens_padded = batch_desc.num_tokens
++                num_reqs_padded = (
++                    batch_desc.num_reqs if batch_desc.num_reqs is not None else num_reqs
++                )
++                ubatch_slices, ubatch_slices_padded = maybe_create_ubatch_slices(
++                    should_ubatch,
++                    num_scheduled_tokens_np,
++                    num_tokens_padded,
++                    num_reqs_padded,
++                    self.parallel_config.num_ubatches,
++                )
++
++                has_separate_kv_update = not all(
++                    all(
++                        g.backend.forward_includes_kv_cache_update
++                        for g in self.attn_groups[kv_cache_gid]
++                    )
++                    for kv_cache_gid, spec in enumerate(
++                        self.kv_cache_config.kv_cache_groups
++                    )
++                    if not isinstance(spec.kv_cache_spec, EncoderOnlyAttentionSpec)
++                )
++                pad_attn = cudagraph_mode == CUDAGraphMode.FULL
++                ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
++
++                slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
++                    num_tokens_padded=(
++                        num_tokens_padded
++                        if pad_attn or has_separate_kv_update
++                        else num_scheduled_tokens
++                    ),
++                    num_reqs_padded=(
++                        num_reqs_padded
++                        if pad_attn or has_separate_kv_update
++                        else num_reqs
++                    ),
++                    num_tokens_unpadded=num_scheduled_tokens,
++                    ubatch_slices=ubatch_slices_padded,
++                )
++
++                attn_metadata, _ = self._build_attention_metadata(
++                    num_tokens=num_scheduled_tokens,
++                    num_tokens_padded=num_tokens_padded if pad_attn else None,
++                    num_reqs=num_reqs,
++                    num_reqs_padded=num_reqs_padded if pad_attn else None,
++                    max_query_len=max_num_scheduled_tokens,
++                    ubatch_slices=ubatch_slices_attn,
++                    logits_indices=logits_indices,
++                    use_spec_decode=False,
++                    num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
++                    cascade_attn_prefix_lens=cascade_attn_prefix_lens,
++                    slot_mappings=slot_mappings_by_group,
++                )
++
++                (
++                    input_ids,
++                    inputs_embeds,
++                    positions,
++                    intermediate_tensors,
++                    model_kwargs,
++                    _,
++                ) = self._preprocess(
++                    scheduler_output,
++                    num_tokens_padded,
++                    None,
++                )
++
++            with (
++                set_forward_context(
++                    attn_metadata,
++                    self.vllm_config,
++                    num_tokens=num_tokens_padded,
++                    num_tokens_across_dp=num_tokens_across_dp,
++                    cudagraph_runtime_mode=cudagraph_mode,
++                    batch_descriptor=batch_desc,
++                    ubatch_slices=ubatch_slices_padded,
++                    slot_mapping=slot_mappings,
++                ),
++                record_function_or_nullcontext("gpu_model_runner: latent_prefill_forward"),
++                self.maybe_get_kv_connector_output(
++                    scheduler_output,
++                    defer_finalize=False,
++                ),
++            ):
++                model_output = self._model_forward(
++                    input_ids=input_ids,
++                    positions=positions,
++                    intermediate_tensors=intermediate_tensors,
++                    inputs_embeds=inputs_embeds,
++                    **model_kwargs,
++                )
++
++            hidden_states = (
++                model_output[0] if self.use_aux_hidden_state_outputs else model_output
++            )
++            if isinstance(hidden_states, IntermediateTensors):
++                raise RuntimeError(
++                    "Unexpected intermediate tensors in native latent prefill."
++                )
++
++            return hidden_states[
++                num_scheduled_tokens - n_query : num_scheduled_tokens
++            ].detach().cpu().unsqueeze(0)
++        finally:
++            self._cleanup_after_native_latent_prefill(req_id)
++
++    @torch.inference_mode()
++    def collect_hidden_states_for_traj_suffix_continuation(
++        self,
++        req_id: str,
++        suffix_token_ids: list[int],
++        new_block_ids: tuple[list[int], ...] | None,
++        num_computed_tokens: int,
++        num_output_tokens: int,
++    ) -> torch.Tensor:
++        if self.execute_model_state is not None:
++            raise RuntimeError(
++                "State error: sample_tokens() must be called before "
++                "same-request latent continuation."
++            )
++        if get_pp_group().world_size > 1:
++            raise NotImplementedError(
++                "Same-request latent continuation does not support PP>1."
++            )
++        if self.use_async_scheduling:
++            raise NotImplementedError(
++                "Same-request latent continuation does not support async scheduling."
++            )
++        if self.input_batch.num_reqs != 1:
++            raise RuntimeError(
++                "Same-request latent continuation only supports batch size 1, got "
++                f"{self.input_batch.num_reqs}."
++            )
++        if not suffix_token_ids:
++            raise ValueError("suffix_token_ids must be non-empty.")
++
++        req_state = self.requests.get(req_id)
++        if req_state is None:
++            raise RuntimeError(f"Live request {req_id} is not available on worker.")
++        req_index = self.input_batch.req_id_to_index.get(req_id)
++        if req_index is None:
++            raise RuntimeError(f"Request {req_id} is not present in the input batch.")
++
++        n_query = len(suffix_token_ids)
++        suffix_start = int(self.input_batch.num_tokens_no_spec[req_index])
++        suffix_end = suffix_start + n_query
++        if suffix_end > self.max_model_len:
++            raise ValueError(
++                "Same-request latent continuation exceeds max_model_len: "
++                f"{suffix_end} > {self.max_model_len}."
++            )
++
++        req_state.output_token_ids.extend(suffix_token_ids)
++        self.input_batch.token_ids_cpu[req_index, suffix_start:suffix_end] = (
++            suffix_token_ids
++        )
++        self.input_batch.is_token_ids[req_index, suffix_start:suffix_end] = True
++        self.input_batch.num_tokens_no_spec[req_index] = suffix_end
++
++        continuation_scheduler_output = SchedulerOutput(
++            scheduled_new_reqs=[],
++            scheduled_cached_reqs=CachedRequestData(
++                req_ids=[req_id],
++                resumed_req_ids=set(),
++                new_token_ids=[[]],
++                all_token_ids={},
++                new_block_ids=[new_block_ids],
++                num_computed_tokens=[num_computed_tokens],
++                num_output_tokens=[num_output_tokens],
++            ),
++            num_scheduled_tokens={req_id: n_query},
++            total_num_scheduled_tokens=n_query,
++            scheduled_spec_decode_tokens={},
++            scheduled_encoder_inputs={},
++            num_common_prefix_blocks=[],
++            finished_req_ids=set(),
++            free_encoder_mm_hashes=[],
++        )
++
++        try:
++            with (
++                record_function_or_nullcontext(
++                    "gpu_model_runner: traj_suffix_continuation_preprocess"
++                ),
++                self.synchronize_input_prep(),
++            ):
++                self._update_states(continuation_scheduler_output)
++
++                num_scheduled_tokens_np = np.array([n_query], dtype=np.int32)
++                max_num_scheduled_tokens = n_query
++                logits_indices, spec_decode_metadata = self._prepare_inputs(
++                    continuation_scheduler_output,
++                    num_scheduled_tokens_np,
++                )
++                if spec_decode_metadata is not None:
++                    raise RuntimeError(
++                        "Spec decode is not supported in same-request latent continuation."
++                    )
++
++                (
++                    cudagraph_mode,
++                    batch_desc,
++                    should_ubatch,
++                    num_tokens_across_dp,
++                    _,
++                ) = self._determine_batch_execution_and_padding(
++                    num_tokens=n_query,
++                    num_reqs=1,
++                    num_scheduled_tokens_np=num_scheduled_tokens_np,
++                    max_num_scheduled_tokens=max_num_scheduled_tokens,
++                    use_cascade_attn=False,
++                    num_encoder_reqs=0,
++                )
++
++                num_tokens_padded = batch_desc.num_tokens
++                num_reqs_padded = (
++                    batch_desc.num_reqs if batch_desc.num_reqs is not None else 1
++                )
++                ubatch_slices, ubatch_slices_padded = maybe_create_ubatch_slices(
++                    should_ubatch,
++                    num_scheduled_tokens_np,
++                    num_tokens_padded,
++                    num_reqs_padded,
++                    self.parallel_config.num_ubatches,
++                )
++
++                has_separate_kv_update = not all(
++                    all(
++                        g.backend.forward_includes_kv_cache_update
++                        for g in self.attn_groups[kv_cache_gid]
++                    )
++                    for kv_cache_gid, spec in enumerate(
++                        self.kv_cache_config.kv_cache_groups
++                    )
++                    if not isinstance(spec.kv_cache_spec, EncoderOnlyAttentionSpec)
++                )
++                pad_attn = cudagraph_mode == CUDAGraphMode.FULL
++                ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
++
++                slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
++                    num_tokens_padded=(
++                        num_tokens_padded
++                        if pad_attn or has_separate_kv_update
++                        else n_query
++                    ),
++                    num_reqs_padded=(
++                        num_reqs_padded if pad_attn or has_separate_kv_update else 1
++                    ),
++                    num_tokens_unpadded=n_query,
++                    ubatch_slices=ubatch_slices_padded,
++                )
++
++                attn_metadata, _ = self._build_attention_metadata(
++                    num_tokens=n_query,
++                    num_tokens_padded=num_tokens_padded if pad_attn else None,
++                    num_reqs=1,
++                    num_reqs_padded=num_reqs_padded if pad_attn else None,
++                    max_query_len=max_num_scheduled_tokens,
++                    ubatch_slices=ubatch_slices_attn,
++                    logits_indices=logits_indices,
++                    use_spec_decode=False,
++                    num_scheduled_tokens=continuation_scheduler_output.num_scheduled_tokens,
++                    cascade_attn_prefix_lens=None,
++                    slot_mappings=slot_mappings_by_group,
++                )
++
++                (
++                    input_ids,
++                    inputs_embeds,
++                    positions,
++                    intermediate_tensors,
++                    model_kwargs,
++                    _,
++                ) = self._preprocess(
++                    continuation_scheduler_output,
++                    num_tokens_padded,
++                    None,
++                )
++
++            with (
++                set_forward_context(
++                    attn_metadata,
++                    self.vllm_config,
++                    num_tokens=num_tokens_padded,
++                    num_tokens_across_dp=num_tokens_across_dp,
++                    cudagraph_runtime_mode=cudagraph_mode,
++                    batch_descriptor=batch_desc,
++                    ubatch_slices=ubatch_slices_padded,
++                    slot_mapping=slot_mappings,
++                ),
++                record_function_or_nullcontext(
++                    "gpu_model_runner: traj_suffix_continuation_forward"
++                ),
++                self.maybe_get_kv_connector_output(
++                    continuation_scheduler_output,
++                    defer_finalize=False,
++                ),
++            ):
++                model_output = self._model_forward(
++                    input_ids=input_ids,
++                    positions=positions,
++                    intermediate_tensors=intermediate_tensors,
++                    inputs_embeds=inputs_embeds,
++                    **model_kwargs,
++                )
++
++            hidden_states = (
++                model_output[0] if self.use_aux_hidden_state_outputs else model_output
++            )
++            if isinstance(hidden_states, IntermediateTensors):
++                raise RuntimeError(
++                    "Unexpected intermediate tensors in same-request latent continuation."
++                )
++
++            return hidden_states[:n_query].detach().cpu().unsqueeze(0)
++        finally:
++            self._cleanup_after_native_latent_prefill(req_id)
++
+     @staticmethod
+     def _is_uniform_decode(
+         max_num_scheduled_tokens: int,
+@@ -3811,6 +4465,15 @@ class GPUModelRunner(
+                     return hidden_states
+ 
+                 if self.is_pooling_model:
++                    if dump_enabled() and torch.is_tensor(hidden_states):
++                        save_tensors(
++                            "gpu_model_runner_actual_post_forward",
++                            {"hidden_states": hidden_states[:num_scheduled_tokens]},
++                            meta={
++                                "num_scheduled_tokens": int(num_scheduled_tokens),
++                                "req_ids": list(self.input_batch.req_ids),
++                            },
++                        )
+                     # Return the pooling output.
+                     return self._pool(
+                         hidden_states,
+@@ -5225,6 +5888,23 @@ class GPUModelRunner(
+                     slot_mapping=slot_mappings,
+                 ),
+             ):
++                if dump_enabled():
++                    save_tensors(
++                        "gpu_model_runner_pre_forward",
++                        {
++                            "input_ids": input_ids,
++                            "inputs_embeds": inputs_embeds,
++                            "positions": positions,
++                        },
++                        meta={
++                            "num_tokens_padded": int(num_tokens_padded),
++                            "num_tokens_unpadded": int(num_tokens_unpadded),
++                            "req_ids": list(self.input_batch.req_ids),
++                            "uses_mrope": bool(self.uses_mrope),
++                            "supports_mm_inputs": bool(self.supports_mm_inputs),
++                            "enable_prompt_embeds": bool(self.enable_prompt_embeds),
++                        },
++                    )
+                 outputs = self.model(
+                     input_ids=input_ids,
+                     positions=positions,
+@@ -5238,6 +5918,18 @@ class GPUModelRunner(
+             else:
+                 hidden_states = outputs
+ 
++            if dump_enabled():
++                save_tensors(
++                    "gpu_model_runner_post_forward",
++                    {
++                        "hidden_states": hidden_states,
++                    },
++                    meta={
++                        "num_tokens_padded": int(num_tokens_padded),
++                        "req_ids": list(self.input_batch.req_ids),
++                    },
++                )
++
+             if self.speculative_config and (
+                 self.speculative_config.use_eagle()
+                 or self.speculative_config.uses_draft_model()
+@@ -5486,7 +6178,7 @@ class GPUModelRunner(
+ 
+                 if (encoder_budget := mm_budget.get_encoder_budget()) > 0:
+                     if not mm_budget.mm_max_toks_per_item:
+-                        # All modality limits are 0 â€” embedding-only mode.
++                        # All modality limits are 0 éˆ¥? embedding-only mode.
+                         # Budget is non-zero for embedding storage, but
+                         # there's no encoder to profile.
+                         logger.info(
+@@ -5676,7 +6368,7 @@ class GPUModelRunner(
+ 
+                 logger.debug(
+                     "Estimated %s CUDA graph memory: "
+-                    "%.2f MiB first-capture + (%d-1) Ã— %.2f MiB per-graph",
++                    "%.2f MiB first-capture + (%d-1) è„³ %.2f MiB per-graph",
+                     mode.name,
+                     first_capture / (1 << 20),
+                     len(descs),
+diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
+index 842e76549..aaaade4a4 100644
+--- a/vllm/v1/worker/gpu_worker.py
++++ b/vllm/v1/worker/gpu_worker.py
+@@ -252,14 +252,19 @@ class Worker(WorkerBase):
+                 )
+ 
+             self.device = torch.device(f"cuda:{self.local_rank}")
++            logger.info("Worker init_device: set_device(%s) begin", self.device)
+             current_platform.set_device(self.device)
++            logger.info("Worker init_device: set_device(%s) done", self.device)
+ 
++            logger.info("Worker init_device: check_if_supports_dtype(%s) begin", self.model_config.dtype)
+             current_platform.check_if_supports_dtype(self.model_config.dtype)
++            logger.info("Worker init_device: check_if_supports_dtype(%s) done", self.model_config.dtype)
+ 
+             # Initialize the distributed environment BEFORE taking
+             # memory snapshot
+             # This ensures NCCL buffers are allocated before we measure
+             # available memory
++            logger.info("Worker init_device: distributed init begin")
+             init_worker_distributed_environment(
+                 self.vllm_config,
+                 self.rank,
+@@ -267,19 +272,28 @@ class Worker(WorkerBase):
+                 self.local_rank,
+                 current_platform.dist_backend,
+             )
++            logger.info("Worker init_device: distributed init done")
+ 
+             if self.use_v2_model_runner:
+                 logger.info_once("Using V2 Model Runner", scope="local")
+ 
+             # Set random seed.
++            logger.info("Worker init_device: set_random_seed(%s) begin", self.model_config.seed)
+             set_random_seed(self.model_config.seed)
++            logger.info("Worker init_device: set_random_seed(%s) done", self.model_config.seed)
+ 
+             # Now take memory snapshot after NCCL is initialized
++            logger.info("Worker init_device: gc.collect() begin")
+             gc.collect()
++            logger.info("Worker init_device: gc.collect() done")
++            logger.info("Worker init_device: torch.accelerator.empty_cache() begin")
+             torch.accelerator.empty_cache()
++            logger.info("Worker init_device: torch.accelerator.empty_cache() done")
+ 
+             # take current memory snapshot
++            logger.info("Worker init_device: MemorySnapshot(%s) begin", self.device)
+             self.init_snapshot = init_snapshot = MemorySnapshot(device=self.device)
++            logger.info("Worker init_device: MemorySnapshot(%s) done", self.device)
+             self.requested_memory = request_memory(init_snapshot, self.cache_config)
+             logger.debug("worker init memory snapshot: %r", self.init_snapshot)
+             logger.debug(
+@@ -290,7 +304,13 @@ class Worker(WorkerBase):
+ 
+         # Initialize workspace manager
+         num_ubatches = 2 if self.vllm_config.parallel_config.enable_dbo else 1
++        logger.info(
++            "Worker init_device: init_workspace_manager(device=%s, num_ubatches=%s) begin",
++            self.device,
++            num_ubatches,
++        )
+         init_workspace_manager(self.device, num_ubatches)
++        logger.info("Worker init_device: init_workspace_manager() done")
+ 
+         # Construct the model runner
+         if self.use_v2_model_runner:
+@@ -299,15 +319,19 @@ class Worker(WorkerBase):
+             )
+ 
+             # HACK(woosuk): This is a temporary fix to avoid type errors.
++            logger.info("Worker init_device: GPUModelRunnerV2() begin")
+             self.model_runner: GPUModelRunner = GPUModelRunnerV2(  # type: ignore
+                 self.vllm_config, self.device
+             )
++            logger.info("Worker init_device: GPUModelRunnerV2() done")
+         else:
+             from vllm.v1.worker.gpu_model_runner import (
+                 GPUModelRunner as GPUModelRunnerV1,
+             )
+ 
++            logger.info("Worker init_device: GPUModelRunnerV1() begin")
+             self.model_runner = GPUModelRunnerV1(self.vllm_config, self.device)
++            logger.info("Worker init_device: GPUModelRunnerV1() done")
+ 
+         if self.rank == 0:
+             # If usage stat is enabled, collect relevant info.
+@@ -723,6 +747,50 @@ class Worker(WorkerBase):
+         """Get encoder timing stats from model runner."""
+         return self.model_runner.get_encoder_timing_stats()
+ 
++    def get_internnav_runtime_stats(self) -> dict[str, int | float | None]:
++        available_kv_cache_memory_bytes = getattr(
++            self,
++            "available_kv_cache_memory_bytes",
++            None,
++        )
++        requested_memory = getattr(self, "requested_memory", None)
++        peak_activation_memory = getattr(self, "peak_activation_memory", None)
++        cudagraph_memory_estimate = getattr(
++            self,
++            "cudagraph_memory_estimate",
++            None,
++        )
++        num_gpu_blocks = getattr(self.cache_config, "num_gpu_blocks", None)
++
++        return {
++            "available_kv_cache_memory_bytes": (
++                int(available_kv_cache_memory_bytes)
++                if available_kv_cache_memory_bytes is not None
++                else None
++            ),
++            "requested_memory_bytes": (
++                int(requested_memory) if requested_memory is not None else None
++            ),
++            "peak_activation_memory_bytes": (
++                int(peak_activation_memory)
++                if peak_activation_memory is not None
++                else None
++            ),
++            "cudagraph_memory_estimate_bytes": (
++                int(cudagraph_memory_estimate)
++                if cudagraph_memory_estimate is not None
++                else None
++            ),
++            "effective_kv_budget_bytes": (
++                int(available_kv_cache_memory_bytes)
++                if available_kv_cache_memory_bytes is not None
++                else None
++            ),
++            "gpu_memory_utilization": float(self.cache_config.gpu_memory_utilization),
++            "max_model_len": int(self.model_config.max_model_len),
++            "num_gpu_blocks": int(num_gpu_blocks) if num_gpu_blocks is not None else None,
++        }
++
+     def annotate_profile(self, scheduler_output):
+         # add trace annotation so that we can easily distinguish
+         # context/generation request numbers in each iteration.
+@@ -846,6 +914,42 @@ class Worker(WorkerBase):
+ 
+         return None
+ 
++    @torch.inference_mode()
++    def generate_latents_native_prefill(
++        self,
++        scheduler_output: "SchedulerOutput",
++        n_query: int,
++    ) -> torch.Tensor:
++        if self.parallel_config.pipeline_parallel_size > 1:
++            raise NotImplementedError(
++                "generate_latents_native_prefill does not yet support PP>1."
++            )
++        return self.model_runner.generate_latents_native_prefill(
++            scheduler_output=scheduler_output,
++            n_query=n_query,
++        )
++
++    @torch.inference_mode()
++    def collect_hidden_states_for_traj_suffix_continuation(
++        self,
++        req_id: str,
++        suffix_token_ids: list[int],
++        new_block_ids: tuple[list[int], ...] | None,
++        num_computed_tokens: int,
++        num_output_tokens: int,
++    ) -> torch.Tensor:
++        if self.parallel_config.pipeline_parallel_size > 1:
++            raise NotImplementedError(
++                "collect_hidden_states_for_traj_suffix_continuation does not yet support PP>1."
++            )
++        return self.model_runner.collect_hidden_states_for_traj_suffix_continuation(
++            req_id,
++            suffix_token_ids,
++            new_block_ids,
++            num_computed_tokens,
++            num_output_tokens,
++        )
++        
+     def take_draft_token_ids(self) -> DraftTokenIds | None:
+         return self.model_runner.take_draft_token_ids()
+ 

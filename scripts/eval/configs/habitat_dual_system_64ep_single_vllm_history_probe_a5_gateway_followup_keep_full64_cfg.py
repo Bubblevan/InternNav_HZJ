@@ -29,4 +29,9 @@ eval_cfg.agent.model_settings["history_probe_interventions"] = [
 ]
 eval_cfg.agent.model_settings["history_probe_blur_radius"] = 2.0
 eval_cfg.agent.model_settings["history_probe_downsample_factor"] = 4
+eval_cfg.eval_settings["save_video"] = False
 eval_cfg.agent.model_settings["vis_debug"]=False
+
+# DiT Cache
+eval_cfg.agent.model_settings["dit_cond_cache_enabled"] = True
+eval_cfg.agent.model_settings["dit_crossattn_kv_cache_enabled"] = True
